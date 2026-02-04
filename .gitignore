@@ -1,0 +1,8 @@
+/target
+debug
+**/*.rs.bk
+nul
+*.pdb
+**/mutants.out*/
+CLAUDE.md
+*.png
