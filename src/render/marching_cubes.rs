@@ -343,6 +343,7 @@ pub struct MarchingCubesRenderer {
 
     // Buffers
     density_grid_buffer: wgpu::Buffer,
+    density_grid_buffer2: wgpu::Buffer, // Second buffer for blur ping-pong
     vertex_buffer: wgpu::Buffer,
     counter_buffer: wgpu::Buffer,
     counter_staging_buffer: wgpu::Buffer,
@@ -355,10 +356,13 @@ pub struct MarchingCubesRenderer {
 
     // Pipelines
     density_pipeline: wgpu::ComputePipeline,
+    blur_pipeline: wgpu::ComputePipeline, // Gaussian blur for density smoothing
     generate_pipeline: wgpu::ComputePipeline,
     render_pipeline: wgpu::RenderPipeline,
 
-    // Bind groups (density_bind_group created per-frame with particle buffer)
+    // Bind groups
+    blur_bind_group1: wgpu::BindGroup, // density1 -> density2
+    blur_bind_group2: wgpu::BindGroup, // density2 -> density1
     generate_bind_group: wgpu::BindGroup,
     render_bind_group: wgpu::BindGroup,
 }
@@ -379,7 +383,14 @@ impl MarchingCubesRenderer {
 
         // Create buffers
         let density_grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Density Grid"),
+            label: Some("Density Grid 1"),
+            size: (total_cells * std::mem::size_of::<f32>() as u32) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let density_grid_buffer2 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Density Grid 2"),
             size: (total_cells * std::mem::size_of::<f32>() as u32) as u64,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
@@ -468,6 +479,11 @@ impl MarchingCubesRenderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_density.wgsl").into()),
         });
 
+        let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("MC Blur Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_blur.wgsl").into()),
+        });
+
         let generate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Generate Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_generate.wgsl").into()),
@@ -528,6 +544,97 @@ impl MarchingCubesRenderer {
             entry_point: Some("main"),
             compilation_options: Default::default(),
             cache: None,
+        });
+
+        // Blur pipeline - smooths the density grid
+        let blur_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Blur BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Blur Pipeline Layout"),
+            bind_group_layouts: &[&blur_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let blur_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Blur Pipeline"),
+            layout: Some(&blur_pipeline_layout),
+            module: &blur_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // Blur bind groups for ping-pong (density1 -> density2, density2 -> density1)
+        let blur_bind_group1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blur Bind Group 1"),
+            layout: &blur_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: density_grid_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: density_grid_buffer2.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: grid_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let blur_bind_group2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blur Bind Group 2"),
+            layout: &blur_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: density_grid_buffer2.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: density_grid_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: grid_params_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         // Generate pipeline
@@ -693,13 +800,14 @@ impl MarchingCubesRenderer {
         });
 
         // Create bind groups (density_bind_group created per-frame with particle buffer)
+        // Generate reads from density_grid_buffer2 (output of blur passes)
         let generate_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Generate Bind Group"),
             layout: &generate_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: density_grid_buffer.as_entire_binding(),
+                    resource: density_grid_buffer2.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -747,6 +855,7 @@ impl MarchingCubesRenderer {
             grid_dims,
             max_vertices,
             density_grid_buffer,
+            density_grid_buffer2,
             vertex_buffer,
             counter_buffer,
             counter_staging_buffer,
@@ -757,8 +866,11 @@ impl MarchingCubesRenderer {
             camera_buffer,
             water_params_buffer,
             density_pipeline,
+            blur_pipeline,
             generate_pipeline,
             render_pipeline,
+            blur_bind_group1,
+            blur_bind_group2,
             generate_bind_group,
             render_bind_group,
         }
@@ -772,15 +884,14 @@ impl MarchingCubesRenderer {
         // Grid must extend beyond particles on ALL sides for proper surface generation
         let grid_extent = 1.2;
 
-        // Larger smoothing radius blends particles together for smoother surface
-        // Lower threshold compensates for the spread-out density
+        // Balance: enough smoothing to blend, but not so much that sides disappear
         let params = GpuGridParams {
             grid_min: [-grid_extent, -grid_extent, -grid_extent],
             cell_size: (grid_extent * 2.0) / self.grid_dims[0] as f32,
             grid_dims: self.grid_dims,
             num_particles,
-            smoothing_radius: smoothing_radius * 2.5,
-            surface_threshold: 20.0,
+            smoothing_radius: smoothing_radius * 3.0,
+            surface_threshold: 10.0,
             _padding: [0.0; 2],
         };
         queue.write_buffer(&self.grid_params_buffer, 0, bytemuck::bytes_of(&params));
@@ -841,6 +952,29 @@ impl MarchingCubesRenderer {
                 (self.grid_dims[1] + 3) / 4,
                 (self.grid_dims[2] + 3) / 4,
             ];
+            pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+        }
+
+        // Pass 1.5: Blur density grid (multiple passes for stronger smoothing)
+        let workgroups = [
+            (self.grid_dims[0] + 3) / 4,
+            (self.grid_dims[1] + 3) / 4,
+            (self.grid_dims[2] + 3) / 4,
+        ];
+
+        // 5 blur passes for very smooth result
+        for i in 0..5 {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Blur Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.blur_pipeline);
+            // Alternate between bind groups for ping-pong
+            if i % 2 == 0 {
+                pass.set_bind_group(0, &self.blur_bind_group1, &[]);
+            } else {
+                pass.set_bind_group(0, &self.blur_bind_group2, &[]);
+            }
             pass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
         }
 
