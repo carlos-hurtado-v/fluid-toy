@@ -43,7 +43,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input: VertexOutput) -> @location(0) f32 {
     let tex_size = vec2<i32>(textureDimensions(depth_tex));
     let iuv = vec2<i32>(input.uv * vec2<f32>(tex_size));
 
@@ -51,7 +51,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     // Background check - don't blur background pixels
     if (center_depth <= 0.0 || center_depth >= 1e4) {
-        return vec4<f32>(center_depth, 0.0, 0.0, 1.0);
+        return center_depth;
     }
 
     let radius = i32(params.max_filter_size);
@@ -101,5 +101,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         result = sum / weight_sum;
     }
 
-    return vec4<f32>(result, 0.0, 0.0, 1.0);
+    return result;
 }

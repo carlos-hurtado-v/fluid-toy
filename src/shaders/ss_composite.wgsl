@@ -79,15 +79,37 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     // Get view-space position (use flipped UV for consistent coordinate system)
     let view_pos = compute_view_pos(flipped_uv, depth);
+    
+    // === NORMAL RECONSTRUCTION WITH STRIDE ===
+    // Widen the sampling kernel to smooth out faceted "grape" artifacts.
+    // stride = 1.0 : Sharpest, but shows artifacts if blur isn't perfect
+    // stride = 2.0 or 3.0 : Smoother normals, hides the sphere shapes
+    let stride = 2.0; 
+    let stride_i = i32(stride);
 
-    // Compute gradients for normal (central differences with smaller gradient selection)
-    // In flipped_uv space: (0,0) = top-left, so +texel_size.y = down = +1 in texture Y
-    let ddx1 = get_view_pos_at(flipped_uv + vec2<f32>(water.texel_size.x, 0.0), iuv + vec2<i32>(1, 0)) - view_pos;
-    let ddy1 = get_view_pos_at(flipped_uv + vec2<f32>(0.0, water.texel_size.y), iuv + vec2<i32>(0, 1)) - view_pos;
-    let ddx2 = view_pos - get_view_pos_at(flipped_uv - vec2<f32>(water.texel_size.x, 0.0), iuv - vec2<i32>(1, 0));
-    let ddy2 = view_pos - get_view_pos_at(flipped_uv - vec2<f32>(0.0, water.texel_size.y), iuv - vec2<i32>(0, 1));
+    // Compute gradients (Central differences with wider gap)
+    // Note: We multiply texel_size by stride for UVs, and use stride_i for integer lookups
+    let ddx1 = get_view_pos_at(
+        flipped_uv + vec2<f32>(water.texel_size.x * stride, 0.0), 
+        iuv + vec2<i32>(stride_i, 0)
+    ) - view_pos;
 
-    // Use the gradient with smaller z change (more robust at edges)
+    let ddy1 = get_view_pos_at(
+        flipped_uv + vec2<f32>(0.0, water.texel_size.y * stride), 
+        iuv + vec2<i32>(0, stride_i)
+    ) - view_pos;
+
+    let ddx2 = view_pos - get_view_pos_at(
+        flipped_uv - vec2<f32>(water.texel_size.x * stride, 0.0), 
+        iuv - vec2<i32>(stride_i, 0)
+    );
+
+    let ddy2 = view_pos - get_view_pos_at(
+        flipped_uv - vec2<f32>(0.0, water.texel_size.y * stride), 
+        iuv - vec2<i32>(0, stride_i)
+    );
+
+    // Use the gradient with smaller z change (edge preservation logic remains the same)
     var ddx = ddx1;
     if (abs(ddx2.z) < abs(ddx1.z)) {
         ddx = ddx2;

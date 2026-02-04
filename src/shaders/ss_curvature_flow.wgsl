@@ -43,7 +43,7 @@ fn sample_depth(iuv: vec2<i32>, offset: vec2<i32>, tex_size: vec2<i32>) -> f32 {
 }
 
 @fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input: VertexOutput) -> @location(0) f32 {
     let tex_size = vec2<i32>(textureDimensions(depth_tex));
     let iuv = vec2<i32>(input.uv * vec2<f32>(tex_size));
 
@@ -51,7 +51,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     // Background check - don't process background pixels
     if (z <= 0.0 || z >= 1e4) {
-        return vec4<f32>(z, 0.0, 0.0, 1.0);
+        return z;
     }
 
     // Sample neighboring depths for finite differences
@@ -103,5 +103,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let grad_mag = sqrt(1.0 + z_x2 + z_y2);
     let z_new = z + params.dt * H * grad_mag;
 
-    return vec4<f32>(z_new, 0.0, 0.0, 1.0);
+    return z_new;
 }

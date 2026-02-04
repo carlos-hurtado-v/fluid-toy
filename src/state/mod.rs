@@ -178,10 +178,10 @@ impl Default for SphConfig {
             kernel_radius: 0.07,
             rest_density: 5000.0,      // Lower = particles stack instead of spreading
             stiffness: 3.0,            // Low so gravity dominates over pressure
-            near_stiffness: 0.5,       // Reduced close-range repulsion
+            near_stiffness: 5.0,       // Higher to prevent particle collapse at extreme compression
             viscosity: 50.0,           // Higher = more energy dissipation, less bouncing
             mass: 1.0,
-            wall_stiffness: 8000.0,
+            wall_stiffness: 15000.0,   // Higher to resist corner pressure at extreme tilts
         }
     }
 }

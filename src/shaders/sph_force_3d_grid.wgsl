@@ -129,7 +129,22 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
                     if (r_sq < params.kernel_radius_sq && r_sq > 1e-12) {
                         let r = sqrt(r_sq);
-                        let dir = normalize(pos_j - pos_i);
+
+                        // Compute direction - use index-based fallback when too close
+                        var dir: vec3<f32>;
+                        let min_dist = params.kernel_radius * 0.1;  // 10% of kernel radius
+                        if (r < min_dist) {
+                            // Particles too close - use deterministic direction based on indices
+                            // This prevents random direction due to floating point noise
+                            let idx_diff = f32(i) - f32(j);
+                            dir = normalize(vec3<f32>(
+                                sin(idx_diff * 1.0),
+                                cos(idx_diff * 2.0),
+                                sin(idx_diff * 3.0)
+                            ));
+                        } else {
+                            dir = normalize(pos_j - pos_i);
+                        }
 
                         let density_j = max(sorted_particles[j].density, 1.0);
                         let near_density_j = max(sorted_particles[j].near_density, 1.0);
@@ -142,6 +157,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
                         f_pressure += -params.mass * shared_pressure * dir * density_kernel_gradient(r) / density_j;
                         f_pressure += -params.mass * near_shared_pressure * dir * near_density_kernel_gradient(r) / near_density_j;
+
+                        // Extra separation force when extremely close (prevents collapse)
+                        if (r < min_dist) {
+                            let separation_strength = 1000.0 * (1.0 - r / min_dist);
+                            f_pressure += -separation_strength * dir;
+                        }
 
                         let vel_j = sorted_particles[j].velocity;
                         let relative_vel = vel_j - vel_i;

@@ -71,6 +71,7 @@ pub struct ScreenSpaceFluidRenderer {
     fluid_params_buffer: wgpu::Buffer,
     blur_params_buffer_h: wgpu::Buffer,
     blur_params_buffer_v: wgpu::Buffer,
+    flow_params_buffer: wgpu::Buffer,  // Separate params for curvature flow (different dt)
     water_params_buffer: wgpu::Buffer,
 
     // Pipelines
@@ -85,6 +86,8 @@ pub struct ScreenSpaceFluidRenderer {
     blur_bind_group_a: wgpu::BindGroup,  // depth → blur_a (first H pass)
     blur_bind_group_b: wgpu::BindGroup,  // blur_a → blur_b (V passes)
     blur_bind_group_c: wgpu::BindGroup,  // blur_b → blur_a (H passes for iter 2+)
+    flow_bind_group_a: wgpu::BindGroup,  // blur_b → blur_a (curvature flow with separate dt)
+    flow_bind_group_b: wgpu::BindGroup,  // blur_a → blur_b (curvature flow)
     thickness_bind_group: wgpu::BindGroup,
     composite_bind_group: wgpu::BindGroup,
 
@@ -106,12 +109,13 @@ impl ScreenSpaceFluidRenderer {
         let width = width.max(1);
         let height = height.max(1);
 
-        // Create textures (use Rgba16Float for all to ensure filterability)
+        // Create textures (use R32Float for high precision depth storage)
         let (depth_texture, depth_view) = create_color_texture(device, width, height, "SS Depth");
         let (depth_buffer, depth_buffer_view) = create_depth_buffer(device, width, height);
         let (blur_texture_a, blur_view_a) = create_color_texture(device, width, height, "SS Blur A");
         let (blur_texture_b, blur_view_b) = create_color_texture(device, width, height, "SS Blur B");
-        let (thickness_texture, thickness_view) = create_color_texture(device, width, height, "SS Thickness");
+        // Thickness needs blendable format for additive accumulation
+        let (thickness_texture, thickness_view) = create_thickness_texture(device, width, height);
 
         // Create buffers - use explicit size to ensure alignment
         let camera_size = std::mem::size_of::<GpuCameraParams>() as u64;
@@ -137,13 +141,12 @@ impl ScreenSpaceFluidRenderer {
         });
 
         // Bilateral blur params - primary smoothing to merge spheres
-        // blur_dir: direction, depth_threshold: depth sigma, max_filter_size: spatial radius
-        // depth_threshold should be ~particle diameter in view space
-        // With particle_radius=0.025 and RADIUS_SCALE=3.0, diameter ~ 0.15
+        // HIGH depth_threshold (0.5-1.0) to "melt" spheres together
+        // LARGE filter size (20-30 pixels) to reach across gaps
         let bilateral_params_h = GpuBlurParams {
             blur_dir: [1.0, 0.0],  // Horizontal
-            depth_threshold: 0.15, // Depth sigma - roughly particle diameter
-            max_filter_size: 15.0, // Spatial radius in pixels
+            depth_threshold: 0.8,  // High value to merge spheres aggressively
+            max_filter_size: 25.0, // Large spatial radius
             projected_particle_constant: 0.0,
             _pad1: [0.0; 3],
             _padding: [0.0; 3],
@@ -157,8 +160,8 @@ impl ScreenSpaceFluidRenderer {
 
         let bilateral_params_v = GpuBlurParams {
             blur_dir: [0.0, 1.0],  // Vertical
-            depth_threshold: 0.15, // Same depth sigma
-            max_filter_size: 15.0, // Same spatial radius
+            depth_threshold: 0.8,  // Same high value
+            max_filter_size: 25.0, // Same large radius
             projected_particle_constant: 0.0,
             _pad1: [0.0; 3],
             _padding: [0.0; 3],
@@ -167,6 +170,23 @@ impl ScreenSpaceFluidRenderer {
         let blur_params_buffer_v = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SS Bilateral Params V"),
             contents: bytemuck::bytes_of(&bilateral_params_v),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Curvature flow params - separate buffer with LOW dt for stable smoothing
+        // dt in depth_threshold field (curvature flow shader reads it as dt)
+        let flow_params = GpuBlurParams {
+            blur_dir: [0.0, 0.0],  // Not used by curvature flow
+            depth_threshold: 0.003, // LOW dt for stable curvature flow
+            max_filter_size: 0.0,
+            projected_particle_constant: 0.0,
+            _pad1: [0.0; 3],
+            _padding: [0.0; 3],
+            _pad2: 0.0,
+        };
+        let flow_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SS Flow Params"),
+            contents: bytemuck::bytes_of(&flow_params),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -402,6 +422,37 @@ impl ScreenSpaceFluidRenderer {
             ],
         });
 
+        // Curvature flow bind groups - use separate flow_params_buffer with low dt
+        let flow_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SS Flow Bind Group A"),
+            layout: &blur_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&blur_view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: flow_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let flow_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SS Flow Bind Group B"),
+            layout: &blur_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&blur_view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: flow_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
         let thickness_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SS Thickness Bind Group"),
             layout: &thickness_bind_group_layout,
@@ -455,6 +506,7 @@ impl ScreenSpaceFluidRenderer {
             fluid_params_buffer,
             blur_params_buffer_h,
             blur_params_buffer_v,
+            flow_params_buffer,
             water_params_buffer,
             depth_pipeline,
             bilateral_blur_pipeline,
@@ -465,6 +517,8 @@ impl ScreenSpaceFluidRenderer {
             blur_bind_group_a,
             blur_bind_group_b,
             blur_bind_group_c,
+            flow_bind_group_a,
+            flow_bind_group_b,
             thickness_bind_group,
             composite_bind_group,
             blur_bind_group_layout,
@@ -505,7 +559,7 @@ impl ScreenSpaceFluidRenderer {
         let (depth_buffer, depth_buffer_view) = create_depth_buffer(device, width, height);
         let (blur_texture_a, blur_view_a) = create_color_texture(device, width, height, "SS Blur A");
         let (blur_texture_b, blur_view_b) = create_color_texture(device, width, height, "SS Blur B");
-        let (thickness_texture, thickness_view) = create_color_texture(device, width, height, "SS Thickness");
+        let (thickness_texture, thickness_view) = create_thickness_texture(device, width, height);
 
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
@@ -560,6 +614,36 @@ impl ScreenSpaceFluidRenderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: self.blur_params_buffer_h.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.flow_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SS Flow Bind Group A"),
+            layout: &self.blur_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.blur_view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.flow_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.flow_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SS Flow Bind Group B"),
+            layout: &self.blur_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.blur_view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.flow_params_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -685,9 +769,9 @@ impl ScreenSpaceFluidRenderer {
         }
 
         // PASS 3: Curvature flow - polish pass to smooth surface tension
-        // This refines the shape after bilateral blur has merged the spheres
+        // Uses separate flow_bind_groups with LOW dt for stable smoothing
         for _iter in 0..5 {
-            // Curvature flow pass A
+            // Curvature flow pass A: blur_b → blur_a
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("SS Curvature Flow A"),
@@ -706,11 +790,11 @@ impl ScreenSpaceFluidRenderer {
                 });
 
                 pass.set_pipeline(&self.curvature_flow_pipeline);
-                pass.set_bind_group(0, &self.blur_bind_group_c, &[]);  // reads blur_b
+                pass.set_bind_group(0, &self.flow_bind_group_a, &[]);  // reads blur_b with flow params
                 pass.draw(0..3, 0..1);
             }
 
-            // Curvature flow pass B
+            // Curvature flow pass B: blur_a → blur_b
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("SS Curvature Flow B"),
@@ -729,7 +813,7 @@ impl ScreenSpaceFluidRenderer {
                 });
 
                 pass.set_pipeline(&self.curvature_flow_pipeline);
-                pass.set_bind_group(0, &self.blur_bind_group_b, &[]);  // reads blur_a
+                pass.set_bind_group(0, &self.flow_bind_group_b, &[]);  // reads blur_a with flow params
                 pass.draw(0..3, 0..1);
             }
         }
@@ -850,6 +934,28 @@ fn create_color_texture(device: &wgpu::Device, width: u32, height: u32, label: &
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
+        // R32Float for high precision depth storage (eliminates quantization artifacts)
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn create_thickness_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("SS Thickness"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        // Rgba16Float for thickness - needs blending support for additive accumulation
         format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
@@ -918,9 +1024,9 @@ fn create_depth_pipeline(
             module: shader,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba16Float,
+                format: wgpu::TextureFormat::R32Float,
                 blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
+                write_mask: wgpu::ColorWrites::RED,
             })],
             compilation_options: Default::default(),
         }),
@@ -970,9 +1076,9 @@ fn create_blur_pipeline(
             module: shader,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba16Float,
+                format: wgpu::TextureFormat::R32Float,
                 blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
+                write_mask: wgpu::ColorWrites::RED,
             })],
             compilation_options: Default::default(),
         }),
@@ -1031,7 +1137,7 @@ fn create_thickness_pipeline(
             module: shader,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba16Float,
+                format: wgpu::TextureFormat::Rgba16Float,  // Blendable format for additive thickness
                 blend: Some(wgpu::BlendState {
                     color: wgpu::BlendComponent {
                         src_factor: wgpu::BlendFactor::One,

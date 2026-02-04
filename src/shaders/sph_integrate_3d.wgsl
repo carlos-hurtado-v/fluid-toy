@@ -66,7 +66,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var accel = force / density;
 
     // Clamp acceleration to prevent explosions from extreme pressure
-    let max_accel = 50.0;
+    // Higher limit allows stronger wall forces to resist corner compression
+    let max_accel = 200.0;
     let accel_mag = length(accel);
     if (accel_mag > max_accel) {
         accel = accel * (max_accel / accel_mag);

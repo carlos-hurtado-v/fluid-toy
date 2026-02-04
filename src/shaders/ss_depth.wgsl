@@ -65,7 +65,7 @@ fn vs_main(
 }
 
 struct FragmentOutput {
-    @location(0) depth: vec4<f32>,
+    @location(0) depth: f32,  // R32Float - high precision depth
     @builtin(frag_depth) frag_depth: f32,
 }
 
@@ -93,7 +93,7 @@ fn fs_main(input: VertexOutput) -> FragmentOutput {
 
     var output: FragmentOutput;
     // Output view-space Z (negative in view space, so negate for positive depth)
-    output.depth = vec4<f32>(-real_view_pos.z, 0.0, 0.0, 1.0);
+    output.depth = -real_view_pos.z;
     // Hardware depth for depth testing
     output.frag_depth = clip_pos.z / clip_pos.w;
     return output;
