@@ -1,5 +1,5 @@
 // Screen-Space Fluid - Composite Pass
-// Reconstructs normals from depth, applies water shading
+// Reconstructs normals from depth, applies water shading with environment map
 
 struct CameraParams {
     view: mat4x4<f32>,
@@ -14,12 +14,20 @@ struct WaterParams {
     fresnel_bias: f32,
     inv_projection: mat4x4<f32>,
     inv_view: mat4x4<f32>,
+    env_rotation: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 }
 
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
 @group(0) @binding(1) var thickness_tex: texture_2d<f32>;
 @group(0) @binding(2) var<uniform> camera: CameraParams;
 @group(0) @binding(3) var<uniform> water: WaterParams;
+@group(0) @binding(4) var env_tex: texture_2d<f32>;
+@group(0) @binding(5) var env_sampler: sampler;
+
+const PI: f32 = 3.14159265359;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -42,17 +50,42 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
+// Rotate a direction around the Y axis
+fn rotate_y(dir: vec3<f32>, angle: f32) -> vec3<f32> {
+    let c = cos(angle);
+    let s = sin(angle);
+    return vec3<f32>(
+        c * dir.x + s * dir.z,
+        dir.y,
+        -s * dir.x + c * dir.z
+    );
+}
+
+// Sample equirectangular environment map from world-space direction
+fn sample_environment(dir: vec3<f32>) -> vec3<f32> {
+    // Apply environment rotation around Y axis
+    let rotated_dir = rotate_y(dir, water.env_rotation);
+
+    // Convert direction to spherical coordinates
+    // phi = atan2(z, x), theta = acos(y)
+    let phi = atan2(rotated_dir.z, rotated_dir.x);
+    let theta = acos(clamp(rotated_dir.y, -1.0, 1.0));
+
+    // Convert to UV coordinates
+    // U: phi goes from -PI to PI, map to 0..1
+    // V: theta goes from 0 (top) to PI (bottom), map to 0..1
+    //    Flip V because texture has Y=0 at top
+    let u = (phi + PI) / (2.0 * PI);
+    let v = 1.0 - theta / PI;
+
+    let color = textureSample(env_tex, env_sampler, vec2<f32>(u, v));
+    return color.rgb;
+}
+
 // Reconstruct view-space position from UV and depth
-// Note: UV has (0,0) at top-left matching texture coordinates after flip
 fn compute_view_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
-    // NDC coordinates: UV (0,0) = top-left = NDC (-1, +1)
-    // UV (1,1) = bottom-right = NDC (+1, -1)
     var ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, 0.0, 1.0);
-
-    // Compute NDC z from view depth using projection matrix
     ndc.z = -camera.projection[2][2] + camera.projection[3][2] / depth;
-
-    // Unproject to view space
     var view_pos = water.inv_projection * ndc;
     return view_pos.xyz / view_pos.w;
 }
@@ -62,54 +95,73 @@ fn get_view_pos_at(uv: vec2<f32>, iuv: vec2<i32>) -> vec3<f32> {
     return compute_view_pos(uv, depth);
 }
 
+// sRGB gamma correction (linear -> sRGB)
+fn gamma_correct(color: vec3<f32>) -> vec3<f32> {
+    return pow(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
+}
+
+// Attempt to linearize if data was stored with gamma (sRGB -> linear)
+fn gamma_to_linear(color: vec3<f32>) -> vec3<f32> {
+    return pow(color, vec3<f32>(2.2));
+}
+
+// HDR to SDR conversion
+// Set USE_GAMMA_CORRECT to see which looks better
+fn hdr_to_sdr(color: vec3<f32>, exposure: f32) -> vec3<f32> {
+    let exposed = color * exposure;
+    // The HDR data from the image crate appears to already have gamma baked in
+    // So we DON'T apply additional gamma correction
+    return clamp(exposed, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let tex_size = vec2<f32>(textureDimensions(depth_tex));
-    // Flip Y for texture coordinate (UV 0,0 is bottom-left, texture 0,0 is top-left)
     let flipped_uv = vec2<f32>(input.uv.x, 1.0 - input.uv.y);
     let iuv = vec2<i32>(flipped_uv * tex_size);
 
     let depth = abs(textureLoad(depth_tex, iuv, 0).r);
-    let bg_color = vec3<f32>(0.02, 0.02, 0.05);
 
-    // Background - no fluid here
+    // Compute world-space ray direction for background
+    let ndc = vec2<f32>(input.uv.x * 2.0 - 1.0, 1.0 - 2.0 * input.uv.y);
+    let view_ray = normalize((water.inv_projection * vec4<f32>(ndc, 1.0, 1.0)).xyz);
+    let world_ray = normalize((water.inv_view * vec4<f32>(view_ray, 0.0)).xyz);
+
+    // Background - sample environment map
     if (depth == 0.0 || depth >= 1e4) {
-        return vec4<f32>(bg_color, 1.0);
+        let env_color = sample_environment(world_ray);
+        // Apply tone mapping and gamma for HDR (exposure = 1.0 for neutral)
+        let mapped = hdr_to_sdr(env_color, 1.0);
+        return vec4<f32>(mapped, 1.0);
     }
 
-    // Get view-space position (use flipped UV for consistent coordinate system)
+    // Get view-space position
     let view_pos = compute_view_pos(flipped_uv, depth);
-    
+
     // === NORMAL RECONSTRUCTION WITH STRIDE ===
-    // Widen the sampling kernel to smooth out faceted "grape" artifacts.
-    // stride = 1.0 : Sharpest, but shows artifacts if blur isn't perfect
-    // stride = 2.0 or 3.0 : Smoother normals, hides the sphere shapes
-    let stride = 2.0; 
+    let stride = 4.0;
     let stride_i = i32(stride);
 
-    // Compute gradients (Central differences with wider gap)
-    // Note: We multiply texel_size by stride for UVs, and use stride_i for integer lookups
     let ddx1 = get_view_pos_at(
-        flipped_uv + vec2<f32>(water.texel_size.x * stride, 0.0), 
+        flipped_uv + vec2<f32>(water.texel_size.x * stride, 0.0),
         iuv + vec2<i32>(stride_i, 0)
     ) - view_pos;
 
     let ddy1 = get_view_pos_at(
-        flipped_uv + vec2<f32>(0.0, water.texel_size.y * stride), 
+        flipped_uv + vec2<f32>(0.0, water.texel_size.y * stride),
         iuv + vec2<i32>(0, stride_i)
     ) - view_pos;
 
     let ddx2 = view_pos - get_view_pos_at(
-        flipped_uv - vec2<f32>(water.texel_size.x * stride, 0.0), 
+        flipped_uv - vec2<f32>(water.texel_size.x * stride, 0.0),
         iuv - vec2<i32>(stride_i, 0)
     );
 
     let ddy2 = view_pos - get_view_pos_at(
-        flipped_uv - vec2<f32>(0.0, water.texel_size.y * stride), 
+        flipped_uv - vec2<f32>(0.0, water.texel_size.y * stride),
         iuv - vec2<i32>(0, stride_i)
     );
 
-    // Use the gradient with smaller z change (edge preservation logic remains the same)
     var ddx = ddx1;
     if (abs(ddx2.z) < abs(ddx1.z)) {
         ddx = ddx2;
@@ -119,60 +171,72 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         ddy = ddy2;
     }
 
-    // Normal from cross product (negate for correct orientation)
     var normal = -normalize(cross(ddx, ddy));
 
-    // Ray direction (view space, pointing from camera into scene)
+    // Ray direction (view space)
     let ray_dir = normalize(view_pos);
 
-    // Light direction in view space
-    let light_dir = normalize((camera.view * vec4<f32>(0.5, 1.0, 0.3, 0.0)).xyz);
+    // Transform normal to world space for environment lookup
+    let normal_world = normalize((water.inv_view * vec4<f32>(normal, 0.0)).xyz);
+    let ray_world = normalize((water.inv_view * vec4<f32>(ray_dir, 0.0)).xyz);
 
-    // Blinn-Phong specular
-    let H = normalize(light_dir - ray_dir);
-    let specular = pow(max(0.0, dot(H, normal)), water.specular_power);
+    // Reflection direction in world space
+    let reflect_world = reflect(ray_world, normal_world);
 
-    // Diffuse
-    let diffuse = max(0.0, dot(light_dir, normal));
+    // Sample environment for reflection
+    let reflection_color = sample_environment(reflect_world);
 
-    // Thickness for absorption (use same flipped coordinates)
+    // Light direction (from environment - approximate sun direction)
+    // For "puresky" type HDRIs, sun is typically near the horizon
+    let light_dir = normalize(vec3<f32>(0.5, 0.3, 0.8));
+
+    // Specular highlight (Blinn-Phong)
+    let H = normalize(light_dir - ray_world);
+    let specular = pow(max(0.0, dot(H, normal_world)), water.specular_power) * 2.0;
+
+    // Thickness for absorption
     let thickness = textureLoad(thickness_tex, iuv, 0).r;
 
-    // Water color and absorption (Beer's law)
-    let water_color = vec3<f32>(0.1, 0.5, 0.9);
-    let density = 2.0;
-    let transmittance = exp(-density * thickness * (1.0 - water_color));
-    let refraction_color = bg_color * transmittance;
+    // Water absorption color (Beer's law)
+    let water_color = vec3<f32>(0.1, 0.4, 0.8);
+    let absorption_color = vec3<f32>(0.8, 0.95, 1.0); // What color light becomes after passing through
+    let density = 3.0;
+    let transmittance = exp(-density * thickness * (1.0 - absorption_color));
+
+    // Refraction - sample environment behind the water (distorted by normal)
+    let refract_dir = refract(ray_world, normal_world, 0.75); // water IOR ~1.33, air/water = 0.75
+    var refraction_color: vec3<f32>;
+    if (length(refract_dir) < 0.001) {
+        // Total internal reflection
+        refraction_color = reflection_color;
+    } else {
+        refraction_color = sample_environment(refract_dir) * transmittance;
+    }
 
     // Fresnel (Schlick approximation)
     let F0 = water.fresnel_bias;
-    let fresnel = clamp(F0 + (1.0 - F0) * pow(1.0 - dot(normal, -ray_dir), 5.0), 0.0, 1.0);
+    let cos_theta = max(0.0, dot(normal_world, -ray_world));
+    let fresnel = clamp(F0 + (1.0 - F0) * pow(1.0 - cos_theta, 5.0), 0.0, 1.0);
 
-    // Reflection (simple sky gradient)
-    let reflect_dir = reflect(ray_dir, normal);
-    let reflect_world = (water.inv_view * vec4<f32>(reflect_dir, 0.0)).xyz;
-    let sky_color = mix(
-        vec3<f32>(0.4, 0.6, 0.9),
-        vec3<f32>(0.7, 0.85, 1.0),
-        max(0.0, reflect_world.y * 0.5 + 0.5)
-    );
+    // Combine reflection and refraction based on Fresnel
+    var color = mix(refraction_color, reflection_color, fresnel);
 
-    // Final color
-    var color = specular + mix(refraction_color, sky_color, fresnel);
+    // Add specular highlight
+    color += vec3<f32>(1.0) * specular;
 
-    // Add subtle diffuse contribution
-    color += water_color * diffuse * 0.2;
+    // Subtle water tint based on thickness
+    color = mix(color, color * water_color, clamp(thickness * 0.3, 0.0, 0.5));
 
-    // ===== DEBUG VISUALIZATION (uncomment ONE to diagnose) =====
+    // Tone mapping and gamma correction for HDR
+    color = hdr_to_sdr(color, 1.0);
+
+    // ===== DEBUG VISUALIZATION =====
     // return vec4<f32>(vec3<f32>(depth * 0.1), 1.0);           // Raw Depth
-    // return vec4<f32>(vec3<f32>(depth * 0.3), 1.0);           // Depth (gray)
-    // return vec4<f32>(normal * 0.5 + 0.5, 1.0);               // Normals (RGB)
-    // return vec4<f32>(vec3<f32>(thickness), 1.0);             // Thickness (gray)
-    // return vec4<f32>(vec3<f32>(fresnel), 1.0);               // Fresnel (gray)
-    // return vec4<f32>(vec3<f32>(specular), 1.0);              // Specular (gray)
-    // return vec4<f32>(vec3<f32>(diffuse), 1.0);               // Diffuse (gray)
-    // return vec4<f32>(refraction_color, 1.0);                 // Refraction only
-    // return vec4<f32>(sky_color * fresnel, 1.0);              // Reflection only
+    // return vec4<f32>(normal_world * 0.5 + 0.5, 1.0);         // Normals (RGB)
+    // return vec4<f32>(vec3<f32>(thickness), 1.0);             // Thickness
+    // return vec4<f32>(vec3<f32>(fresnel), 1.0);               // Fresnel
+    // return vec4<f32>(hdr_to_sdr(reflection_color, 1.0), 1.0);  // Reflection only
+    // return vec4<f32>(hdr_to_sdr(refraction_color, 1.0), 1.0);  // Refraction only
 
     return vec4<f32>(color, 1.0);
 }

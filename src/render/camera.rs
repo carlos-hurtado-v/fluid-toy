@@ -80,6 +80,14 @@ impl Camera {
         self.distance = (self.distance - delta).clamp(0.5, 20.0);
     }
 
+    /// Reset camera to default position
+    pub fn reset(&mut self) {
+        self.distance = 3.0;
+        self.yaw = 0.0;
+        self.pitch = 0.4;
+        self.target = [0.0, 0.0, 0.0];
+    }
+
     /// Update aspect ratio (call on window resize)
     pub fn set_aspect(&mut self, width: f32, height: f32) {
         self.aspect = width / height;
@@ -219,51 +227,4 @@ impl Camera {
             ray_origin[2] + t * ray_dir[2],
         ])
     }
-}
-
-/// Invert a perspective projection matrix
-fn invert_perspective(fov: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
-    let f = 1.0 / (fov / 2.0).tan();
-    let nf = 1.0 / (near - far);
-    let a = f / aspect;
-    let b = f;
-    let c = (far + near) * nf;
-    let d = 2.0 * far * near * nf;
-
-    // Inverse of perspective matrix
-    [
-        [1.0 / a, 0.0, 0.0, 0.0],
-        [0.0, 1.0 / b, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0 / d],
-        [0.0, 0.0, -1.0, c / d],
-    ]
-}
-
-/// Invert a look-at view matrix
-fn invert_look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
-    let f = normalize([
-        target[0] - eye[0],
-        target[1] - eye[1],
-        target[2] - eye[2],
-    ]);
-    let r = normalize(cross(f, up));
-    let u = cross(r, f);
-
-    // Inverse is transpose of rotation part, with eye position
-    [
-        [r[0], r[1], r[2], 0.0],
-        [u[0], u[1], u[2], 0.0],
-        [-f[0], -f[1], -f[2], 0.0],
-        [eye[0], eye[1], eye[2], 1.0],
-    ]
-}
-
-/// Multiply 4x4 matrix by vec4
-fn mat4_mul_vec4(m: &[[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
-    [
-        m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2] + m[3][0] * v[3],
-        m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2] + m[3][1] * v[3],
-        m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2] + m[3][2] * v[3],
-        m[0][3] * v[0] + m[1][3] * v[1] + m[2][3] * v[2] + m[3][3] * v[3],
-    ]
 }

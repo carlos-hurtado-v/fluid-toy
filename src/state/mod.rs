@@ -84,6 +84,8 @@ pub struct RenderConfig {
     pub background_color: [f32; 3],
     /// Rendering mode (particles or marching cubes)
     pub render_mode: FluidRenderMode,
+    /// Environment map rotation (radians, around Y axis)
+    pub env_rotation: f32,
 }
 
 /// Camera configuration for 3D viewing
@@ -167,6 +169,7 @@ impl Default for RenderConfig {
             color_by_velocity: true,
             background_color: [0.02, 0.02, 0.05],
             render_mode: FluidRenderMode::ScreenSpace,  // Use screen-space rendering by default
+            env_rotation: 0.0,
         }
     }
 }

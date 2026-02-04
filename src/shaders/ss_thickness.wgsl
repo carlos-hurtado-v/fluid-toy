@@ -25,7 +25,7 @@ struct VertexOutput {
 @group(0) @binding(1) var<uniform> params: FluidParams;
 
 // Visual radius multiplier - must match ss_depth.wgsl
-const RADIUS_SCALE: f32 = 3.0;
+const RADIUS_SCALE: f32 = 4.5;
 
 @vertex
 fn vs_main(

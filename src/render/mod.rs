@@ -1,6 +1,7 @@
 //! Rendering module
 
 pub mod camera;
+pub mod environment;
 pub mod fluid_renderer;
 pub mod marching_cubes;
 pub mod particle_renderer;

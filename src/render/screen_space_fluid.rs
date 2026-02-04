@@ -8,12 +8,13 @@
 //! 4. Composite Pass - Final water shading with normals from depth
 
 use crate::render::camera::GpuCameraParams;
+use crate::render::environment::load_embedded_environment_map;
 use crate::simulation::SphParticle3D;
 use wgpu::util::DeviceExt;
 
 // Compile-time size assertions for debugging
 const _: () = assert!(std::mem::size_of::<GpuCameraParams>() == 144, "GpuCameraParams must be 144 bytes");
-const _: () = assert!(std::mem::size_of::<GpuWaterParams>() == 144, "GpuWaterParams must be 144 bytes");
+const _: () = assert!(std::mem::size_of::<GpuWaterParams>() == 160, "GpuWaterParams must be 160 bytes");
 const _: () = assert!(std::mem::size_of::<GpuBlurParams>() == 48, "GpuBlurParams must be 48 bytes (WGSL std140)");
 const _: () = assert!(std::mem::size_of::<GpuFluidParams>() == 16, "GpuFluidParams must be 16 bytes");
 
@@ -51,7 +52,12 @@ pub struct GpuWaterParams {
     pub fresnel_bias: f32,
     pub inv_projection: [[f32; 4]; 4],
     pub inv_view: [[f32; 4]; 4],
+    pub env_rotation: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
+    pub _pad3: f32,
 }
+// Total: 160 bytes
 
 pub struct ScreenSpaceFluidRenderer {
     // Textures
@@ -65,6 +71,12 @@ pub struct ScreenSpaceFluidRenderer {
     blur_view_b: wgpu::TextureView,
     thickness_texture: wgpu::Texture,
     thickness_view: wgpu::TextureView,
+
+    // Environment map
+    #[allow(dead_code)]
+    env_texture: wgpu::Texture,
+    env_view: wgpu::TextureView,
+    env_sampler: wgpu::Sampler,
 
     // Buffers
     camera_buffer: wgpu::Buffer,
@@ -101,6 +113,7 @@ pub struct ScreenSpaceFluidRenderer {
 impl ScreenSpaceFluidRenderer {
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         surface_format: wgpu::TextureFormat,
         camera_params: &GpuCameraParams,
         width: u32,
@@ -116,6 +129,10 @@ impl ScreenSpaceFluidRenderer {
         let (blur_texture_b, blur_view_b) = create_color_texture(device, width, height, "SS Blur B");
         // Thickness needs blendable format for additive accumulation
         let (thickness_texture, thickness_view) = create_thickness_texture(device, width, height);
+
+        // Load environment map (embedded at compile time)
+        let (env_texture, env_view, env_sampler) = load_embedded_environment_map(device, queue)
+            .expect("Failed to load environment map");
 
         // Create buffers - use explicit size to ensure alignment
         let camera_size = std::mem::size_of::<GpuCameraParams>() as u64;
@@ -141,12 +158,12 @@ impl ScreenSpaceFluidRenderer {
         });
 
         // Bilateral blur params - primary smoothing to merge spheres
-        // HIGH depth_threshold (0.5-1.0) to "melt" spheres together
-        // LARGE filter size (20-30 pixels) to reach across gaps
+        // HIGH depth_threshold (1.0-3.0) to "melt" spheres together
+        // LARGE filter size (30-50 pixels) to reach across gaps
         let bilateral_params_h = GpuBlurParams {
             blur_dir: [1.0, 0.0],  // Horizontal
-            depth_threshold: 0.8,  // High value to merge spheres aggressively
-            max_filter_size: 25.0, // Large spatial radius
+            depth_threshold: 2.5,  // Very high - merge spheres aggressively
+            max_filter_size: 40.0, // Large spatial radius for wide coverage
             projected_particle_constant: 0.0,
             _pad1: [0.0; 3],
             _padding: [0.0; 3],
@@ -160,8 +177,8 @@ impl ScreenSpaceFluidRenderer {
 
         let bilateral_params_v = GpuBlurParams {
             blur_dir: [0.0, 1.0],  // Vertical
-            depth_threshold: 0.8,  // Same high value
-            max_filter_size: 25.0, // Same large radius
+            depth_threshold: 2.5,  // Same very high value
+            max_filter_size: 40.0, // Same large radius
             projected_particle_constant: 0.0,
             _pad1: [0.0; 3],
             _padding: [0.0; 3],
@@ -177,7 +194,7 @@ impl ScreenSpaceFluidRenderer {
         // dt in depth_threshold field (curvature flow shader reads it as dt)
         let flow_params = GpuBlurParams {
             blur_dir: [0.0, 0.0],  // Not used by curvature flow
-            depth_threshold: 0.003, // LOW dt for stable curvature flow
+            depth_threshold: 0.005, // Slightly higher dt for more aggressive smoothing
             max_filter_size: 0.0,
             projected_particle_constant: 0.0,
             _pad1: [0.0; 3],
@@ -190,7 +207,7 @@ impl ScreenSpaceFluidRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let water_params = create_water_params(width, height, camera_params);
+        let water_params = create_water_params(width, height, camera_params, 0.0);
         let water_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SS Water Params Buffer"),
             contents: bytemuck::bytes_of(&water_params),
@@ -350,6 +367,24 @@ impl ScreenSpaceFluidRenderer {
                     },
                     count: None,
                 },
+                // Environment map texture (binding 4)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Environment map sampler (binding 5)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -488,6 +523,14 @@ impl ScreenSpaceFluidRenderer {
                     binding: 3,
                     resource: water_params_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&env_sampler),
+                },
             ],
         });
 
@@ -502,6 +545,9 @@ impl ScreenSpaceFluidRenderer {
             blur_view_b,
             thickness_texture,
             thickness_view,
+            env_texture,
+            env_view,
+            env_sampler,
             camera_buffer,
             fluid_params_buffer,
             blur_params_buffer_h,
@@ -531,7 +577,7 @@ impl ScreenSpaceFluidRenderer {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(params));
     }
 
-    pub fn update_params(&self, queue: &wgpu::Queue, particle_radius: f32, width: u32, height: u32, camera_params: &GpuCameraParams) {
+    pub fn update_params(&self, queue: &wgpu::Queue, particle_radius: f32, width: u32, height: u32, camera_params: &GpuCameraParams, env_rotation: f32) {
         let fluid_params = GpuFluidParams {
             particle_radius,
             screen_width: width as f32,
@@ -540,7 +586,7 @@ impl ScreenSpaceFluidRenderer {
         };
         queue.write_buffer(&self.fluid_params_buffer, 0, bytemuck::bytes_of(&fluid_params));
 
-        let water_params = create_water_params(width, height, camera_params);
+        let water_params = create_water_params(width, height, camera_params, env_rotation);
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&water_params));
     }
 
@@ -668,6 +714,14 @@ impl ScreenSpaceFluidRenderer {
                     binding: 3,
                     resource: self.water_params_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&self.env_sampler),
+                },
             ],
         });
     }
@@ -713,9 +767,9 @@ impl ScreenSpaceFluidRenderer {
 
         // PASS 2: Bilateral blur - primary smoothing to merge spheres into blob
         // Uses wide spatial filter with depth-aware weighting
-        // More iterations = smoother result (4-6 is typical)
+        // More iterations = smoother result (6-8 is typical for fluid)
         // Iteration pattern: depth → blur_a → blur_b, then blur_b → blur_a → blur_b
-        for iter in 0..5 {
+        for iter in 0..8 {
             // Horizontal bilateral blur
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -770,7 +824,8 @@ impl ScreenSpaceFluidRenderer {
 
         // PASS 3: Curvature flow - polish pass to smooth surface tension
         // Uses separate flow_bind_groups with LOW dt for stable smoothing
-        for _iter in 0..5 {
+        // More iterations = smoother, more polished surface
+        for _iter in 0..10 {
             // Curvature flow pass A: blur_b → blur_a
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -872,13 +927,17 @@ impl ScreenSpaceFluidRenderer {
     }
 }
 
-fn create_water_params(width: u32, height: u32, camera_params: &GpuCameraParams) -> GpuWaterParams {
+fn create_water_params(width: u32, height: u32, camera_params: &GpuCameraParams, env_rotation: f32) -> GpuWaterParams {
     GpuWaterParams {
         texel_size: [1.0 / width as f32, 1.0 / height as f32],
         specular_power: 250.0,
         fresnel_bias: 0.02,
         inv_projection: invert_matrix(&camera_params.projection),
         inv_view: invert_matrix(&camera_params.view),
+        env_rotation,
+        _pad1: 0.0,
+        _pad2: 0.0,
+        _pad3: 0.0,
     }
 }
 

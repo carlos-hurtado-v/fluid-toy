@@ -26,7 +26,8 @@ struct VertexOutput {
 
 // Visual radius multiplier - makes spheres overlap for smooth fluid surface
 // Higher = more overlap before blur, helps merge spheres
-const RADIUS_SCALE: f32 = 3.5;
+// 4.5-5.0 gives good liquid appearance with particle_radius ~0.025
+const RADIUS_SCALE: f32 = 4.5;
 
 @vertex
 fn vs_main(

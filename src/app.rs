@@ -131,6 +131,7 @@ impl App {
         // Create screen-space fluid renderer (photorealistic)
         let ss_renderer = ScreenSpaceFluidRenderer::new(
             &gpu.device,
+            &gpu.queue,
             gpu.config.format,
             &camera_params,
             gpu.config.width,
@@ -297,12 +298,11 @@ impl ApplicationHandler for App {
                 // Always track mouse position for force interaction
                 self.current_mouse_pos = (position.x, position.y);
 
-                // Camera rotation on left drag
+                // Camera orbit control on left drag
                 if self.mouse_pressed {
                     if let Some((last_x, last_y)) = self.last_mouse_pos {
                         let delta_x = (position.x - last_x) as f32;
                         let delta_y = (position.y - last_y) as f32;
-                        // Rotate camera: horizontal drag = yaw, vertical drag = pitch
                         self.camera.rotate(delta_x * 0.01, -delta_y * 0.01);
                     }
                     self.last_mouse_pos = Some((position.x, position.y));
@@ -316,7 +316,7 @@ impl ApplicationHandler for App {
                 self.camera.zoom(scroll);
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // Handle both press and hold for continuous tilting
+                // Handle keys on press only
                 if event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(key_code) = event.physical_key {
                         let tilt_speed = 0.05; // Radians per key event
@@ -337,10 +337,11 @@ impl ApplicationHandler for App {
                             KeyCode::ArrowDown => {
                                 self.state.simulation.tilt_x += tilt_speed;
                             }
-                            // Home to reset tilt
+                            // Home to reset tilt AND camera
                             KeyCode::Home => {
                                 self.state.simulation.tilt_x = 0.0;
                                 self.state.simulation.tilt_z = 0.0;
+                                self.camera.reset();
                             }
                             // End to flip upside down
                             KeyCode::End => {
@@ -431,10 +432,10 @@ impl App {
                 );
 
                 // Intersect with horizontal plane at y = -0.6 (where fluid settles)
-                // If that fails, try y = 0 (center), then use camera target as fallback
+                // If that fails, try y = 0 (center), then use origin as fallback
                 let hit = self.camera.ray_plane_intersection(ray_origin, ray_dir, -0.6)
                     .or_else(|| self.camera.ray_plane_intersection(ray_origin, ray_dir, 0.0))
-                    .unwrap_or(self.camera.target);
+                    .unwrap_or([0.0, 0.0, 0.0]);
 
                 GpuMouseForce {
                     position: hit,
@@ -529,6 +530,7 @@ impl App {
                             gpu.config.width,
                             gpu.config.height,
                             &camera_params,
+                            self.state.rendering.env_rotation,
                         );
                         ss_renderer.render(
                             &mut encoder,

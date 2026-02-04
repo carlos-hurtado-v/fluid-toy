@@ -152,6 +152,12 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.add_space(4.0);
                 ui.label("Background:");
                 egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.background_color);
+
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Slider::new(&mut state.rendering.env_rotation, 0.0..=std::f32::consts::TAU)
+                        .text("Environment Rotation")
+                );
             });
 
             ui.add_space(16.0);
