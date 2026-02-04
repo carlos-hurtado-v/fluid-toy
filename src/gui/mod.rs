@@ -130,7 +130,8 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
             ui.collapsing("Rendering", |ui| {
                 ui.label("Render Mode:");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::MarchingCubes, "Water");
+                    ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::ScreenSpace, "Screen-Space");
+                    ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::MarchingCubes, "Marching Cubes");
                     ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::Particles, "Particles");
                 });
                 ui.add_space(4.0);

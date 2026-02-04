@@ -5,13 +5,15 @@
 pub enum FluidRenderMode {
     /// Simple particle spheres (fast, debug-friendly)
     Particles,
-    /// Marching cubes surface reconstruction (photorealistic)
+    /// Marching cubes surface reconstruction
     MarchingCubes,
+    /// Screen-space fluid rendering (photorealistic)
+    ScreenSpace,
 }
 
 impl Default for FluidRenderMode {
     fn default() -> Self {
-        Self::MarchingCubes
+        Self::ScreenSpace
     }
 }
 
@@ -164,7 +166,7 @@ impl Default for RenderConfig {
             particle_color: [0.2, 0.4, 0.9],
             color_by_velocity: true,
             background_color: [0.02, 0.02, 0.05],
-            render_mode: FluidRenderMode::MarchingCubes,  // Use water rendering by default
+            render_mode: FluidRenderMode::ScreenSpace,  // Use screen-space rendering by default
         }
     }
 }

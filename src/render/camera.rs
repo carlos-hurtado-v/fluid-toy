@@ -144,14 +144,16 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 }
 
 /// GPU-compatible camera uniform data
+/// Layout matches WGSL std140: mat4x4 requires 16-byte alignment
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuCameraParams {
-    pub view: [[f32; 4]; 4],
-    pub projection: [[f32; 4]; 4],
-    pub camera_pos: [f32; 3],
-    pub _padding: f32,
+    pub view: [[f32; 4]; 4],       // 64 bytes, offset 0
+    pub projection: [[f32; 4]; 4], // 64 bytes, offset 64
+    pub camera_pos: [f32; 3],      // 12 bytes
+    pub _padding: f32,             // 4 bytes
 }
+// Total: 144 bytes
 
 impl Camera {
     /// Convert to GPU-compatible uniform struct

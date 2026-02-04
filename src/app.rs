@@ -12,7 +12,7 @@ use winit::{
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, FluidRenderer, MarchingCubesRenderer, ParticleRenderer3D};
+use crate::render::{Camera, FluidRenderer, MarchingCubesRenderer, ParticleRenderer3D, ScreenSpaceFluidRenderer};
 use crate::simulation::{SphParticle3D, SphSimulation3DGrid};
 use crate::state::{AppState, FluidRenderMode, GpuMouseForce};
 
@@ -23,6 +23,7 @@ pub struct App {
     fluid_renderer: Option<FluidRenderer>,
     mc_renderer: Option<MarchingCubesRenderer>,
     mc_depth_texture: Option<wgpu::TextureView>,
+    ss_renderer: Option<ScreenSpaceFluidRenderer>,
     sph_simulation: Option<SphSimulation3DGrid>,
     camera: Camera,
     state: AppState,
@@ -51,6 +52,7 @@ impl App {
             fluid_renderer: None,
             mc_renderer: None,
             mc_depth_texture: None,
+            ss_renderer: None,
             sph_simulation: None,
             camera: Camera::default(),
             state: AppState::default(),
@@ -119,11 +121,20 @@ impl App {
             gpu.config.height,
         );
 
-        // Create marching cubes renderer (photorealistic)
+        // Create marching cubes renderer
         let mc_renderer = MarchingCubesRenderer::new(
             &gpu.device,
             gpu.config.format,
             &camera_params,
+        );
+
+        // Create screen-space fluid renderer (photorealistic)
+        let ss_renderer = ScreenSpaceFluidRenderer::new(
+            &gpu.device,
+            gpu.config.format,
+            &camera_params,
+            gpu.config.width,
+            gpu.config.height,
         );
 
         // Create depth texture for marching cubes
@@ -164,6 +175,7 @@ impl App {
         self.fluid_renderer = Some(fluid_renderer);
         self.mc_renderer = Some(mc_renderer);
         self.mc_depth_texture = Some(mc_depth_view);
+        self.ss_renderer = Some(ss_renderer);
         self.sph_simulation = Some(sph_simulation);
         self.egui_winit = Some(egui_winit);
         self.egui_renderer = Some(egui_renderer);
@@ -257,6 +269,9 @@ impl ApplicationHandler for App {
                     self.camera.set_aspect(new_size.width as f32, new_size.height as f32);
                     if let Some(renderer) = &mut self.renderer {
                         renderer.resize(&gpu.device, new_size.width, new_size.height);
+                    }
+                    if let Some(ss_renderer) = &mut self.ss_renderer {
+                        ss_renderer.resize(&gpu.device, new_size.width, new_size.height);
                     }
                 }
             }
@@ -503,8 +518,29 @@ impl App {
         // Render fluid or particles based on render mode
         if let Some(sph_sim) = &self.sph_simulation {
             match self.state.rendering.render_mode {
+                FluidRenderMode::ScreenSpace => {
+                    // Screen-space fluid rendering (photorealistic)
+                    if let Some(ss_renderer) = &self.ss_renderer {
+                        let camera_params = self.camera.to_gpu_params();
+                        ss_renderer.update_camera(&gpu.queue, &camera_params);
+                        ss_renderer.update_params(
+                            &gpu.queue,
+                            self.state.rendering.particle_radius,
+                            gpu.config.width,
+                            gpu.config.height,
+                            &camera_params,
+                        );
+                        ss_renderer.render(
+                            &mut encoder,
+                            &view,
+                            sph_sim.particle_buffer(),
+                            sph_sim.num_particles(),
+                            &self.state.rendering.background_color,
+                        );
+                    }
+                }
                 FluidRenderMode::MarchingCubes => {
-                    // Marching cubes surface reconstruction (photorealistic)
+                    // Marching cubes surface reconstruction
                     if let (Some(mc_renderer), Some(depth_view)) = (&self.mc_renderer, &self.mc_depth_texture) {
                         mc_renderer.update_camera(&gpu.queue, &self.camera.to_gpu_params());
                         mc_renderer.update_params(&gpu.queue, sph_sim.num_particles(), self.state.sph.kernel_radius);
