@@ -164,6 +164,20 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     ui.checkbox(&mut state.rendering.color_by_velocity, "Color by velocity");
                 }
 
+                if state.rendering.render_mode == FluidRenderMode::ScreenSpace {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label("Surface Detail:");
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.ripple_scale, 1.0..=50.0)
+                            .text("Ripple Scale")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.ripple_strength, 0.0..=1.0)
+                            .text("Ripple Strength")
+                    );
+                }
+
                 ui.add_space(4.0);
                 ui.label("Particle Color:");
                 egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.particle_color);

@@ -98,8 +98,12 @@ pub struct RenderConfig {
     /// Rendering mode (particles or marching cubes)
     pub render_mode: FluidRenderMode,
     /// Scene rotation matrix (3x3, rotates the fluid in world space)
-    /// Camera and environment stay fixed, scene rotates
+    /// Camera and environment stays fixed, scene rotates
     pub scene_rotation: [[f32; 3]; 3],
+    /// Ripple scale - frequency of surface detail ripples (higher = more dense)
+    pub ripple_scale: f32,
+    /// Ripple strength - how much ripples perturb surface normals
+    pub ripple_strength: f32,
 }
 
 /// Camera configuration for 3D viewing
@@ -219,6 +223,8 @@ impl Default for RenderConfig {
                 [0.0, 1.0, 0.0],
                 [0.0, 0.0, 1.0],
             ],  // Identity matrix
+            ripple_scale: 15.0,      // Frequency of surface ripples
+            ripple_strength: 0.3,    // Moderate perturbation
         }
     }
 }

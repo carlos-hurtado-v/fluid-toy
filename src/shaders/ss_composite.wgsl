@@ -14,6 +14,11 @@ struct WaterParams {
     fresnel_bias: f32,
     inv_projection: mat4x4<f32>,
     inv_view: mat4x4<f32>,
+    // Surface detail parameters
+    ripple_scale: f32,      // Frequency of ripples (higher = more dense)
+    ripple_strength: f32,   // How much ripples perturb normals
+    time: f32,              // For animated ripples
+    _padding2: f32,
 }
 
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
@@ -24,6 +29,82 @@ struct WaterParams {
 @group(0) @binding(5) var env_sampler: sampler;
 
 const PI: f32 = 3.14159265359;
+
+// Simple hash function for procedural noise
+fn hash(p: vec2<f32>) -> f32 {
+    let h = dot(p, vec2<f32>(127.1, 311.7));
+    return fract(sin(h) * 43758.5453123);
+}
+
+// Smooth noise (value noise with interpolation)
+fn noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+
+    // Cubic interpolation for smoothness
+    let u = f * f * (3.0 - 2.0 * f);
+
+    let a = hash(i + vec2<f32>(0.0, 0.0));
+    let b = hash(i + vec2<f32>(1.0, 0.0));
+    let c = hash(i + vec2<f32>(0.0, 1.0));
+    let d = hash(i + vec2<f32>(1.0, 1.0));
+
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// Fractal Brownian Motion - layered noise for natural look
+fn fbm(p: vec2<f32>, octaves: i32) -> f32 {
+    var value = 0.0;
+    var amplitude = 0.5;
+    var frequency = 1.0;
+    var pos = p;
+
+    for (var i = 0; i < octaves; i++) {
+        value += amplitude * noise(pos * frequency);
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+
+    return value;
+}
+
+// Compute normal perturbation from procedural ripples
+fn compute_ripple_normal(world_pos: vec3<f32>, scale: f32, strength: f32, time: f32) -> vec3<f32> {
+    // Use XZ plane for ripple pattern (horizontal surface)
+    let p = world_pos.xz * scale;
+
+    // Animated offset
+    let t = time * 0.5;
+
+    // Multiple overlapping wave patterns for organic look
+    let wave1 = sin(p.x * 1.0 + t * 0.7) * sin(p.y * 1.2 - t * 0.5);
+    let wave2 = sin(p.x * 2.3 - t * 0.3) * sin(p.y * 1.8 + t * 0.4) * 0.5;
+    let wave3 = fbm(p * 0.5 + vec2<f32>(t * 0.1, -t * 0.15), 3) * 2.0 - 1.0;
+
+    // Combine waves
+    let height = (wave1 + wave2 + wave3 * 0.3) * strength;
+
+    // Compute gradient for normal (numerical derivative)
+    let eps = 0.1;
+    let p_dx = world_pos.xz * scale + vec2<f32>(eps, 0.0);
+    let p_dy = world_pos.xz * scale + vec2<f32>(0.0, eps);
+
+    let wave1_dx = sin(p_dx.x * 1.0 + t * 0.7) * sin(p_dx.y * 1.2 - t * 0.5);
+    let wave2_dx = sin(p_dx.x * 2.3 - t * 0.3) * sin(p_dx.y * 1.8 + t * 0.4) * 0.5;
+    let wave3_dx = fbm(p_dx * 0.5 + vec2<f32>(t * 0.1, -t * 0.15), 3) * 2.0 - 1.0;
+    let height_dx = (wave1_dx + wave2_dx + wave3_dx * 0.3) * strength;
+
+    let wave1_dy = sin(p_dy.x * 1.0 + t * 0.7) * sin(p_dy.y * 1.2 - t * 0.5);
+    let wave2_dy = sin(p_dy.x * 2.3 - t * 0.3) * sin(p_dy.y * 1.8 + t * 0.4) * 0.5;
+    let wave3_dy = fbm(p_dy * 0.5 + vec2<f32>(t * 0.1, -t * 0.15), 3) * 2.0 - 1.0;
+    let height_dy = (wave1_dy + wave2_dy + wave3_dy * 0.3) * strength;
+
+    // Normal from height gradient
+    let dx = (height_dx - height) / eps;
+    let dy = (height_dy - height) / eps;
+
+    return normalize(vec3<f32>(-dx, 1.0, -dy));
+}
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -159,7 +240,32 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let ray_dir = normalize(view_pos);
 
     // Transform normal to world space for environment lookup
-    let normal_world = normalize((water.inv_view * vec4<f32>(normal, 0.0)).xyz);
+    var normal_world = normalize((water.inv_view * vec4<f32>(normal, 0.0)).xyz);
+
+    // === SURFACE DETAIL: Procedural ripple perturbation ===
+    // This adds micro-surface variation to break up flat areas
+    if (water.ripple_strength > 0.001) {
+        // Get world position of this surface point
+        let world_pos = (water.inv_view * vec4<f32>(view_pos, 1.0)).xyz;
+
+        // Compute ripple normal in world space
+        let ripple_normal = compute_ripple_normal(
+            world_pos,
+            water.ripple_scale,
+            water.ripple_strength,
+            water.time
+        );
+
+        // Blend ripple normal with geometric normal using TBN-style perturbation
+        // The ripple_normal is in tangent space (Y-up), we blend it with world normal
+        let up = vec3<f32>(0.0, 1.0, 0.0);
+        let tangent = normalize(cross(up, normal_world));
+        let bitangent = cross(normal_world, tangent);
+
+        // Transform ripple from tangent to world space and blend
+        let perturbed = tangent * ripple_normal.x + normal_world * ripple_normal.y + bitangent * ripple_normal.z;
+        normal_world = normalize(mix(normal_world, perturbed, water.ripple_strength));
+    }
     let ray_world = normalize((water.inv_view * vec4<f32>(ray_dir, 0.0)).xyz);
 
     // Reflection direction in world space

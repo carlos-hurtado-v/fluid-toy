@@ -563,6 +563,9 @@ impl App {
                             gpu.config.height,
                             &camera_params,
                             &identity,
+                            self.state.rendering.ripple_scale,
+                            self.state.rendering.ripple_strength,
+                            self.state.runtime.time_elapsed,
                         );
                         ss_renderer.render(
                             &mut encoder,
