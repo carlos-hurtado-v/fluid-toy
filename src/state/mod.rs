@@ -1,12 +1,14 @@
 //! Central state management - single source of truth for the application
 
+pub mod post_process;
+
+pub use post_process::{GpuPostProcessParams, PostProcessConfig};
+
 /// Fluid render mode selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FluidRenderMode {
     /// Simple particle spheres (fast, debug-friendly)
     Particles,
-    /// Marching cubes surface reconstruction
-    MarchingCubes,
     /// Screen-space fluid rendering (photorealistic)
     ScreenSpace,
 }
@@ -21,8 +23,10 @@ impl Default for FluidRenderMode {
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub simulation: SimulationConfig,
+    pub container: ContainerConfig,
     pub sph: SphConfig,
     pub rendering: RenderConfig,
+    pub post_process: PostProcessConfig,
     pub camera: CameraConfig,
     pub runtime: RuntimeState,
 }
@@ -34,14 +38,6 @@ pub struct SimulationConfig {
     pub delta_time: f32,
     /// Gravity acceleration magnitude
     pub gravity: f32,
-    /// Container tilt around X axis (radians) - tilts forward/back
-    pub tilt_x: f32,
-    /// Container tilt around Z axis (radians) - tilts left/right
-    pub tilt_z: f32,
-    /// Boundary extents (particles stay within [-bound, bound])
-    pub bounds: (f32, f32),
-    /// Z-axis boundary extent (for 3D mode)
-    pub bounds_z: f32,
     /// Energy retained on bounce (0 = no bounce, 1 = perfect elastic)
     pub damping: f32,
     /// Whether simulation is running
@@ -50,6 +46,23 @@ pub struct SimulationConfig {
     pub max_particles: u32,
     /// Initial particle cube dimension (N×N×N particles on reset)
     pub initial_cube_size: u32,
+}
+
+/// Container configuration - defines the fluid container
+#[derive(Debug, Clone)]
+pub struct ContainerConfig {
+    /// Container width (X axis, centered at 0)
+    pub width: f32,
+    /// Container depth (Z axis, centered at 0)
+    pub depth: f32,
+    /// Floor Y position (bottom of container)
+    pub floor_y: f32,
+    /// Container height (extends upward from floor_y)
+    pub height: f32,
+    /// Container tilt around X axis (radians) - tilts forward/back
+    pub tilt_x: f32,
+    /// Container tilt around Z axis (radians) - tilts left/right
+    pub tilt_z: f32,
 }
 
 /// SPH physics configuration
@@ -84,8 +97,9 @@ pub struct RenderConfig {
     pub background_color: [f32; 3],
     /// Rendering mode (particles or marching cubes)
     pub render_mode: FluidRenderMode,
-    /// Environment map rotation (radians, around Y axis)
-    pub env_rotation: f32,
+    /// Scene rotation matrix (3x3, rotates the fluid in world space)
+    /// Camera and environment stay fixed, scene rotates
+    pub scene_rotation: [[f32; 3]; 3],
 }
 
 /// Camera configuration for 3D viewing
@@ -118,8 +132,10 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             simulation: SimulationConfig::default(),
+            container: ContainerConfig::default(),
             sph: SphConfig::default(),
             rendering: RenderConfig::default(),
+            post_process: PostProcessConfig::default(),
             camera: CameraConfig::default(),
             runtime: RuntimeState::default(),
         }
@@ -131,15 +147,44 @@ impl Default for SimulationConfig {
         Self {
             delta_time: 0.006,   // Reference: 0.006
             gravity: 9.8,        // Magnitude (positive)
-            tilt_x: 0.0,         // No tilt
-            tilt_z: 0.0,
-            bounds: (0.9, 0.9),
-            bounds_z: 0.9,
             damping: 0.3,
             paused: false,       // Start running
             max_particles: 50_000,
             initial_cube_size: 20, // 20×20×20 = 8000 particles
         }
+    }
+}
+
+impl Default for ContainerConfig {
+    fn default() -> Self {
+        Self {
+            width: 1.8,          // Full X dimension (-0.9 to +0.9)
+            depth: 1.8,          // Full Z dimension (-0.9 to +0.9)
+            floor_y: -0.9,       // Floor at bottom
+            height: 1.8,         // Extends to +0.9
+            tilt_x: 0.0,         // No tilt
+            tilt_z: 0.0,
+        }
+    }
+}
+
+impl ContainerConfig {
+    pub fn reset_defaults(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Get the ceiling Y position
+    pub fn ceiling_y(&self) -> f32 {
+        self.floor_y + self.height
+    }
+
+    /// Convert to half-extents for GPU (legacy format)
+    pub fn half_width(&self) -> f32 {
+        self.width / 2.0
+    }
+
+    pub fn half_depth(&self) -> f32 {
+        self.depth / 2.0
     }
 }
 
@@ -169,9 +214,86 @@ impl Default for RenderConfig {
             color_by_velocity: true,
             background_color: [0.02, 0.02, 0.05],
             render_mode: FluidRenderMode::ScreenSpace,  // Use screen-space rendering by default
-            env_rotation: 0.0,
+            scene_rotation: [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],  // Identity matrix
         }
     }
+}
+
+impl RenderConfig {
+    pub fn reset_defaults(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Calculate the visual margin for boundary compensation
+    /// Screen-space rendering expands particles significantly (4.5x), particles mode does not
+    pub fn visual_margin(&self) -> f32 {
+        match self.render_mode {
+            FluidRenderMode::ScreenSpace => self.particle_radius * 4.5,
+            FluidRenderMode::Particles => self.particle_radius, // Just the particle radius
+        }
+    }
+
+    /// Apply trackball rotation from mouse delta
+    /// delta_x rotates around Y axis (vertical screen axis)
+    /// delta_y rotates around X axis (horizontal screen axis)
+    pub fn rotate_scene(&mut self, delta_x: f32, delta_y: f32) {
+        let sensitivity = 0.01;
+        let angle_y = -delta_x * sensitivity;
+        let angle_x = -delta_y * sensitivity;
+
+        // Rotation around Y axis
+        let rot_y = [
+            [angle_y.cos(), 0.0, angle_y.sin()],
+            [0.0, 1.0, 0.0],
+            [-angle_y.sin(), 0.0, angle_y.cos()],
+        ];
+
+        // Rotation around X axis
+        let rot_x = [
+            [1.0, 0.0, 0.0],
+            [0.0, angle_x.cos(), -angle_x.sin()],
+            [0.0, angle_x.sin(), angle_x.cos()],
+        ];
+
+        // Combine: new_rotation = rot_y * rot_x * current_rotation
+        let temp = mat3_mul(&rot_x, &self.scene_rotation);
+        self.scene_rotation = mat3_mul(&rot_y, &temp);
+    }
+
+    /// Reset scene rotation to identity
+    pub fn reset_scene_rotation(&mut self) {
+        self.scene_rotation = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+    }
+
+    /// Convert scene rotation to 4x4 matrix for GPU
+    pub fn scene_rotation_matrix_4x4(&self) -> [[f32; 4]; 4] {
+        let r = &self.scene_rotation;
+        [
+            [r[0][0], r[0][1], r[0][2], 0.0],
+            [r[1][0], r[1][1], r[1][2], 0.0],
+            [r[2][0], r[2][1], r[2][2], 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    }
+}
+
+/// Multiply two 3x3 matrices
+fn mat3_mul(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut result = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            result[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    result
 }
 
 impl Default for SphConfig {
@@ -225,13 +347,13 @@ impl Default for RuntimeState {
 }
 
 impl SimulationConfig {
-    /// Convert to GPU-compatible uniform struct
+    /// Convert to GPU-compatible uniform struct (legacy 2D - bounds now in ContainerConfig)
     pub fn to_gpu_params(&self, num_particles: u32) -> GpuSimParams {
         GpuSimParams {
             delta_time: self.delta_time,
             gravity: self.gravity,
-            bound_x: self.bounds.0,
-            bound_y: self.bounds.1,
+            bound_x: 0.9,  // Legacy - use ContainerConfig for 3D
+            bound_y: 0.9,  // Legacy - use ContainerConfig for 3D
             damping: self.damping,
             num_particles,
             _padding: [0.0; 2],
@@ -336,10 +458,12 @@ pub struct GpuSphParams3D {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuBoundsParams3D {
-    pub bound_x: f32,
-    pub bound_y: f32,
-    pub bound_z: f32,
+    pub bound_x: f32,        // Half-width (symmetric: -bound_x to +bound_x)
+    pub bound_z: f32,        // Half-depth (symmetric: -bound_z to +bound_z)
+    pub floor_y: f32,        // Floor Y position
+    pub ceiling_y: f32,      // Ceiling Y position
     pub wall_stiffness: f32,
+    pub _padding: [f32; 3],  // Padding for 16-byte alignment
     // Rotation matrix for container orientation (3x3 stored as 3 vec4s for alignment)
     pub rotation_row0: [f32; 4],  // First row + padding
     pub rotation_row1: [f32; 4],  // Second row + padding
@@ -413,9 +537,13 @@ impl SphConfig {
     }
 }
 
-impl SimulationConfig {
+impl ContainerConfig {
     /// Convert to 3D GPU-compatible bounds struct with rotation
-    pub fn to_gpu_bounds_3d(&self, wall_stiffness: f32) -> GpuBoundsParams3D {
+    ///
+    /// `particle_visual_radius` is used to shrink bounds so the rendered fluid
+    /// surface stays within the visual wireframe (particle centers are constrained
+    /// inside bounds minus this margin)
+    pub fn to_gpu_bounds_3d(&self, wall_stiffness: f32, particle_visual_radius: f32) -> GpuBoundsParams3D {
         // Compute rotation matrix from tilt angles
         // Rotation around X (tilt_x) then around Z (tilt_z)
         let (sin_x, cos_x) = self.tilt_x.sin_cos();
@@ -428,11 +556,16 @@ impl SimulationConfig {
         let rotation_row1 = [sin_z, cos_z * cos_x, -cos_z * sin_x, 0.0];
         let rotation_row2 = [0.0, sin_x, cos_x, 0.0];
 
+        // Shrink physics bounds by visual radius so rendered surface fits inside wireframe
+        let margin = particle_visual_radius;
+
         GpuBoundsParams3D {
-            bound_x: self.bounds.0,
-            bound_y: self.bounds.1,
-            bound_z: self.bounds_z,
+            bound_x: (self.half_width() - margin).max(0.1),
+            bound_z: (self.half_depth() - margin).max(0.1),
+            floor_y: self.floor_y + margin,
+            ceiling_y: (self.ceiling_y() - margin).max(self.floor_y + margin + 0.1),
             wall_stiffness,
+            _padding: [0.0; 3],
             rotation_row0,
             rotation_row1,
             rotation_row2,

@@ -93,7 +93,9 @@ impl SphSimulation3DGrid {
         // Calculate grid dimensions based on bounds and kernel radius
         // Use sqrt(3) multiplier to handle tilted containers (diagonal extends further)
         let cell_size = sph_params.kernel_radius;
-        let base_extent = bounds_params.bound_x.max(bounds_params.bound_y).max(bounds_params.bound_z);
+        // For Y extent, use max of |floor| and |ceiling| since container can be asymmetric
+        let y_extent = bounds_params.floor_y.abs().max(bounds_params.ceiling_y.abs());
+        let base_extent = bounds_params.bound_x.max(y_extent).max(bounds_params.bound_z);
         let bounds_extent = base_extent * 1.8 + 0.2;  // ~sqrt(3) for worst-case tilt + margin
         let grid_size = ((2.0 * bounds_extent) / cell_size).ceil() as u32 + 2;
         let total_cells = grid_size * grid_size * grid_size;

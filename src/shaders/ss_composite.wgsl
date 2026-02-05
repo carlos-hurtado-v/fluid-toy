@@ -14,10 +14,6 @@ struct WaterParams {
     fresnel_bias: f32,
     inv_projection: mat4x4<f32>,
     inv_view: mat4x4<f32>,
-    env_rotation: f32,
-    _pad1: f32,
-    _pad2: f32,
-    _pad3: f32,
 }
 
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
@@ -50,26 +46,12 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-// Rotate a direction around the Y axis
-fn rotate_y(dir: vec3<f32>, angle: f32) -> vec3<f32> {
-    let c = cos(angle);
-    let s = sin(angle);
-    return vec3<f32>(
-        c * dir.x + s * dir.z,
-        dir.y,
-        -s * dir.x + c * dir.z
-    );
-}
-
 // Sample equirectangular environment map from world-space direction
 fn sample_environment(dir: vec3<f32>) -> vec3<f32> {
-    // Apply environment rotation around Y axis
-    let rotated_dir = rotate_y(dir, water.env_rotation);
-
     // Convert direction to spherical coordinates
     // phi = atan2(z, x), theta = acos(y)
-    let phi = atan2(rotated_dir.z, rotated_dir.x);
-    let theta = acos(clamp(rotated_dir.y, -1.0, 1.0));
+    let phi = atan2(dir.z, dir.x);
+    let theta = acos(clamp(dir.y, -1.0, 1.0));
 
     // Convert to UV coordinates
     // U: phi goes from -PI to PI, map to 0..1
@@ -231,8 +213,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     color = hdr_to_sdr(color, 1.0);
 
     // ===== DEBUG VISUALIZATION =====
+    // Uncomment ONE of these to diagnose rendering issues:
     // return vec4<f32>(vec3<f32>(depth * 0.1), 1.0);           // Raw Depth
-    // return vec4<f32>(normal_world * 0.5 + 0.5, 1.0);         // Normals (RGB)
+    // return vec4<f32>(normal_world * 0.5 + 0.5, 1.0);         // Normals (RGB) - DEBUG ENABLED
     // return vec4<f32>(vec3<f32>(thickness), 1.0);             // Thickness
     // return vec4<f32>(vec3<f32>(fresnel), 1.0);               // Fresnel
     // return vec4<f32>(hdr_to_sdr(reflection_color, 1.0), 1.0);  // Reflection only

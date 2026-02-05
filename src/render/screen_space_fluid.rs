@@ -14,9 +14,9 @@ use wgpu::util::DeviceExt;
 
 // Compile-time size assertions for debugging
 const _: () = assert!(std::mem::size_of::<GpuCameraParams>() == 144, "GpuCameraParams must be 144 bytes");
-const _: () = assert!(std::mem::size_of::<GpuWaterParams>() == 160, "GpuWaterParams must be 160 bytes");
+const _: () = assert!(std::mem::size_of::<GpuWaterParams>() == 144, "GpuWaterParams must be 144 bytes");
 const _: () = assert!(std::mem::size_of::<GpuBlurParams>() == 48, "GpuBlurParams must be 48 bytes (WGSL std140)");
-const _: () = assert!(std::mem::size_of::<GpuFluidParams>() == 16, "GpuFluidParams must be 16 bytes");
+const _: () = assert!(std::mem::size_of::<GpuFluidParams>() == 80, "GpuFluidParams must be 80 bytes");
 
 /// GPU-compatible fluid rendering parameters (depth pass)
 #[repr(C)]
@@ -26,6 +26,7 @@ pub struct GpuFluidParams {
     pub screen_width: f32,
     pub screen_height: f32,
     pub _padding: f32,
+    pub scene_rotation: [[f32; 4]; 4],  // mat4x4 for scene turntable rotation
 }
 
 /// GPU-compatible blur parameters
@@ -52,12 +53,8 @@ pub struct GpuWaterParams {
     pub fresnel_bias: f32,
     pub inv_projection: [[f32; 4]; 4],
     pub inv_view: [[f32; 4]; 4],
-    pub env_rotation: f32,
-    pub _pad1: f32,
-    pub _pad2: f32,
-    pub _pad3: f32,
 }
-// Total: 160 bytes
+// Total: 144 bytes
 
 pub struct ScreenSpaceFluidRenderer {
     // Textures
@@ -150,6 +147,12 @@ impl ScreenSpaceFluidRenderer {
             screen_width: width as f32,
             screen_height: height as f32,
             _padding: 0.0,
+            scene_rotation: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
         };
         let fluid_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SS Fluid Params Buffer"),
@@ -207,7 +210,7 @@ impl ScreenSpaceFluidRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let water_params = create_water_params(width, height, camera_params, 0.0);
+        let water_params = create_water_params(width, height, camera_params);
         let water_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SS Water Params Buffer"),
             contents: bytemuck::bytes_of(&water_params),
@@ -577,16 +580,17 @@ impl ScreenSpaceFluidRenderer {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(params));
     }
 
-    pub fn update_params(&self, queue: &wgpu::Queue, particle_radius: f32, width: u32, height: u32, camera_params: &GpuCameraParams, env_rotation: f32) {
+    pub fn update_params(&self, queue: &wgpu::Queue, particle_radius: f32, width: u32, height: u32, camera_params: &GpuCameraParams, scene_rotation: &[[f32; 4]; 4]) {
         let fluid_params = GpuFluidParams {
             particle_radius,
             screen_width: width as f32,
             screen_height: height as f32,
             _padding: 0.0,
+            scene_rotation: *scene_rotation,
         };
         queue.write_buffer(&self.fluid_params_buffer, 0, bytemuck::bytes_of(&fluid_params));
 
-        let water_params = create_water_params(width, height, camera_params, env_rotation);
+        let water_params = create_water_params(width, height, camera_params);
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&water_params));
     }
 
@@ -927,17 +931,13 @@ impl ScreenSpaceFluidRenderer {
     }
 }
 
-fn create_water_params(width: u32, height: u32, camera_params: &GpuCameraParams, env_rotation: f32) -> GpuWaterParams {
+fn create_water_params(width: u32, height: u32, camera_params: &GpuCameraParams) -> GpuWaterParams {
     GpuWaterParams {
         texel_size: [1.0 / width as f32, 1.0 / height as f32],
         specular_power: 250.0,
         fresnel_bias: 0.02,
         inv_projection: invert_matrix(&camera_params.projection),
         inv_view: invert_matrix(&camera_params.view),
-        env_rotation,
-        _pad1: 0.0,
-        _pad2: 0.0,
-        _pad3: 0.0,
     }
 }
 

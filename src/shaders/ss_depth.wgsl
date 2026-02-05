@@ -13,6 +13,7 @@ struct FluidParams {
     screen_width: f32,
     screen_height: f32,
     _padding: f32,
+    scene_rotation: mat4x4<f32>,
 }
 
 struct VertexOutput {
@@ -49,8 +50,11 @@ fn vs_main(
     let corner = vec3<f32>(corners[vertex_index] * visual_radius, 0.0);
     let uv = corners[vertex_index] * 0.5 + 0.5;
 
+    // Apply scene rotation to particle position (turntable)
+    let rotated_pos = (params.scene_rotation * vec4<f32>(particle_pos, 1.0)).xyz;
+
     // Transform particle to view space
-    let view_center = (camera.view * vec4<f32>(particle_pos, 1.0)).xyz;
+    let view_center = (camera.view * vec4<f32>(rotated_pos, 1.0)).xyz;
 
     // Billboard in view space (add corner offset)
     let view_pos = view_center + corner;

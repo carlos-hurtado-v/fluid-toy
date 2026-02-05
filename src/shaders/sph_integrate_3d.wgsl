@@ -1,5 +1,5 @@
 // SPH 3D Integration Shader
-// Soft boundary forces only (matching reference implementation)
+// Hard boundary constraints with velocity reflection
 
 struct SphParticle3D {
     position: vec3<f32>,
@@ -26,10 +26,14 @@ struct SphParams {
 }
 
 struct BoundsParams {
-    bound_x: f32,
-    bound_y: f32,
-    bound_z: f32,
+    bound_x: f32,        // Half-width (symmetric: -bound_x to +bound_x)
+    bound_z: f32,        // Half-depth (symmetric: -bound_z to +bound_z)
+    floor_y: f32,        // Floor Y position (asymmetric)
+    ceiling_y: f32,      // Ceiling Y position (asymmetric)
     wall_stiffness: f32,
+    _padding0: f32,
+    _padding1: f32,
+    _padding2: f32,
     // Rotation matrix rows (transforms world -> container local space)
     rotation_row0: vec4<f32>,
     rotation_row1: vec4<f32>,
@@ -86,45 +90,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
 
-    // Transform particle position to container-local space
-    // The rotation matrix transforms world coords -> container local coords
-    let rot_row0 = bounds.rotation_row0.xyz;
-    let rot_row1 = bounds.rotation_row1.xyz;
-    let rot_row2 = bounds.rotation_row2.xyz;
-
-    let local_pos = vec3<f32>(
-        dot(rot_row0, pos),
-        dot(rot_row1, pos),
-        dot(rot_row2, pos)
-    );
-
-    // Soft boundary forces in container-local space
-    let x_plus_dist = bounds.bound_x - local_pos.x;
-    let x_minus_dist = bounds.bound_x + local_pos.x;
-    let y_plus_dist = bounds.bound_y - local_pos.y;
-    let y_minus_dist = bounds.bound_y + local_pos.y;
-    let z_plus_dist = bounds.bound_z - local_pos.z;
-    let z_minus_dist = bounds.bound_z + local_pos.z;
-
-    // Compute forces in container-local space
-    var local_force = vec3<f32>(0.0, 0.0, 0.0);
-    local_force.x += bounds.wall_stiffness * min(x_plus_dist, 0.0);   // Right wall
-    local_force.x -= bounds.wall_stiffness * min(x_minus_dist, 0.0);  // Left wall
-    local_force.y += bounds.wall_stiffness * min(y_plus_dist, 0.0);   // Top wall
-    local_force.y -= bounds.wall_stiffness * min(y_minus_dist, 0.0);  // Bottom wall
-    local_force.z += bounds.wall_stiffness * min(z_plus_dist, 0.0);   // Front wall
-    local_force.z -= bounds.wall_stiffness * min(z_minus_dist, 0.0);  // Back wall
-
-    // Transform force back to world space (multiply by transpose = inverse rotation)
-    // For rotation matrix R, transpose is [column0, column1, column2] as rows
-    let world_force = vec3<f32>(
-        rot_row0.x * local_force.x + rot_row1.x * local_force.y + rot_row2.x * local_force.z,
-        rot_row0.y * local_force.x + rot_row1.y * local_force.y + rot_row2.y * local_force.z,
-        rot_row0.z * local_force.x + rot_row1.z * local_force.y + rot_row2.z * local_force.z
-    );
-
-    accel += world_force;
-
     // Semi-implicit Euler integration
     vel = vel + params.dt * accel;
 
@@ -135,6 +100,69 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     vel = vel * damping;
 
     pos = pos + params.dt * vel;
+
+    // === HARD BOUNDARY CONSTRAINTS ===
+    // Transform position to container-local space using rotation matrix
+    let rot_row0 = bounds.rotation_row0.xyz;
+    let rot_row1 = bounds.rotation_row1.xyz;
+    let rot_row2 = bounds.rotation_row2.xyz;
+
+    var local_pos = vec3<f32>(
+        dot(rot_row0, pos),
+        dot(rot_row1, pos),
+        dot(rot_row2, pos)
+    );
+
+    // Transform velocity to local space
+    var local_vel = vec3<f32>(
+        dot(rot_row0, vel),
+        dot(rot_row1, vel),
+        dot(rot_row2, vel)
+    );
+
+    // Restitution coefficient (how much velocity is retained on bounce)
+    let restitution = 0.3;
+
+    // Clamp position and reflect velocity at boundaries
+    // X axis (symmetric: -bound_x to +bound_x)
+    if (local_pos.x < -bounds.bound_x) {
+        local_pos.x = -bounds.bound_x;
+        local_vel.x = abs(local_vel.x) * restitution;
+    } else if (local_pos.x > bounds.bound_x) {
+        local_pos.x = bounds.bound_x;
+        local_vel.x = -abs(local_vel.x) * restitution;
+    }
+
+    // Y axis (asymmetric: floor_y to ceiling_y)
+    if (local_pos.y < bounds.floor_y) {
+        local_pos.y = bounds.floor_y;
+        local_vel.y = abs(local_vel.y) * restitution;
+    } else if (local_pos.y > bounds.ceiling_y) {
+        local_pos.y = bounds.ceiling_y;
+        local_vel.y = -abs(local_vel.y) * restitution;
+    }
+
+    // Z axis (symmetric: -bound_z to +bound_z)
+    if (local_pos.z < -bounds.bound_z) {
+        local_pos.z = -bounds.bound_z;
+        local_vel.z = abs(local_vel.z) * restitution;
+    } else if (local_pos.z > bounds.bound_z) {
+        local_pos.z = bounds.bound_z;
+        local_vel.z = -abs(local_vel.z) * restitution;
+    }
+
+    // Transform back to world space (multiply by transpose of rotation matrix)
+    pos = vec3<f32>(
+        rot_row0.x * local_pos.x + rot_row1.x * local_pos.y + rot_row2.x * local_pos.z,
+        rot_row0.y * local_pos.x + rot_row1.y * local_pos.y + rot_row2.y * local_pos.z,
+        rot_row0.z * local_pos.x + rot_row1.z * local_pos.y + rot_row2.z * local_pos.z
+    );
+
+    vel = vec3<f32>(
+        rot_row0.x * local_vel.x + rot_row1.x * local_vel.y + rot_row2.x * local_vel.z,
+        rot_row0.y * local_vel.x + rot_row1.y * local_vel.y + rot_row2.y * local_vel.z,
+        rot_row0.z * local_vel.x + rot_row1.z * local_vel.y + rot_row2.z * local_vel.z
+    );
 
     particles[i].velocity = vel;
     particles[i].position = pos;

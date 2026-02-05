@@ -14,6 +14,7 @@ struct FluidParams {
     screen_width: f32,
     screen_height: f32,
     _padding: f32,
+    scene_rotation: mat4x4<f32>,
 }
 
 struct VertexOutput {
@@ -45,8 +46,11 @@ fn vs_main(
 
     let local_pos = quad_verts[vertex_index];
 
+    // Apply scene rotation to particle position (turntable)
+    let rotated_pos = (params.scene_rotation * vec4<f32>(particle_pos, 1.0)).xyz;
+
     // Transform particle center to view space
-    let view_center = camera.view * vec4<f32>(particle_pos, 1.0);
+    let view_center = camera.view * vec4<f32>(rotated_pos, 1.0);
 
     // Create billboard quad in view space (use scaled radius for visual overlap)
     let visual_radius = params.particle_radius * RADIUS_SCALE;

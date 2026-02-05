@@ -12,7 +12,7 @@ use winit::{
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, FluidRenderer, MarchingCubesRenderer, ParticleRenderer3D, ScreenSpaceFluidRenderer};
+use crate::render::{Camera, FluidRenderer, GpuContainerParams, ParticleRenderer3D, PostProcessRenderer, ScreenSpaceFluidRenderer, WireframeRenderer};
 use crate::simulation::{SphParticle3D, SphSimulation3DGrid};
 use crate::state::{AppState, FluidRenderMode, GpuMouseForce};
 
@@ -21,9 +21,9 @@ pub struct App {
     gpu: Option<GpuContext>,
     renderer: Option<ParticleRenderer3D>,
     fluid_renderer: Option<FluidRenderer>,
-    mc_renderer: Option<MarchingCubesRenderer>,
-    mc_depth_texture: Option<wgpu::TextureView>,
     ss_renderer: Option<ScreenSpaceFluidRenderer>,
+    wireframe_renderer: Option<WireframeRenderer>,
+    post_process_renderer: Option<PostProcessRenderer>,
     sph_simulation: Option<SphSimulation3DGrid>,
     camera: Camera,
     state: AppState,
@@ -50,9 +50,9 @@ impl App {
             gpu: None,
             renderer: None,
             fluid_renderer: None,
-            mc_renderer: None,
-            mc_depth_texture: None,
             ss_renderer: None,
+            wireframe_renderer: None,
+            post_process_renderer: None,
             sph_simulation: None,
             camera: Camera::default(),
             state: AppState::default(),
@@ -102,7 +102,10 @@ impl App {
             self.state.runtime.particle_count,
             self.state.simulation.delta_time,
         );
-        let bounds_params = self.state.simulation.to_gpu_bounds_3d(self.state.sph.wall_stiffness);
+        let bounds_params = self.state.container.to_gpu_bounds_3d(
+                self.state.sph.wall_stiffness,
+                self.state.rendering.visual_margin(),
+            );
         let sph_simulation = SphSimulation3DGrid::new(
             &gpu.device,
             &gpu.queue,
@@ -121,13 +124,6 @@ impl App {
             gpu.config.height,
         );
 
-        // Create marching cubes renderer
-        let mc_renderer = MarchingCubesRenderer::new(
-            &gpu.device,
-            gpu.config.format,
-            &camera_params,
-        );
-
         // Create screen-space fluid renderer (photorealistic)
         let ss_renderer = ScreenSpaceFluidRenderer::new(
             &gpu.device,
@@ -138,22 +134,24 @@ impl App {
             gpu.config.height,
         );
 
-        // Create depth texture for marching cubes
-        let mc_depth_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("MC Depth Texture"),
-            size: wgpu::Extent3d {
-                width: gpu.config.width,
-                height: gpu.config.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let mc_depth_view = mc_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Create wireframe renderer for container visualization
+        let container_params = GpuContainerParams::from_config(&self.state.container);
+        let wireframe_renderer = WireframeRenderer::new(
+            &gpu.device,
+            gpu.config.format,
+            &camera_params,
+            &container_params,
+        );
+
+        // Create post-process renderer
+        let post_process_params = self.state.post_process.to_gpu_params();
+        let post_process_renderer = PostProcessRenderer::new(
+            &gpu.device,
+            gpu.config.format,
+            gpu.config.width,
+            gpu.config.height,
+            &post_process_params,
+        );
 
         // Setup egui
         let egui_winit = egui_winit::State::new(
@@ -174,9 +172,9 @@ impl App {
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
         self.fluid_renderer = Some(fluid_renderer);
-        self.mc_renderer = Some(mc_renderer);
-        self.mc_depth_texture = Some(mc_depth_view);
         self.ss_renderer = Some(ss_renderer);
+        self.wireframe_renderer = Some(wireframe_renderer);
+        self.post_process_renderer = Some(post_process_renderer);
         self.sph_simulation = Some(sph_simulation);
         self.egui_winit = Some(egui_winit);
         self.egui_renderer = Some(egui_renderer);
@@ -192,7 +190,10 @@ impl App {
                 self.state.runtime.particle_count,
                 self.state.simulation.delta_time,
             );
-            let bounds_params = self.state.simulation.to_gpu_bounds_3d(self.state.sph.wall_stiffness);
+            let bounds_params = self.state.container.to_gpu_bounds_3d(
+                self.state.sph.wall_stiffness,
+                self.state.rendering.visual_margin(),
+            );
             self.sph_simulation = Some(SphSimulation3DGrid::new(
                 &gpu.device,
                 &gpu.queue,
@@ -298,7 +299,7 @@ impl ApplicationHandler for App {
                 // Always track mouse position for force interaction
                 self.current_mouse_pos = (position.x, position.y);
 
-                // Camera orbit control on left drag
+                // Orbit camera control on left drag
                 if self.mouse_pressed {
                     if let Some((last_x, last_y)) = self.last_mouse_pos {
                         let delta_x = (position.x - last_x) as f32;
@@ -326,27 +327,27 @@ impl ApplicationHandler for App {
                             }
                             // Arrow keys for tilting
                             KeyCode::ArrowLeft => {
-                                self.state.simulation.tilt_z -= tilt_speed;
+                                self.state.container.tilt_z -= tilt_speed;
                             }
                             KeyCode::ArrowRight => {
-                                self.state.simulation.tilt_z += tilt_speed;
+                                self.state.container.tilt_z += tilt_speed;
                             }
                             KeyCode::ArrowUp => {
-                                self.state.simulation.tilt_x -= tilt_speed;
+                                self.state.container.tilt_x -= tilt_speed;
                             }
                             KeyCode::ArrowDown => {
-                                self.state.simulation.tilt_x += tilt_speed;
+                                self.state.container.tilt_x += tilt_speed;
                             }
                             // Home to reset tilt AND camera
                             KeyCode::Home => {
-                                self.state.simulation.tilt_x = 0.0;
-                                self.state.simulation.tilt_z = 0.0;
+                                self.state.container.tilt_x = 0.0;
+                                self.state.container.tilt_z = 0.0;
                                 self.camera.reset();
                             }
                             // End to flip upside down
                             KeyCode::End => {
-                                self.state.simulation.tilt_x = std::f32::consts::PI;
-                                self.state.simulation.tilt_z = 0.0;
+                                self.state.container.tilt_x = std::f32::consts::PI;
+                                self.state.container.tilt_z = 0.0;
                             }
                             _ => {}
                         }
@@ -412,8 +413,17 @@ impl App {
             );
             sph_sim.update_sph_params(&gpu.queue, &sph_params);
 
-            let bounds_params = self.state.simulation.to_gpu_bounds_3d(self.state.sph.wall_stiffness);
+            let bounds_params = self.state.container.to_gpu_bounds_3d(
+                self.state.sph.wall_stiffness,
+                self.state.rendering.visual_margin(),
+            );
             sph_sim.update_bounds_params(&gpu.queue, &bounds_params);
+
+            // Update wireframe container visualization
+            if let Some(wireframe) = &self.wireframe_renderer {
+                let container_params = GpuContainerParams::from_config(&self.state.container);
+                wireframe.update_container(&gpu.queue, &container_params);
+            }
 
             // Update gravity (based on tilt)
             let gravity = self.state.simulation.to_gpu_gravity();
@@ -452,6 +462,9 @@ impl App {
             // Update camera
             let camera_params = self.camera.to_gpu_params();
             renderer.update_camera(&gpu.queue, &camera_params);
+            if let Some(wireframe) = &self.wireframe_renderer {
+                wireframe.update_camera(&gpu.queue, &camera_params);
+            }
 
             let render_params = self.state.rendering.to_gpu_params();
             renderer.update_params(&gpu.queue, &render_params);
@@ -516,6 +529,18 @@ impl App {
             }
         }
 
+        // Determine render target (post-process intermediate or direct to screen)
+        let post_process_enabled = self.state.post_process.enabled;
+        let render_target = if post_process_enabled {
+            if let Some(pp) = &self.post_process_renderer {
+                pp.scene_view()
+            } else {
+                &view
+            }
+        } else {
+            &view
+        };
+
         // Render fluid or particles based on render mode
         if let Some(sph_sim) = &self.sph_simulation {
             match self.state.rendering.render_mode {
@@ -524,35 +549,26 @@ impl App {
                     if let Some(ss_renderer) = &self.ss_renderer {
                         let camera_params = self.camera.to_gpu_params();
                         ss_renderer.update_camera(&gpu.queue, &camera_params);
+                        // Identity scene rotation (camera orbits, scene stays fixed)
+                        let identity = [
+                            [1.0, 0.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ];
                         ss_renderer.update_params(
                             &gpu.queue,
                             self.state.rendering.particle_radius,
                             gpu.config.width,
                             gpu.config.height,
                             &camera_params,
-                            self.state.rendering.env_rotation,
+                            &identity,
                         );
                         ss_renderer.render(
                             &mut encoder,
-                            &view,
+                            render_target,
                             sph_sim.particle_buffer(),
                             sph_sim.num_particles(),
-                            &self.state.rendering.background_color,
-                        );
-                    }
-                }
-                FluidRenderMode::MarchingCubes => {
-                    // Marching cubes surface reconstruction
-                    if let (Some(mc_renderer), Some(depth_view)) = (&self.mc_renderer, &self.mc_depth_texture) {
-                        mc_renderer.update_camera(&gpu.queue, &self.camera.to_gpu_params());
-                        mc_renderer.update_params(&gpu.queue, sph_sim.num_particles(), self.state.sph.kernel_radius);
-                        mc_renderer.render(
-                            &gpu.device,
-                            &mut encoder,
-                            &view,
-                            depth_view,
-                            sph_sim.particle_buffer(),
-                            &gpu.queue,
                             &self.state.rendering.background_color,
                         );
                     }
@@ -562,7 +578,7 @@ impl App {
                     if let Some(renderer) = &self.renderer {
                         renderer.render(
                             &mut encoder,
-                            &view,
+                            render_target,
                             sph_sim.particle_buffer(),
                             sph_sim.num_particles(),
                             &self.state.rendering.background_color,
@@ -570,6 +586,35 @@ impl App {
                     }
                 }
             }
+        }
+
+        // Apply post-processing if enabled
+        if post_process_enabled {
+            if let Some(pp) = &self.post_process_renderer {
+                let pp_params = self.state.post_process.to_gpu_params();
+                pp.update_params(&gpu.queue, &pp_params);
+                pp.render(&mut encoder, &view, self.state.post_process.bloom_enabled, self.state.post_process.streaks_enabled);
+            }
+        }
+
+        // Render wireframe container visualization (on top of fluid, below UI)
+        if let Some(wireframe) = &self.wireframe_renderer {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Wireframe Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load, // Keep fluid rendering
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            wireframe.render(&mut render_pass);
         }
 
         // Render egui

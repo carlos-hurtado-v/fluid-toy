@@ -1,0 +1,155 @@
+//! Post-processing configuration
+
+/// Post-processing settings
+#[derive(Debug, Clone)]
+pub struct PostProcessConfig {
+    /// Master enable for all post-processing
+    pub enabled: bool,
+
+    // === Exposure / Tone Mapping ===
+    pub exposure: f32,
+    /// ACES filmic tonemapping for cinematic look
+    pub tonemapping_enabled: bool,
+
+    // === Color Grading ===
+    pub saturation: f32,
+    pub contrast: f32,
+    pub brightness: f32,
+    /// Color temperature shift (-1 = cool/blue, +1 = warm/orange)
+    pub temperature: f32,
+
+    // === Vignette ===
+    pub vignette_enabled: bool,
+    pub vignette_intensity: f32,
+    pub vignette_smoothness: f32,
+
+    // === Bloom ===
+    pub bloom_enabled: bool,
+    pub bloom_intensity: f32,
+    pub bloom_threshold: f32,
+
+    // === Chromatic Aberration ===
+    pub chromatic_aberration_enabled: bool,
+    pub chromatic_aberration_intensity: f32,
+
+    // === Anamorphic Streaks ===
+    pub streaks_enabled: bool,
+    pub streaks_intensity: f32,
+    pub streaks_threshold: f32,
+    /// Streak tint color [R, G, B]
+    pub streaks_tint: [f32; 3],
+}
+
+impl Default for PostProcessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+
+            // Exposure / Tonemapping
+            exposure: 1.0,
+            tonemapping_enabled: false,
+
+            // Color grading (neutral defaults)
+            saturation: 1.0,
+            contrast: 1.0,
+            brightness: 0.0,
+            temperature: 0.0,
+
+            // Vignette (subtle by default)
+            vignette_enabled: false,
+            vignette_intensity: 0.3,
+            vignette_smoothness: 0.5,
+
+            // Bloom
+            bloom_enabled: false,
+            bloom_intensity: 0.5,
+            bloom_threshold: 0.8,
+
+            // Chromatic aberration
+            chromatic_aberration_enabled: false,
+            chromatic_aberration_intensity: 0.005,
+
+            // Anamorphic streaks (cyan tint by default for sci-fi look)
+            streaks_enabled: false,
+            streaks_intensity: 0.5,
+            streaks_threshold: 0.7,
+            streaks_tint: [0.6, 0.8, 1.0], // Slight cyan/blue tint
+        }
+    }
+}
+
+impl PostProcessConfig {
+    pub fn reset_defaults(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// GPU-compatible post-process parameters
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuPostProcessParams {
+    // Exposure
+    pub exposure: f32,
+
+    // Color grading
+    pub saturation: f32,
+    pub contrast: f32,
+    pub brightness: f32,
+    pub temperature: f32,
+
+    // Vignette
+    pub vignette_enabled: u32,
+    pub vignette_intensity: f32,
+    pub vignette_smoothness: f32,
+
+    // Chromatic aberration
+    pub chromatic_aberration_enabled: u32,
+    pub chromatic_aberration_intensity: f32,
+
+    // Bloom (applied in separate pass, but threshold checked here)
+    pub bloom_enabled: u32,
+    pub bloom_intensity: f32,
+    pub bloom_threshold: f32,
+
+    // Tonemapping
+    pub tonemapping_enabled: u32,
+
+    // Anamorphic streaks
+    pub streaks_enabled: u32,
+    pub streaks_intensity: f32,
+    pub streaks_threshold: f32,
+    pub streaks_tint_r: f32,
+    pub streaks_tint_g: f32,
+    pub streaks_tint_b: f32,
+
+    // Padding to 16-byte alignment (21 fields * 4 = 84 bytes, need 96)
+    pub _padding: [f32; 3],
+}
+
+impl PostProcessConfig {
+    pub fn to_gpu_params(&self) -> GpuPostProcessParams {
+        GpuPostProcessParams {
+            exposure: self.exposure,
+            saturation: self.saturation,
+            contrast: self.contrast,
+            brightness: self.brightness,
+            temperature: self.temperature,
+            vignette_enabled: if self.vignette_enabled { 1 } else { 0 },
+            vignette_intensity: self.vignette_intensity,
+            vignette_smoothness: self.vignette_smoothness,
+            chromatic_aberration_enabled: if self.chromatic_aberration_enabled { 1 } else { 0 },
+            chromatic_aberration_intensity: self.chromatic_aberration_intensity,
+            bloom_enabled: if self.bloom_enabled { 1 } else { 0 },
+            bloom_intensity: self.bloom_intensity,
+            bloom_threshold: self.bloom_threshold,
+            tonemapping_enabled: if self.tonemapping_enabled { 1 } else { 0 },
+            streaks_enabled: if self.streaks_enabled { 1 } else { 0 },
+            streaks_intensity: self.streaks_intensity,
+            streaks_threshold: self.streaks_threshold,
+            streaks_tint_r: self.streaks_tint[0],
+            streaks_tint_g: self.streaks_tint[1],
+            streaks_tint_b: self.streaks_tint[2],
+            _padding: [0.0; 3],
+        }
+    }
+}

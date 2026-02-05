@@ -1,6 +1,6 @@
 //! GUI module - egui integration for parameter control
 
-use crate::state::{AppState, FluidRenderMode, RenderConfig, SimulationConfig};
+use crate::state::{AppState, ContainerConfig, FluidRenderMode, SimulationConfig};
 
 /// Renders the control panel and returns any triggered action
 pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAction {
@@ -29,34 +29,6 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     egui::Slider::new(&mut state.simulation.gravity, 0.0..=30.0)
                         .text("Gravity")
                 );
-
-                ui.add_space(4.0);
-                ui.label("Container Tilt:");
-                ui.add(
-                    egui::Slider::new(&mut state.simulation.tilt_x, -std::f32::consts::PI..=std::f32::consts::PI)
-                        .text("Tilt X (↕)")
-                        .suffix(" rad")
-                );
-                ui.add(
-                    egui::Slider::new(&mut state.simulation.tilt_z, -std::f32::consts::PI..=std::f32::consts::PI)
-                        .text("Tilt Z (↔)")
-                        .suffix(" rad")
-                );
-                if ui.button("Reset Tilt").clicked() {
-                    state.simulation.tilt_x = 0.0;
-                    state.simulation.tilt_z = 0.0;
-                }
-                if ui.button("Flip Upside Down").clicked() {
-                    state.simulation.tilt_x = std::f32::consts::PI;
-                    state.simulation.tilt_z = 0.0;
-                }
-
-                // Show container orientation
-                let tilt_deg_x = state.simulation.tilt_x.to_degrees();
-                let tilt_deg_z = state.simulation.tilt_z.to_degrees();
-                ui.label(format!("Container tilt: {:.0}° x {:.0}°", tilt_deg_x, tilt_deg_z));
-
-                ui.add_space(4.0);
                 ui.add(
                     egui::Slider::new(&mut state.simulation.damping, 0.0..=1.0)
                         .text("Bounce")
@@ -82,14 +54,62 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         .text("Max Particles")
                         .logarithmic(true)
                 );
+            });
+
+            ui.add_space(8.0);
+
+            // Container controls
+            ui.collapsing("Container", |ui| {
+                ui.label("Dimensions:");
+                ui.add(
+                    egui::Slider::new(&mut state.container.width, 0.5..=3.0)
+                        .text("Width (X)")
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.container.depth, 0.5..=3.0)
+                        .text("Depth (Z)")
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.container.height, 0.5..=3.0)
+                        .text("Height (Y)")
+                );
 
                 ui.add_space(4.0);
-                ui.label("Bounds:");
+                ui.add(
+                    egui::Slider::new(&mut state.container.floor_y, -1.5..=0.5)
+                        .text("Floor Position")
+                );
+                ui.label(format!("  Ceiling at: {:.2}", state.container.ceiling_y()));
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label("Tilt:");
+                ui.add(
+                    egui::Slider::new(&mut state.container.tilt_x, -std::f32::consts::PI..=std::f32::consts::PI)
+                        .text("Tilt X (↕)")
+                        .suffix(" rad")
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.container.tilt_z, -std::f32::consts::PI..=std::f32::consts::PI)
+                        .text("Tilt Z (↔)")
+                        .suffix(" rad")
+                );
+
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut state.simulation.bounds.0).speed(0.01).range(0.1..=1.0));
-                    ui.label("x");
-                    ui.add(egui::DragValue::new(&mut state.simulation.bounds.1).speed(0.01).range(0.1..=1.0));
+                    if ui.button("Reset Tilt").clicked() {
+                        state.container.tilt_x = 0.0;
+                        state.container.tilt_z = 0.0;
+                    }
+                    if ui.button("Flip Upside Down").clicked() {
+                        state.container.tilt_x = std::f32::consts::PI;
+                        state.container.tilt_z = 0.0;
+                    }
                 });
+
+                // Show container orientation
+                let tilt_deg_x = state.container.tilt_x.to_degrees();
+                let tilt_deg_z = state.container.tilt_z.to_degrees();
+                ui.label(format!("Tilt: {:.0}° x {:.0}°", tilt_deg_x, tilt_deg_z));
             });
 
             ui.add_space(8.0);
@@ -131,7 +151,6 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.label("Render Mode:");
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::ScreenSpace, "Screen-Space");
-                    ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::MarchingCubes, "Marching Cubes");
                     ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::Particles, "Particles");
                 });
                 ui.add_space(4.0);
@@ -152,12 +171,115 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.add_space(4.0);
                 ui.label("Background:");
                 egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.background_color);
+            });
 
-                ui.add_space(8.0);
-                ui.add(
-                    egui::Slider::new(&mut state.rendering.env_rotation, 0.0..=std::f32::consts::TAU)
-                        .text("Environment Rotation")
-                );
+            ui.add_space(8.0);
+
+            // Post-processing controls
+            ui.collapsing("Post Processing", |ui| {
+                ui.checkbox(&mut state.post_process.enabled, "Enable Post Processing");
+
+                if state.post_process.enabled {
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    // Exposure & Tonemapping
+                    ui.label("Exposure & Tonemapping:");
+                    ui.add(
+                        egui::Slider::new(&mut state.post_process.exposure, 0.1..=3.0)
+                            .text("Exposure")
+                    );
+                    ui.checkbox(&mut state.post_process.tonemapping_enabled, "ACES Tonemapping");
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    // Color Grading
+                    ui.label("Color Grading:");
+                    ui.add(
+                        egui::Slider::new(&mut state.post_process.saturation, 0.0..=2.0)
+                            .text("Saturation")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.post_process.contrast, 0.5..=2.0)
+                            .text("Contrast")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.post_process.brightness, -0.5..=0.5)
+                            .text("Brightness")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.post_process.temperature, -1.0..=1.0)
+                            .text("Temperature")
+                    );
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    // Bloom
+                    ui.checkbox(&mut state.post_process.bloom_enabled, "Bloom");
+                    if state.post_process.bloom_enabled {
+                        ui.add(
+                            egui::Slider::new(&mut state.post_process.bloom_intensity, 0.0..=2.0)
+                                .text("Intensity")
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut state.post_process.bloom_threshold, 0.0..=2.0)
+                                .text("Threshold")
+                        );
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    // Vignette
+                    ui.checkbox(&mut state.post_process.vignette_enabled, "Vignette");
+                    if state.post_process.vignette_enabled {
+                        ui.add(
+                            egui::Slider::new(&mut state.post_process.vignette_intensity, 0.0..=1.0)
+                                .text("Intensity")
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut state.post_process.vignette_smoothness, 0.0..=1.0)
+                                .text("Smoothness")
+                        );
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    // Chromatic Aberration
+                    ui.checkbox(&mut state.post_process.chromatic_aberration_enabled, "Chromatic Aberration");
+                    if state.post_process.chromatic_aberration_enabled {
+                        ui.add(
+                            egui::Slider::new(&mut state.post_process.chromatic_aberration_intensity, 0.0..=0.05)
+                                .text("Intensity")
+                        );
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    // Anamorphic Streaks
+                    ui.checkbox(&mut state.post_process.streaks_enabled, "Anamorphic Streaks");
+                    if state.post_process.streaks_enabled {
+                        ui.add(
+                            egui::Slider::new(&mut state.post_process.streaks_intensity, 0.0..=2.0)
+                                .text("Intensity")
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut state.post_process.streaks_threshold, 0.0..=1.5)
+                                .text("Threshold")
+                        );
+                        ui.label("Streak Tint:");
+                        egui::color_picker::color_edit_button_rgb(ui, &mut state.post_process.streaks_tint);
+                    }
+
+                    ui.add_space(8.0);
+                    if ui.button("Reset Post Processing").clicked() {
+                        state.post_process.reset_defaults();
+                    }
+                }
             });
 
             ui.add_space(16.0);
@@ -190,8 +312,9 @@ impl SimulationConfig {
     }
 }
 
-impl RenderConfig {
-    pub fn reset_defaults(&mut self) {
+impl ContainerConfig {
+    pub fn gui_reset_defaults(&mut self) {
         *self = Self::default();
     }
 }
+
