@@ -151,6 +151,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.label("Render Mode:");
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::ScreenSpace, "Screen-Space");
+                    ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::MarchingCubes, "Marching Cubes");
                     ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::Particles, "Particles");
                 });
                 ui.add_space(4.0);
@@ -164,7 +165,9 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     ui.checkbox(&mut state.rendering.color_by_velocity, "Color by velocity");
                 }
 
-                if state.rendering.render_mode == FluidRenderMode::ScreenSpace {
+                if state.rendering.render_mode == FluidRenderMode::ScreenSpace
+                    || state.rendering.render_mode == FluidRenderMode::MarchingCubes
+                {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.label("Surface Detail:");

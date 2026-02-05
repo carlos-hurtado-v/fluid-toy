@@ -92,13 +92,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Semi-implicit Euler integration
     vel = vel + params.dt * accel;
-
-    // Apply velocity damping to dissipate energy (time-step aware)
-    // Using pow(0.3, dt) gives ~70% velocity loss per second, which feels fluid-like
-    let damping_per_second = 0.3;  // Retain 30% velocity per second
-    let damping = pow(damping_per_second, params.dt);
-    vel = vel * damping;
-
     pos = pos + params.dt * vel;
 
     // === HARD BOUNDARY CONSTRAINTS ===

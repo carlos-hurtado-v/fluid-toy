@@ -13,7 +13,7 @@ use crate::simulation::SphParticle3D;
 use wgpu::util::DeviceExt;
 
 // Compile-time size assertions for debugging
-const _: () = assert!(std::mem::size_of::<GpuCameraParams>() == 144, "GpuCameraParams must be 144 bytes");
+const _: () = assert!(std::mem::size_of::<GpuCameraParams>() == 272, "GpuCameraParams must be 272 bytes");
 const _: () = assert!(std::mem::size_of::<GpuWaterParams>() == 160, "GpuWaterParams must be 160 bytes");
 const _: () = assert!(std::mem::size_of::<GpuBlurParams>() == 48, "GpuBlurParams must be 48 bytes (WGSL std140)");
 const _: () = assert!(std::mem::size_of::<GpuFluidParams>() == 80, "GpuFluidParams must be 80 bytes");
@@ -945,6 +945,16 @@ impl ScreenSpaceFluidRenderer {
             pass.set_bind_group(0, &self.composite_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+    }
+
+    /// Get environment texture view for sharing with other renderers
+    pub fn env_texture_view(&self) -> &wgpu::TextureView {
+        &self.env_view
+    }
+
+    /// Get environment sampler for sharing with other renderers
+    pub fn env_sampler(&self) -> &wgpu::Sampler {
+        &self.env_sampler
     }
 }
 

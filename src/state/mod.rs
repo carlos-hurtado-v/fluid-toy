@@ -11,6 +11,8 @@ pub enum FluidRenderMode {
     Particles,
     /// Screen-space fluid rendering (photorealistic)
     ScreenSpace,
+    /// Marching cubes mesh generation (true surface)
+    MarchingCubes,
 }
 
 impl Default for FluidRenderMode {
@@ -149,10 +151,10 @@ impl Default for AppState {
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            delta_time: 0.006,   // Reference: 0.006
-            gravity: 9.8,        // Magnitude (positive)
-            damping: 0.3,
-            paused: false,       // Start running
+            delta_time: 0.006,
+            gravity: 9.8,
+            damping: 0.6,        // Energy retained on wall bounce
+            paused: false,
             max_particles: 50_000,
             initial_cube_size: 20, // 20×20×20 = 8000 particles
         }
@@ -190,6 +192,61 @@ impl ContainerConfig {
     pub fn half_depth(&self) -> f32 {
         self.depth / 2.0
     }
+
+    /// Compute axis-aligned bounding box of the tilted container
+    /// Returns (min, max) corners in world space
+    pub fn tilted_aabb(&self) -> ([f32; 3], [f32; 3]) {
+        let hw = self.half_width();
+        let hd = self.half_depth();
+        let y0 = self.floor_y;
+        let y1 = self.ceiling_y();
+
+        // 8 corners of the untilted container (centered at origin for rotation)
+        let center_y = (y0 + y1) / 2.0;
+        let half_h = (y1 - y0) / 2.0;
+
+        let corners = [
+            [-hw, -half_h, -hd],
+            [ hw, -half_h, -hd],
+            [-hw,  half_h, -hd],
+            [ hw,  half_h, -hd],
+            [-hw, -half_h,  hd],
+            [ hw, -half_h,  hd],
+            [-hw,  half_h,  hd],
+            [ hw,  half_h,  hd],
+        ];
+
+        // Rotation matrices for tilt
+        let cx = self.tilt_x.cos();
+        let sx = self.tilt_x.sin();
+        let cz = self.tilt_z.cos();
+        let sz = self.tilt_z.sin();
+
+        let mut min = [f32::MAX, f32::MAX, f32::MAX];
+        let mut max = [f32::MIN, f32::MIN, f32::MIN];
+
+        for corner in &corners {
+            // Rotate around X axis first
+            let y1 = corner[1] * cx - corner[2] * sx;
+            let z1 = corner[1] * sx + corner[2] * cx;
+
+            // Then rotate around Z axis
+            let x2 = corner[0] * cz - y1 * sz;
+            let y2 = corner[0] * sz + y1 * cz;
+            let z2 = z1;
+
+            // Translate back (add center_y to Y)
+            let world = [x2, y2 + center_y, z2];
+
+            // Update AABB
+            for i in 0..3 {
+                min[i] = min[i].min(world[i]);
+                max[i] = max[i].max(world[i]);
+            }
+        }
+
+        (min, max)
+    }
 }
 
 impl Default for CameraConfig {
@@ -213,18 +270,18 @@ impl CameraConfig {
 impl Default for RenderConfig {
     fn default() -> Self {
         Self {
-            particle_radius: 0.025,  // Smaller to see individual particles
+            particle_radius: 0.02,
             particle_color: [0.2, 0.4, 0.9],
             color_by_velocity: true,
             background_color: [0.02, 0.02, 0.05],
-            render_mode: FluidRenderMode::ScreenSpace,  // Use screen-space rendering by default
+            render_mode: FluidRenderMode::ScreenSpace,
             scene_rotation: [
                 [1.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0],
                 [0.0, 0.0, 1.0],
-            ],  // Identity matrix
-            ripple_scale: 15.0,      // Frequency of surface ripples
-            ripple_strength: 0.3,    // Moderate perturbation
+            ],
+            ripple_scale: 15.0,
+            ripple_strength: 0.3,
         }
     }
 }
@@ -239,7 +296,8 @@ impl RenderConfig {
     pub fn visual_margin(&self) -> f32 {
         match self.render_mode {
             FluidRenderMode::ScreenSpace => self.particle_radius * 4.5,
-            FluidRenderMode::Particles => self.particle_radius, // Just the particle radius
+            FluidRenderMode::MarchingCubes => self.particle_radius * 4.5, // Similar to screen-space
+            FluidRenderMode::Particles => self.particle_radius,
         }
     }
 
@@ -304,15 +362,15 @@ fn mat3_mul(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
 
 impl Default for SphConfig {
     fn default() -> Self {
-        // Tuned values for water-like behavior
+        // Tuned values for realistic water-like behavior
         Self {
-            kernel_radius: 0.07,
-            rest_density: 5000.0,      // Lower = particles stack instead of spreading
-            stiffness: 3.0,            // Low so gravity dominates over pressure
-            near_stiffness: 5.0,       // Higher to prevent particle collapse at extreme compression
-            viscosity: 50.0,           // Higher = more energy dissipation, less bouncing
+            kernel_radius: 0.08,
+            rest_density: 6000.0,
+            stiffness: 15.0,           // Fast pressure response for proper wave propagation
+            near_stiffness: 5.0,
+            viscosity: 20.0,           // Low enough for waves to persist
             mass: 1.0,
-            wall_stiffness: 15000.0,   // Higher to resist corner pressure at extreme tilts
+            wall_stiffness: 16000.0,
         }
     }
 }

@@ -12,7 +12,7 @@ use winit::{
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, FluidRenderer, GpuContainerParams, ParticleRenderer3D, PostProcessRenderer, ScreenSpaceFluidRenderer, WireframeRenderer};
+use crate::render::{Camera, FluidRenderer, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, ScreenSpaceFluidRenderer, WireframeRenderer};
 use crate::simulation::{SphParticle3D, SphSimulation3DGrid};
 use crate::state::{AppState, FluidRenderMode, GpuMouseForce};
 
@@ -22,6 +22,7 @@ pub struct App {
     renderer: Option<ParticleRenderer3D>,
     fluid_renderer: Option<FluidRenderer>,
     ss_renderer: Option<ScreenSpaceFluidRenderer>,
+    mc_renderer: Option<MarchingCubesRenderer>,
     wireframe_renderer: Option<WireframeRenderer>,
     post_process_renderer: Option<PostProcessRenderer>,
     sph_simulation: Option<SphSimulation3DGrid>,
@@ -51,6 +52,7 @@ impl App {
             renderer: None,
             fluid_renderer: None,
             ss_renderer: None,
+            mc_renderer: None,
             wireframe_renderer: None,
             post_process_renderer: None,
             sph_simulation: None,
@@ -134,6 +136,16 @@ impl App {
             gpu.config.height,
         );
 
+        // Create marching cubes renderer (shares environment map with ss_renderer)
+        let mc_renderer = MarchingCubesRenderer::new(
+            &gpu.device,
+            gpu.config.format,
+            ss_renderer.env_texture_view(),
+            ss_renderer.env_sampler(),
+            gpu.config.width,
+            gpu.config.height,
+        );
+
         // Create wireframe renderer for container visualization
         let container_params = GpuContainerParams::from_config(&self.state.container);
         let wireframe_renderer = WireframeRenderer::new(
@@ -173,6 +185,7 @@ impl App {
         self.renderer = Some(renderer);
         self.fluid_renderer = Some(fluid_renderer);
         self.ss_renderer = Some(ss_renderer);
+        self.mc_renderer = Some(mc_renderer);
         self.wireframe_renderer = Some(wireframe_renderer);
         self.post_process_renderer = Some(post_process_renderer);
         self.sph_simulation = Some(sph_simulation);
@@ -588,6 +601,45 @@ impl App {
                         );
                     }
                 }
+                FluidRenderMode::MarchingCubes => {
+                    // Marching cubes surface mesh rendering
+                    if let Some(mc_renderer) = &mut self.mc_renderer {
+                        // Update grid bounds to match tilted container (with margin for kernel)
+                        let margin = self.state.sph.kernel_radius * 2.0;
+                        let (aabb_min, aabb_max) = self.state.container.tilted_aabb();
+                        mc_renderer.set_bounds(
+                            [aabb_min[0] - margin, aabb_min[1] - margin, aabb_min[2] - margin],
+                            [aabb_max[0] + margin, aabb_max[1] + margin, aabb_max[2] + margin],
+                        );
+
+                        let camera_params = self.camera.to_gpu_params();
+                        mc_renderer.update_camera(&gpu.queue, &camera_params);
+                        mc_renderer.update_water_params(
+                            &gpu.queue,
+                            &self.state.rendering.particle_color,
+                            self.state.rendering.ripple_scale,
+                            self.state.rendering.ripple_strength,
+                        );
+                        // Use kernel radius and rest density to compute iso value
+                        let iso_value = self.state.sph.rest_density * 0.3;
+                        mc_renderer.update_params(
+                            &gpu.queue,
+                            self.state.sph.kernel_radius * 1.5, // Slightly larger for density sampling
+                            iso_value,
+                            sph_sim.num_particles(),
+                        );
+                        mc_renderer.generate(
+                            &mut encoder,
+                            &gpu.device,
+                            sph_sim.particle_buffer(),
+                        );
+                        mc_renderer.render(
+                            &mut encoder,
+                            render_target,
+                            &self.state.rendering.background_color,
+                        );
+                    }
+                }
             }
         }
 
@@ -663,6 +715,13 @@ impl App {
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        // Read back marching cubes vertex count for next frame
+        if self.state.rendering.render_mode == FluidRenderMode::MarchingCubes {
+            if let Some(mc_renderer) = &mut self.mc_renderer {
+                mc_renderer.read_vertex_count(&gpu.device);
+            }
+        }
 
         // Handle GUI actions after rendering
         match gui_action {
