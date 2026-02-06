@@ -1089,8 +1089,7 @@ impl App {
                         mc_renderer.update_water_params(
                             &gpu.queue,
                             &self.state.rendering.particle_color,
-                            self.state.rendering.ripple_scale,
-                            self.state.rendering.ripple_strength,
+                            self.state.rendering.water_roughness,
                             self.state.environment.environment_intensity,
                             use_env,
                             &self.state.environment.background_color,
@@ -1101,16 +1100,19 @@ impl App {
                         let env_params = self.state.environment.to_gpu_params();
                         mc_renderer.update_env_params(&gpu.queue, &env_params);
                         let iso_value = self.state.rendering.mc_iso_value;
+                        let blur_radius = self.state.rendering.mc_blur_radius;
                         mc_renderer.update_params(
                             &gpu.queue,
                             self.state.sph.kernel_radius * 2.5, // Larger radius for smoother density field
                             iso_value,
                             sph_sim.num_particles(),
+                            blur_radius,
                         );
                         mc_renderer.generate(
                             &mut encoder,
                             &gpu.device,
                             sph_sim.particle_buffer(),
+                            blur_radius,
                         );
                         // Pass rigid body renderer into MC pass for proper MSAA depth testing
                         let rb_for_mc = if self.state.rigid_body.enabled {

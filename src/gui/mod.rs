@@ -280,22 +280,20 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 if state.rendering.render_mode == FluidRenderMode::MarchingCubes {
                     ui.add_space(8.0);
                     ui.separator();
-                    ui.label("Surface Detail:");
+                    let mut blur_val = state.rendering.mc_blur_radius as i32;
                     ui.add(
-                        egui::Slider::new(&mut state.rendering.ripple_scale, 1.0..=50.0)
-                            .text("Ripple Scale")
+                        egui::Slider::new(&mut blur_val, 0..=5)
+                            .text("Surface Smoothing")
                     );
-                    ui.add(
-                        egui::Slider::new(&mut state.rendering.ripple_strength, 0.0..=1.0)
-                            .text("Ripple Strength")
-                    );
-                }
-
-                if state.rendering.render_mode == FluidRenderMode::MarchingCubes {
+                    state.rendering.mc_blur_radius = blur_val as u32;
                     ui.add(
                         egui::Slider::new(&mut state.rendering.mc_iso_value, 10.0..=2000.0)
                             .text("Iso Value")
                             .logarithmic(true)
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.water_roughness, 0.01..=0.5)
+                            .text("Roughness")
                     );
                     ui.add(
                         egui::Slider::new(&mut state.rendering.refraction_strength, 0.0..=0.5)
@@ -373,12 +371,6 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                             .text("Intensity")
                     );
 
-                    ui.add_space(8.0);
-                    ui.add(
-                        egui::Slider::new(&mut state.lighting.specular_power, 16.0..=512.0)
-                            .text("Specular Sharpness")
-                            .logarithmic(true)
-                    );
                 }
             });
 

@@ -97,8 +97,6 @@ pub struct LightingConfig {
     pub sun_color: [f32; 3],
     /// Sun intensity multiplier
     pub sun_intensity: f32,
-    /// Specular power (shininess) for water highlights
-    pub specular_power: f32,
 }
 
 /// Simulation parameters - physics configuration
@@ -171,16 +169,16 @@ pub struct RenderConfig {
     pub color_by_velocity: bool,
     /// Rendering mode (particles or marching cubes)
     pub render_mode: FluidRenderMode,
-    /// Ripple scale - frequency of surface detail ripples (higher = more dense)
-    pub ripple_scale: f32,
-    /// Ripple strength - how much ripples perturb surface normals
-    pub ripple_strength: f32,
     /// Marching cubes iso-value threshold (lower = shows smaller droplets but blobbier surface)
     pub mc_iso_value: f32,
     /// Refraction strength - how much the background distorts through water
     pub refraction_strength: f32,
     /// Deep water color - what you see looking into deep water
     pub deep_water_color: [f32; 3],
+    /// Surface smoothing - blur radius for MC density field (0 = off, higher = smoother)
+    pub mc_blur_radius: u32,
+    /// Water surface roughness for PBR specular (0.01 = mirror, 0.5 = rough)
+    pub water_roughness: f32,
 }
 
 /// MSAA sample count options
@@ -423,7 +421,6 @@ impl Default for LightingConfig {
             sun_direction: [0.0, 0.15, 0.3],  // Will be normalized in shader
             sun_color: [0.98, 0.82, 0.6],    // Warm white sunlight
             sun_intensity: 2.0,
-            specular_power: 128.0,           // Sharp highlights for water
         }
     }
 }
@@ -582,11 +579,11 @@ impl Default for RenderConfig {
             particle_color: [0.2, 0.4, 0.9],
             color_by_velocity: true,
             render_mode: FluidRenderMode::MarchingCubes,
-            ripple_scale: 15.0,
-            ripple_strength: 0.4,
             mc_iso_value: 500.0,
             refraction_strength: 0.15,
             deep_water_color: [0.01, 0.04, 0.1],
+            mc_blur_radius: 2,
+            water_roughness: 0.03,
         }
     }
 }
@@ -842,7 +839,7 @@ pub struct GpuLightParams {
     pub sun_enabled: u32,           // 4 bytes, offset 12
     pub sun_color: [f32; 3],        // 12 bytes, offset 16
     pub sun_intensity: f32,         // 4 bytes, offset 28
-    pub specular_power: f32,        // 4 bytes, offset 32
+    pub _pad_unused: f32,           // 4 bytes, offset 32 (was specular_power)
     pub _pad0: [f32; 3],            // 12 bytes, offset 36 (aligns _padding to offset 48)
     pub _padding: [f32; 3],         // 12 bytes, offset 48 (matches WGSL vec3 alignment)
     pub _pad1: f32,                 // 4 bytes, offset 60 (struct padding to reach 64)
@@ -856,7 +853,7 @@ impl LightingConfig {
             sun_enabled: if self.sun_enabled { 1 } else { 0 },
             sun_color: self.sun_color,
             sun_intensity: self.sun_intensity,
-            specular_power: self.specular_power,
+            _pad_unused: 0.0,
             _pad0: [0.0; 3],
             _padding: [0.0; 3],
             _pad1: 0.0,

@@ -32,16 +32,26 @@ pub struct GpuGridParams {
     pub max_vertices: u32,
 }
 
+/// Blur parameters for density field smoothing
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct GpuBlurParams {
+    dir_x: i32,
+    dir_y: i32,
+    dir_z: i32,
+    radius: i32,
+    grid_size: u32,
+    _pad: [u32; 3],
+}
+
 /// Water shading parameters
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct GpuWaterParams {
     pub water_color: [f32; 3],
-    pub specular_power: f32,
+    pub roughness: f32,
     pub ior: f32,
     pub refraction_strength: f32,
-    pub ripple_scale: f32,
-    pub ripple_strength: f32,
     pub env_intensity: f32,
     pub use_env_background: u32,
     pub background_r: f32,
@@ -51,18 +61,16 @@ pub struct GpuWaterParams {
     pub deep_color_r: f32,
     pub deep_color_g: f32,
     pub deep_color_b: f32,
-    pub _pad: [f32; 3],
+    pub _pad: f32,
 }
 
 impl Default for GpuWaterParams {
     fn default() -> Self {
         Self {
             water_color: [0.1, 0.4, 0.8],
-            specular_power: 64.0,
+            roughness: 0.03,
             ior: 1.333,
             refraction_strength: 0.15,
-            ripple_scale: 15.0,
-            ripple_strength: 0.4,
             env_intensity: 1.0,
             use_env_background: 1,
             background_r: 0.15,
@@ -72,7 +80,7 @@ impl Default for GpuWaterParams {
             deep_color_r: 0.01,
             deep_color_g: 0.04,
             deep_color_b: 0.1,
-            _pad: [0.0; 3],
+            _pad: 0.0,
         }
     }
 }
@@ -192,9 +200,11 @@ fn create_msaa_depth_texture(device: &wgpu::Device, width: u32, height: u32, sam
 }
 
 pub struct MarchingCubesRenderer {
-    // Density field (3D texture)
+    // Density field (3D texture) - two textures for ping-pong blur
     _density_texture: wgpu::Texture,
     density_view: wgpu::TextureView,
+    _density_texture_b: wgpu::Texture,
+    _density_view_b: wgpu::TextureView,
 
     // MSAA render targets
     msaa_texture: Option<wgpu::Texture>,
@@ -235,9 +245,16 @@ pub struct MarchingCubesRenderer {
     env_pipeline: wgpu::RenderPipeline,        // MSAA version for main render
     env_pipeline_1x: wgpu::RenderPipeline,     // Single-sampled for background pass
 
+    // Blur pipeline and bind groups
+    blur_pipeline: wgpu::ComputePipeline,
+    blur_params_buffers: [wgpu::Buffer; 3], // X, Y, Z directions
+    // blur_bind_groups[dir][0] = a->b, blur_bind_groups[dir][1] = b->a
+    blur_bind_groups: [[wgpu::BindGroup; 2]; 3],
+
     // Bind groups
     _density_bind_group: wgpu::BindGroup,
     generate_bind_group: wgpu::BindGroup,
+    generate_bind_group_b: wgpu::BindGroup, // reads from density_b (used after blur)
     back_face_bind_group: wgpu::BindGroup,
     render_bind_group: wgpu::BindGroup,
     env_bind_group: wgpu::BindGroup,
@@ -303,6 +320,23 @@ impl MarchingCubesRenderer {
             view_formats: &[],
         });
         let density_view = density_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Second density texture for ping-pong blur
+        let density_texture_b = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MC Density Field B"),
+            size: wgpu::Extent3d {
+                width: GRID_SIZE,
+                height: GRID_SIZE,
+                depth_or_array_layers: GRID_SIZE,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let density_view_b = density_texture_b.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Create MSAA textures if sample_count > 1
         let (msaa_texture, msaa_view) = if sample_count > 1 {
@@ -422,7 +456,7 @@ impl MarchingCubesRenderer {
             sun_enabled: 1,
             sun_color: [1.0, 0.95, 0.85],
             sun_intensity: 2.0,
-            specular_power: 128.0,
+            _pad_unused: 0.0,
             _pad0: [0.0; 3],
             _padding: [0.0; 3],
             _pad1: 0.0,
@@ -467,6 +501,11 @@ impl MarchingCubesRenderer {
         let env_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Environment Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_environment.wgsl").into()),
+        });
+
+        let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("MC Blur Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_blur.wgsl").into()),
         });
 
         let back_depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -647,6 +686,137 @@ impl MarchingCubesRenderer {
                     resource: vertex_buffer.as_entire_binding(),
                 },
             ],
+        });
+
+        // Generate bind group B (reads from density_b, used after blur)
+        let generate_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MC Generate BG B"),
+            layout: &generate_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&density_view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: grid_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: edge_table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tri_table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: counter_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: vertex_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // === Blur Pipeline ===
+        let blur_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("MC Blur BGL"),
+            entries: &[
+                // Input density field (read)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Output density field (write)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                    },
+                    count: None,
+                },
+                // Blur params
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("MC Blur Pipeline Layout"),
+            bind_group_layouts: &[&blur_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let blur_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("MC Blur Pipeline"),
+            layout: Some(&blur_pipeline_layout),
+            module: &blur_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        // Create 3 blur param buffers (one per direction: X, Y, Z)
+        let directions: [[i32; 3]; 3] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+        let blur_params_buffers: [wgpu::Buffer; 3] = std::array::from_fn(|i| {
+            let params = GpuBlurParams {
+                dir_x: directions[i][0],
+                dir_y: directions[i][1],
+                dir_z: directions[i][2],
+                radius: 2, // default
+                grid_size: GRID_SIZE,
+                _pad: [0; 3],
+            };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("MC Blur Params {}", ["X", "Y", "Z"][i])),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        });
+
+        // Create 6 blur bind groups: [direction][a_to_b=0, b_to_a=1]
+        let blur_bind_groups: [[wgpu::BindGroup; 2]; 3] = std::array::from_fn(|dir| {
+            [
+                // a -> b
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("MC Blur BG {} A->B", ["X", "Y", "Z"][dir])),
+                    layout: &blur_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&density_view_b) },
+                        wgpu::BindGroupEntry { binding: 2, resource: blur_params_buffers[dir].as_entire_binding() },
+                    ],
+                }),
+                // b -> a
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("MC Blur BG {} B->A", ["X", "Y", "Z"][dir])),
+                    layout: &blur_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view_b) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&density_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: blur_params_buffers[dir].as_entire_binding() },
+                    ],
+                }),
+            ]
         });
 
         // === Render Pipeline ===
@@ -1100,6 +1270,8 @@ impl MarchingCubesRenderer {
         Self {
             _density_texture: density_texture,
             density_view,
+            _density_texture_b: density_texture_b,
+            _density_view_b: density_view_b,
             msaa_texture,
             msaa_view,
             sample_count,
@@ -1128,8 +1300,12 @@ impl MarchingCubesRenderer {
             render_pipeline,
             env_pipeline,
             env_pipeline_1x,
+            blur_pipeline,
+            blur_params_buffers,
+            blur_bind_groups,
             _density_bind_group: density_bind_group,
             generate_bind_group,
+            generate_bind_group_b,
             back_face_bind_group,
             render_bind_group,
             env_bind_group,
@@ -1175,7 +1351,7 @@ impl MarchingCubesRenderer {
         queue.write_buffer(&self.light_params_buffer, 0, bytemuck::bytes_of(params));
     }
 
-    pub fn update_params(&self, queue: &wgpu::Queue, kernel_radius: f32, iso_value: f32, num_particles: u32) {
+    pub fn update_params(&self, queue: &wgpu::Queue, kernel_radius: f32, iso_value: f32, num_particles: u32, blur_radius: u32) {
         let cell_size = (self.grid_max[0] - self.grid_min[0]) / GRID_SIZE as f32;
         let params = GpuGridParams {
             grid_min: self.grid_min,
@@ -1188,6 +1364,20 @@ impl MarchingCubesRenderer {
             max_vertices: MAX_VERTICES,
         };
         queue.write_buffer(&self.grid_params_buffer, 0, bytemuck::bytes_of(&params));
+
+        // Update blur radius for all 3 direction buffers
+        let directions: [[i32; 3]; 3] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+        for i in 0..3 {
+            let blur_params = GpuBlurParams {
+                dir_x: directions[i][0],
+                dir_y: directions[i][1],
+                dir_z: directions[i][2],
+                radius: blur_radius as i32,
+                grid_size: GRID_SIZE,
+                _pad: [0; 3],
+            };
+            queue.write_buffer(&self.blur_params_buffers[i], 0, bytemuck::bytes_of(&blur_params));
+        }
     }
 
     /// Update environment parameters (background mode, color, intensity)
@@ -1206,8 +1396,7 @@ impl MarchingCubesRenderer {
         &self,
         queue: &wgpu::Queue,
         water_color: &[f32; 3],
-        ripple_scale: f32,
-        ripple_strength: f32,
+        roughness: f32,
         env_intensity: f32,
         use_env_background: bool,
         background_color: &[f32; 3],
@@ -1217,8 +1406,7 @@ impl MarchingCubesRenderer {
     ) {
         let params = GpuWaterParams {
             water_color: *water_color,
-            ripple_scale,
-            ripple_strength,
+            roughness,
             env_intensity,
             use_env_background: if use_env_background { 1 } else { 0 },
             background_r: background_color[0],
@@ -1240,6 +1428,7 @@ impl MarchingCubesRenderer {
         encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
         particle_buffer: &wgpu::Buffer,
+        blur_radius: u32,
     ) {
         // Reset counter
         encoder.clear_buffer(&self.counter_buffer, 0, None);
@@ -1247,7 +1436,7 @@ impl MarchingCubesRenderer {
         // Create density bind group with particle buffer
         let density_bind_group = self.create_density_bind_group(device, particle_buffer);
 
-        // Pass 1: Generate density field
+        // Pass 1: Generate density field (splat particles into texture A)
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("MC Density Pass"),
@@ -1259,14 +1448,39 @@ impl MarchingCubesRenderer {
             pass.dispatch_workgroups(workgroups, workgroups, workgroups);
         }
 
-        // Pass 2: Generate triangles
+        // Pass 1.5: Blur density field (3 separable passes: X, Y, Z)
+        // After blur: result is in texture B (odd number of passes: a->b, b->a, a->b)
+        let result_in_b = if blur_radius > 0 {
+            let workgroups = (GRID_SIZE + 3) / 4;
+            // Pass order: X(a->b), Y(b->a), Z(a->b)
+            // a_to_b = 0, b_to_a = 1
+            let pass_sources = [0usize, 1, 0]; // which bind group variant per pass
+            for (dir, &src) in pass_sources.iter().enumerate() {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("MC Blur Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.blur_pipeline);
+                pass.set_bind_group(0, &self.blur_bind_groups[dir][src], &[]);
+                pass.dispatch_workgroups(workgroups, workgroups, workgroups);
+            }
+            true // result ends up in texture B
+        } else {
+            false // no blur, result is in texture A
+        };
+
+        // Pass 2: Generate triangles (read from whichever texture has the result)
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("MC Generate Pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.generate_pipeline);
-            pass.set_bind_group(0, &self.generate_bind_group, &[]);
+            if result_in_b {
+                pass.set_bind_group(0, &self.generate_bind_group_b, &[]);
+            } else {
+                pass.set_bind_group(0, &self.generate_bind_group, &[]);
+            }
             let workgroups = (GRID_SIZE + 3) / 4;
             pass.dispatch_workgroups(workgroups, workgroups, workgroups);
         }

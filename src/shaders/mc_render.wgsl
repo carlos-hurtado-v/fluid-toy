@@ -16,11 +16,9 @@ struct CameraParams {
 
 struct WaterParams {
     water_color: vec3<f32>,
-    specular_power: f32,
+    roughness: f32,
     ior: f32,
     refraction_strength: f32,
-    ripple_scale: f32,
-    ripple_strength: f32,
     env_intensity: f32,
     use_env_background: u32,
     background_r: f32,
@@ -31,8 +29,6 @@ struct WaterParams {
     deep_color_g: f32,
     deep_color_b: f32,
     _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
 }
 
 struct LightParams {
@@ -40,7 +36,7 @@ struct LightParams {
     sun_enabled: u32,
     sun_color: vec3<f32>,
     sun_intensity: f32,
-    specular_power: f32,
+    _pad2: f32,
     _padding: vec3<f32>,
 }
 
@@ -74,80 +70,25 @@ struct FragmentInput {
 
 const PI: f32 = 3.14159265359;
 
-// Hash function for procedural noise
-fn hash(p: vec2<f32>) -> f32 {
-    let h = dot(p, vec2<f32>(127.1, 311.7));
-    return fract(sin(h) * 43758.5453123);
+// === PBR: GGX/Cook-Torrance BRDF ===
+
+// GGX (Trowbridge-Reitz) Normal Distribution Function
+fn D_GGX(NdotH: f32, alpha: f32) -> f32 {
+    let a2 = alpha * alpha;
+    let d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
 }
 
-// Smooth noise
-fn noise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-
-    let a = hash(i + vec2<f32>(0.0, 0.0));
-    let b = hash(i + vec2<f32>(1.0, 0.0));
-    let c = hash(i + vec2<f32>(0.0, 1.0));
-    let d = hash(i + vec2<f32>(1.0, 1.0));
-
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+// Schlick-GGX geometry term (one direction)
+fn G_SchlickGGX(NdotX: f32, k: f32) -> f32 {
+    return NdotX / (NdotX * (1.0 - k) + k);
 }
 
-// Compute procedural normal perturbation for water surface detail
-// Uses sum of directional sine waves with analytic gradients
-fn surface_detail_normal(world_pos: vec3<f32>, base_normal: vec3<f32>, scale: f32, strength: f32, time: f32) -> vec3<f32> {
-    let p = world_pos.xz * scale;
-    let t = time * 0.5;
-
-    // Sum of directional sine waves (capillary ripples) with time-based animation
-    // Analytic gradient: d/dp [A*sin(dot(p,k) + phase)] = A*cos(dot(p,k) + phase)*k
-    var grad = vec2<f32>(0.0, 0.0);
-
-    // Low-frequency swell
-    let k0 = vec2<f32>(1.31, 0.97);
-    grad += 0.040 * cos(dot(p, k0) + t * 0.7) * k0;
-    let k1 = vec2<f32>(-1.07, 1.43);
-    grad += 0.035 * cos(dot(p, k1) - t * 0.5) * k1;
-
-    // Medium-frequency ripples
-    let k2 = vec2<f32>(2.71, -1.83);
-    grad += 0.025 * cos(dot(p, k2) + t * 1.1) * k2;
-    let k3 = vec2<f32>(-1.67, -2.31);
-    grad += 0.020 * cos(dot(p, k3) - t * 0.8) * k3;
-
-    // High-frequency capillary detail
-    let k4 = vec2<f32>(4.37, 1.51);
-    grad += 0.015 * cos(dot(p, k4) + t * 1.5) * k4;
-    let k5 = vec2<f32>(-2.17, 3.93);
-    grad += 0.012 * cos(dot(p, k5) - t * 1.3) * k5;
-    let k6 = vec2<f32>(3.91, -3.17);
-    grad += 0.010 * cos(dot(p, k6) + t * 1.7) * k6;
-    let k7 = vec2<f32>(-4.53, -1.79);
-    grad += 0.008 * cos(dot(p, k7) - t * 1.1) * k7;
-
-    // Modulate amplitude with noise to break repetition
-    let n = noise(p * 0.5) * 0.4;
-    grad *= (1.0 + n);
-
-    // Apply strength
-    grad *= strength;
-
-    // Normal from height gradient
-    let detail_normal = normalize(vec3<f32>(-grad.x, 1.0, -grad.y));
-
-    // Blend detail normal with base normal using TBN-style perturbation
-    let up = vec3<f32>(0.0, 1.0, 0.0);
-    var tangent = cross(up, base_normal);
-    if (length(tangent) < 0.001) {
-        tangent = vec3<f32>(1.0, 0.0, 0.0);
-    }
-    tangent = normalize(tangent);
-    let bitangent = normalize(cross(base_normal, tangent));
-
-    // Transform detail from tangent space to world space
-    let perturbed = tangent * detail_normal.x + base_normal * detail_normal.y + bitangent * detail_normal.z;
-    return normalize(perturbed);
+// Smith's method: combined geometry for both view and light directions
+fn G_Smith(NdotV: f32, NdotL: f32, roughness: f32) -> f32 {
+    let r = roughness + 1.0;
+    let k = (r * r) / 8.0;
+    return G_SchlickGGX(NdotV, k) * G_SchlickGGX(NdotL, k);
 }
 
 @vertex
@@ -188,11 +129,6 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     // If normal points away from camera, flip it (ensures correct reflection)
     if (dot(normal, view_dir) < 0.0) {
         normal = -normal;
-    }
-
-    // Add procedural surface detail to break up the polygonal look
-    if (water.ripple_strength > 0.001) {
-        normal = surface_detail_normal(input.world_position, normal, water.ripple_scale, water.ripple_strength, water.time);
     }
 
     // === THICKNESS CALCULATION ===
@@ -277,16 +213,26 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     if (light.sun_enabled == 1u) {
         let light_dir = normalize(light.sun_direction);
         let NdotL = max(0.0, dot(normal, light_dir));
+        let NdotV = max(dot(normal, view_dir), 0.001);
 
-        // Specular reflection (Blinn-Phong), modulated by Fresnel
-        // At steep angles most light enters water; at grazing angles it reflects
+        // Cook-Torrance specular BRDF (GGX distribution)
+        let alpha = water.roughness * water.roughness;
         let half_vec = normalize(light_dir + view_dir);
-        let NdotH = max(0.0, dot(normal, half_vec));
-        let spec_intensity = pow(NdotH, light.specular_power);
-        sun_specular = light.sun_color * light.sun_intensity * spec_intensity * fresnel;
+        let NdotH = max(dot(normal, half_vec), 0.0);
+        let HdotV = max(dot(half_vec, view_dir), 0.0);
+
+        let D = D_GGX(NdotH, alpha);
+        let G = G_Smith(NdotV, max(NdotL, 0.001), water.roughness);
+        // Fresnel at half-vector angle (physically correct for microfacet model)
+        let F_spec = F0 + (1.0 - F0) * pow(1.0 - HdotV, 5.0);
+
+        let denom = 4.0 * NdotV * max(NdotL, 0.001);
+        let specular_brdf = (D * G * F_spec) / max(denom, 0.001);
+
+        sun_specular = light.sun_color * light.sun_intensity * specular_brdf * NdotL;
 
         // Subsurface illumination — light enters water, scatters, exits toward viewer
-        let light_entering = NdotL * (1.0 - fresnel);
+        let light_entering = NdotL * (1.0 - F_spec);
         let interior_glow = water.water_color * transmittance;
         sun_subsurface = interior_glow * light_entering * light.sun_color * light.sun_intensity * 0.4;
 
