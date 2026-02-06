@@ -23,6 +23,10 @@ struct SphParams {
     viscosity: f32,
     dt: f32,
     num_particles: u32,
+    surface_tension: f32,
+    _pad_st0: f32,
+    _pad_st1: f32,
+    _pad_st2: f32,
 }
 
 struct BoundsParams {

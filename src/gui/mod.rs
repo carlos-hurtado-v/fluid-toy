@@ -203,6 +203,10 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         .text("Particle Mass")
                 );
                 ui.add(
+                    egui::Slider::new(&mut state.sph.surface_tension, 0.0..=30.0)
+                        .text("Surface Tension")
+                );
+                ui.add(
                     egui::Slider::new(&mut state.sph.wall_stiffness, 50.0..=500.0)
                         .text("Wall Stiffness")
                 );
@@ -242,6 +246,14 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     ui.add(
                         egui::Slider::new(&mut state.rendering.ripple_strength, 0.0..=1.0)
                             .text("Ripple Strength")
+                    );
+                }
+
+                if state.rendering.render_mode == FluidRenderMode::MarchingCubes {
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.mc_iso_value, 10.0..=2000.0)
+                            .text("Iso Value")
+                            .logarithmic(true)
                     );
                 }
 

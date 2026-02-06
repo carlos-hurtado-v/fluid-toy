@@ -127,6 +127,8 @@ pub struct SphConfig {
     pub viscosity: f32,
     /// Particle mass
     pub mass: f32,
+    /// Surface tension (cohesion between particles)
+    pub surface_tension: f32,
     /// Wall repulsion stiffness
     pub wall_stiffness: f32,
 }
@@ -148,6 +150,8 @@ pub struct RenderConfig {
     pub ripple_scale: f32,
     /// Ripple strength - how much ripples perturb surface normals
     pub ripple_strength: f32,
+    /// Marching cubes iso-value threshold (lower = shows smaller droplets but blobbier surface)
+    pub mc_iso_value: f32,
 }
 
 /// MSAA sample count options
@@ -502,6 +506,7 @@ impl Default for RenderConfig {
             render_mode: FluidRenderMode::ScreenSpace,
             ripple_scale: 10.0,
             ripple_strength: 0.25,
+            mc_iso_value: 500.0,
         }
     }
 }
@@ -533,6 +538,7 @@ impl Default for SphConfig {
             near_stiffness: 0.4,
             viscosity: 20.0,           // Low enough for waves to persist
             mass: 1.0,
+            surface_tension: 5.0,
             wall_stiffness: 200.0,
         }
     }
@@ -604,6 +610,8 @@ pub struct GpuSphParams3D {
     pub viscosity: f32,
     pub dt: f32,
     pub num_particles: u32,
+    pub surface_tension: f32,
+    pub _padding_st: [f32; 3],
 }
 
 /// GPU-compatible 3D boundary parameters (matches WGSL struct layout)
@@ -686,6 +694,8 @@ impl SphConfig {
             viscosity: self.viscosity,
             dt,
             num_particles,
+            surface_tension: self.surface_tension,
+            _padding_st: [0.0; 3],
         }
     }
 }

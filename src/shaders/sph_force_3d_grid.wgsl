@@ -21,6 +21,10 @@ struct SphParams {
     viscosity: f32,
     dt: f32,
     num_particles: u32,
+    surface_tension: f32,
+    _pad_st0: f32,
+    _pad_st1: f32,
+    _pad_st2: f32,
 }
 
 struct GridParams {
@@ -105,6 +109,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Accumulate acceleration (not force) using Monaghan symmetric formulation
     var a_pressure = vec3<f32>(0.0, 0.0, 0.0);
     var a_viscosity = vec3<f32>(0.0, 0.0, 0.0);
+    var a_cohesion = vec3<f32>(0.0, 0.0, 0.0);
 
     // Iterate over 3x3x3 neighboring cells
     for (var dz = -1i; dz <= 1i; dz++) {
@@ -170,6 +175,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         let vel_j = sorted_particles[j].velocity;
                         let relative_vel = vel_j - vel_i;
                         a_viscosity += params.mass * relative_vel * viscosity_kernel_laplacian(r) / (density_i * density_j);
+
+                        // Surface tension: pairwise cohesion
+                        // Attractive force toward each neighbor, weighted by (1-r/h)²
+                        // In bulk: symmetric neighbors cancel out
+                        // At surface/detached: net inward force
+                        let q = 1.0 - r / params.kernel_radius;
+                        a_cohesion += q * q * dir;
                     }
                 }
             }
@@ -177,8 +189,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     a_viscosity *= params.viscosity;
+    a_cohesion *= params.surface_tension;
     let a_gravity = gravity.direction;
 
     // Store acceleration directly (integration shader uses it without dividing by density)
-    particles[i].force = a_pressure + a_viscosity + a_gravity;
+    particles[i].force = a_pressure + a_viscosity + a_cohesion + a_gravity;
 }

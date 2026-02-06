@@ -806,8 +806,7 @@ impl App {
                             self.state.rendering.ripple_scale,
                             self.state.rendering.ripple_strength,
                         );
-                        // Use kernel radius and rest density to compute iso value
-                        let iso_value = self.state.sph.rest_density * 0.3;
+                        let iso_value = self.state.rendering.mc_iso_value;
                         mc_renderer.update_params(
                             &gpu.queue,
                             self.state.sph.kernel_radius * 2.5, // Larger radius for smoother density field
