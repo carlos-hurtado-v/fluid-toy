@@ -9,15 +9,13 @@ pub use post_process::PostProcessConfig;
 pub enum FluidRenderMode {
     /// Simple particle spheres (fast, debug-friendly)
     Particles,
-    /// Screen-space fluid rendering (photorealistic)
-    ScreenSpace,
     /// Marching cubes mesh generation (true surface)
     MarchingCubes,
 }
 
 impl Default for FluidRenderMode {
     fn default() -> Self {
-        Self::ScreenSpace
+        Self::MarchingCubes
     }
 }
 
@@ -583,7 +581,7 @@ impl Default for RenderConfig {
             particle_radius: 0.02,
             particle_color: [0.2, 0.4, 0.9],
             color_by_velocity: true,
-            render_mode: FluidRenderMode::ScreenSpace,
+            render_mode: FluidRenderMode::MarchingCubes,
             ripple_scale: 15.0,
             ripple_strength: 0.4,
             mc_iso_value: 500.0,
@@ -602,8 +600,7 @@ impl RenderConfig {
     /// Screen-space rendering expands particles significantly (4.5x), particles mode does not
     pub fn visual_margin(&self) -> f32 {
         match self.render_mode {
-            FluidRenderMode::ScreenSpace => self.particle_radius * 4.5,
-            FluidRenderMode::MarchingCubes => self.particle_radius, // MC isosurface doesn't inflate particles like screen-space
+            FluidRenderMode::MarchingCubes => self.particle_radius,
             FluidRenderMode::Particles => self.particle_radius,
         }
     }

@@ -14,7 +14,7 @@ use wgpu::util::DeviceExt;
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, ScreenSpaceFluidRenderer, SprayRenderer, WireframeRenderer};
+use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
 use crate::state::{AppState, BackgroundMode, FluidRenderMode, GpuMouseForce, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, quat_mul, quat_normalize};
@@ -23,7 +23,6 @@ pub struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
     renderer: Option<ParticleRenderer3D>,
-    ss_renderer: Option<ScreenSpaceFluidRenderer>,
     mc_renderer: Option<MarchingCubesRenderer>,
     wireframe_renderer: Option<WireframeRenderer>,
     rigid_body_renderer: Option<RigidBodyRenderer>,
@@ -31,7 +30,7 @@ pub struct App {
     spray_system: Option<SpraySystem>,
     spray_renderer: Option<SprayRenderer>,
     post_process_renderer: Option<PostProcessRenderer>,
-    // Environment map (shared by SS + MC renderers)
+    // Environment map (used by MC renderer + env background)
     #[allow(dead_code)]
     env_texture: Option<wgpu::Texture>,
     env_view: Option<wgpu::TextureView>,
@@ -67,7 +66,6 @@ impl App {
             window: None,
             gpu: None,
             renderer: None,
-            ss_renderer: None,
             mc_renderer: None,
             wireframe_renderer: None,
             rigid_body_renderer: None,
@@ -152,18 +150,6 @@ impl App {
             &gpu.queue,
             self.state.environment.hdr_selection,
         ).expect("Failed to load environment map");
-
-        // Create screen-space fluid renderer (photorealistic)
-        let ss_renderer = ScreenSpaceFluidRenderer::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.config.format,
-            &camera_params,
-            &env_view,
-            &env_sampler,
-            gpu.config.width,
-            gpu.config.height,
-        );
 
         // Create marching cubes renderer (shares environment map)
         let mc_renderer = MarchingCubesRenderer::new(
@@ -378,7 +364,6 @@ impl App {
 
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
-        self.ss_renderer = Some(ss_renderer);
         self.mc_renderer = Some(mc_renderer);
         self.wireframe_renderer = Some(wireframe_renderer);
         self.rigid_body_renderer = Some(rigid_body_renderer);
@@ -510,9 +495,6 @@ impl ApplicationHandler for App {
                     }
                     let env_view = self.env_view.as_ref().unwrap();
                     let env_sampler = self.env_sampler.as_ref().unwrap();
-                    if let Some(ss_renderer) = &mut self.ss_renderer {
-                        ss_renderer.resize(&gpu.device, env_view, env_sampler, new_size.width, new_size.height);
-                    }
                     if let Some(mc_renderer) = &mut self.mc_renderer {
                         mc_renderer.resize(&gpu.device, env_view, env_sampler, new_size.width, new_size.height);
                     }
@@ -632,11 +614,6 @@ impl App {
             &gpu.queue,
             selection,
         ).expect("Failed to load environment map");
-
-        // Rebuild SS renderer bind group
-        if let Some(ss_renderer) = &mut self.ss_renderer {
-            ss_renderer.rebuild_env_bind_group(&gpu.device, &env_view, &env_sampler);
-        }
 
         // Rebuild MC renderer bind groups
         if let Some(mc_renderer) = &mut self.mc_renderer {
@@ -1039,44 +1016,6 @@ impl App {
         let mut fluid_depth_view: Option<&wgpu::TextureView> = None;
         if let Some(sph_sim) = &self.sph_simulation {
             match self.state.rendering.render_mode {
-                FluidRenderMode::ScreenSpace => {
-                    // Screen-space fluid rendering (photorealistic)
-                    if let Some(ss_renderer) = &self.ss_renderer {
-                        let camera_params = self.camera.to_gpu_params();
-                        ss_renderer.update_camera(&gpu.queue, &camera_params);
-                        ss_renderer.update_light_params(&gpu.queue, &self.state.lighting.to_gpu_params());
-                        // Identity scene rotation (camera orbits, scene stays fixed)
-                        let identity = [
-                            [1.0, 0.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0, 0.0],
-                            [0.0, 0.0, 1.0, 0.0],
-                            [0.0, 0.0, 0.0, 1.0],
-                        ];
-                        let use_env = self.state.environment.background_mode == BackgroundMode::Environment;
-                        ss_renderer.update_params(
-                            &gpu.queue,
-                            self.state.rendering.particle_radius,
-                            gpu.config.width,
-                            gpu.config.height,
-                            &camera_params,
-                            &identity,
-                            self.state.rendering.ripple_scale,
-                            self.state.rendering.ripple_strength,
-                            self.state.runtime.time_elapsed,
-                            use_env,
-                            &self.state.environment.background_color,
-                            self.state.environment.environment_intensity,
-                        );
-                        ss_renderer.render(
-                            &mut encoder,
-                            render_target,
-                            sph_sim.particle_buffer(),
-                            sph_sim.num_particles(),
-                            &self.state.environment.background_color,
-                        );
-                        // SS mode: no shared depth buffer, use fallback
-                    }
-                }
                 FluidRenderMode::Particles => {
                     // Particle rendering (individual spheres)
                     let use_env = self.state.environment.background_mode == BackgroundMode::Environment;
