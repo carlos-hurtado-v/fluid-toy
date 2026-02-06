@@ -48,10 +48,37 @@ struct MouseForce {
     _padding: vec2<f32>,
 }
 
+struct RigidBody {
+    position: vec3<f32>,
+    half_extent: f32,
+    velocity: vec3<f32>,
+    is_active: u32,
+    stiffness: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+    rot_row0: vec4<f32>,
+    rot_row1: vec4<f32>,
+    rot_row2: vec4<f32>,
+}
+
+struct RigidBodyAccum {
+    force_x: atomic<i32>,
+    force_y: atomic<i32>,
+    force_z: atomic<i32>,
+    contact_count: atomic<u32>,
+    torque_x: atomic<i32>,
+    torque_y: atomic<i32>,
+    torque_z: atomic<i32>,
+    _pad: u32,
+}
+
 @group(0) @binding(0) var<uniform> params: SphParams;
 @group(0) @binding(1) var<storage, read_write> particles: array<SphParticle3D>;
 @group(0) @binding(2) var<uniform> bounds: BoundsParams;
 @group(0) @binding(3) var<uniform> mouse_force: MouseForce;
+@group(0) @binding(4) var<uniform> rigid_body: RigidBody;
+@group(0) @binding(5) var<storage, read_write> body_accum: RigidBodyAccum;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -143,6 +170,69 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let force_dir = normalize(to_mouse);
             // Negative strength = repel (push away), positive = attract
             accel += force_dir * mouse_force.strength * falloff * -1.0;
+        }
+    }
+
+    // Rigid body penalty forces (oriented box SDF)
+    if (rigid_body.is_active != 0u) {
+        // Transform particle position to body-local frame
+        let world_rel = pos - rigid_body.position;
+        let local_pos = vec3<f32>(
+            dot(rigid_body.rot_row0.xyz, world_rel),
+            dot(rigid_body.rot_row1.xyz, world_rel),
+            dot(rigid_body.rot_row2.xyz, world_rel),
+        );
+
+        // Axis-aligned box SDF in local space
+        let d = abs(local_pos) - vec3<f32>(rigid_body.half_extent);
+        let sdf = max(d.x, max(d.y, d.z));
+        let interact_range = params.kernel_radius * 0.7;
+
+        if (sdf < interact_range) {
+            // Outward normal in local space
+            var local_normal = vec3<f32>(0.0);
+            if (d.x >= d.y && d.x >= d.z) {
+                local_normal.x = sign(local_pos.x);
+            } else if (d.y >= d.x && d.y >= d.z) {
+                local_normal.y = sign(local_pos.y);
+            } else {
+                local_normal.z = sign(local_pos.z);
+            }
+
+            // Transform normal from local to world (transpose multiply)
+            let normal = vec3<f32>(
+                rigid_body.rot_row0.x * local_normal.x + rigid_body.rot_row1.x * local_normal.y + rigid_body.rot_row2.x * local_normal.z,
+                rigid_body.rot_row0.y * local_normal.x + rigid_body.rot_row1.y * local_normal.y + rigid_body.rot_row2.y * local_normal.z,
+                rigid_body.rot_row0.z * local_normal.x + rigid_body.rot_row1.z * local_normal.y + rigid_body.rot_row2.z * local_normal.z,
+            );
+
+            // Quadratic penalty ramp
+            let penetration = interact_range - sdf;
+            let t = penetration / interact_range;
+            let penalty = normal * rigid_body.stiffness * t * t;
+            accel += penalty;
+
+            // Velocity-dependent damping
+            var damping_accel = vec3<f32>(0.0);
+            let rel_vel = vel - rigid_body.velocity;
+            let vn = dot(rel_vel, normal);
+            if (vn < 0.0) {
+                damping_accel = -normal * vn * 5.0;
+                accel += damping_accel;
+            }
+
+            // Accumulate reaction force and torque (Newton's 3rd law)
+            let reaction = -(penalty + damping_accel) * params.mass;
+            atomicAdd(&body_accum.force_x, i32(reaction.x * 1000.0));
+            atomicAdd(&body_accum.force_y, i32(reaction.y * 1000.0));
+            atomicAdd(&body_accum.force_z, i32(reaction.z * 1000.0));
+            atomicAdd(&body_accum.contact_count, 1u);
+
+            // Torque: cross(r, F) where r = particle_pos - body_center
+            let torque = cross(world_rel, reaction);
+            atomicAdd(&body_accum.torque_x, i32(torque.x * 1000.0));
+            atomicAdd(&body_accum.torque_y, i32(torque.y * 1000.0));
+            atomicAdd(&body_accum.torque_z, i32(torque.z * 1000.0));
         }
     }
 

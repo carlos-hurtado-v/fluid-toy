@@ -85,31 +85,95 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.separator();
                 ui.label("Tilt:");
                 ui.add(
-                    egui::Slider::new(&mut state.container.tilt_x, -std::f32::consts::PI..=std::f32::consts::PI)
+                    egui::Slider::new(&mut state.container.tilt_x_target, -std::f32::consts::PI..=std::f32::consts::PI)
                         .text("Tilt X (↕)")
                         .suffix(" rad")
                 );
                 ui.add(
-                    egui::Slider::new(&mut state.container.tilt_z, -std::f32::consts::PI..=std::f32::consts::PI)
+                    egui::Slider::new(&mut state.container.tilt_z_target, -std::f32::consts::PI..=std::f32::consts::PI)
                         .text("Tilt Z (↔)")
                         .suffix(" rad")
                 );
 
                 ui.horizontal(|ui| {
                     if ui.button("Reset Tilt").clicked() {
-                        state.container.tilt_x = 0.0;
-                        state.container.tilt_z = 0.0;
+                        state.container.tilt_x_target = 0.0;
+                        state.container.tilt_z_target = 0.0;
                     }
                     if ui.button("Flip Upside Down").clicked() {
-                        state.container.tilt_x = std::f32::consts::PI;
-                        state.container.tilt_z = 0.0;
+                        state.container.tilt_x_target = std::f32::consts::PI;
+                        state.container.tilt_z_target = 0.0;
                     }
                 });
 
-                // Show container orientation
-                let tilt_deg_x = state.container.tilt_x.to_degrees();
-                let tilt_deg_z = state.container.tilt_z.to_degrees();
+                let tilt_deg_x = state.container.tilt_x_target.to_degrees();
+                let tilt_deg_z = state.container.tilt_z_target.to_degrees();
                 ui.label(format!("Tilt: {:.0}° x {:.0}°", tilt_deg_x, tilt_deg_z));
+            });
+
+            ui.add_space(8.0);
+
+            // Rigid Body controls
+            ui.collapsing("Rigid Body", |ui| {
+                ui.checkbox(&mut state.rigid_body.enabled, "Enable");
+
+                if state.rigid_body.enabled {
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut state.rigid_body.held, "Held (manual position)");
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Drop").clicked() {
+                            state.rigid_body.held = false;
+                            state.rigid_body.velocity = [0.0; 3];
+                        }
+                        if ui.button("Reset").clicked() {
+                            state.rigid_body.held = true;
+                            state.rigid_body.position = [0.0, 0.2, 0.0];
+                            state.rigid_body.velocity = [0.0; 3];
+                            state.rigid_body.orientation = [0.0, 0.0, 0.0, 1.0];
+                            state.rigid_body.angular_velocity = [0.0; 3];
+                        }
+                        if ui.button("Reset Rotation").clicked() {
+                            state.rigid_body.orientation = [0.0, 0.0, 0.0, 1.0];
+                            state.rigid_body.angular_velocity = [0.0; 3];
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Slider::new(&mut state.rigid_body.half_extent, 0.05..=0.5)
+                            .text("Size")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.rigid_body.density, 10.0..=10000.0)
+                            .text("Density")
+                            .logarithmic(true)
+                    );
+                    ui.label(format!("  Fluid density: {:.0}", state.sph.rest_density));
+
+                    if state.rigid_body.held {
+                        ui.add_space(4.0);
+                        ui.label("Position:");
+                        ui.add(
+                            egui::Slider::new(&mut state.rigid_body.position[0], -1.0..=1.0)
+                                .text("X")
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut state.rigid_body.position[1], -1.0..=1.0)
+                                .text("Y")
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut state.rigid_body.position[2], -1.0..=1.0)
+                                .text("Z")
+                        );
+                    }
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Color:");
+                        egui::color_picker::color_edit_button_rgb(ui, &mut state.rigid_body.color);
+                    });
+                }
             });
 
             ui.add_space(8.0);

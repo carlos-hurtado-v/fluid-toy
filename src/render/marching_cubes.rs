@@ -6,6 +6,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
+use super::RigidBodyRenderer;
 use crate::render::GpuCameraParams;
 use crate::state::GpuLightParams;
 
@@ -1246,12 +1247,15 @@ impl MarchingCubesRenderer {
         self.counter_staging_buffer.unmap();
     }
 
-    /// Render the generated mesh with environment background
+    /// Render the generated mesh with environment background.
+    /// If `rigid_body` is provided, it will be rendered inside the same MSAA pass
+    /// for proper depth testing against the fluid surface.
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         color_view: &wgpu::TextureView,
         _background_color: &[f32; 3],
+        rigid_body: Option<&RigidBodyRenderer>,
     ) {
         // Pass 1: Render back faces to back_depth_texture (for thickness calculation)
         {
@@ -1293,7 +1297,7 @@ impl MarchingCubesRenderer {
                     view: &self.background_depth_view,  // Use single-sampled depth
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,  // Don't need to keep it
+                        store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
@@ -1303,6 +1307,12 @@ impl MarchingCubesRenderer {
             env_pass.set_pipeline(&self.env_pipeline_1x);  // Use single-sampled pipeline
             env_pass.set_bind_group(0, &self.env_bind_group, &[]);
             env_pass.draw(0..3, 0..1);
+
+            // Render rigid body into background texture so the water shader's
+            // screen-space refraction shows it through the water surface
+            if let Some(rb) = rigid_body {
+                rb.render(&mut env_pass);
+            }
         }
 
         // Pass 3: Render water mesh with screen-space refraction from background
@@ -1342,6 +1352,11 @@ impl MarchingCubesRenderer {
             pass.set_bind_group(0, &self.env_bind_group, &[]);
             pass.draw(0..3, 0..1);
 
+            // Draw rigid body into the carved-out gap before water mesh
+            if let Some(rb) = rigid_body {
+                rb.render_msaa(&mut pass);
+            }
+
             // Draw water mesh on top (samples background_texture for refraction)
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, &self.render_bind_group, &[]);
@@ -1349,7 +1364,6 @@ impl MarchingCubesRenderer {
         }
     }
 
-    /// Resize depth buffer when window size changes
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if self.width == width && self.height == height {
             return;

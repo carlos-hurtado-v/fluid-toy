@@ -179,6 +179,11 @@ impl ParticleRenderer3D {
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
     }
 
+    /// Expose depth view for other renderers (e.g. rigid body) to depth-test against
+    pub fn depth_view(&self) -> &wgpu::TextureView {
+        &self.depth_view
+    }
+
     /// Resize depth buffer if needed
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if self.current_size != (width, height) {

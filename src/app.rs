@@ -12,9 +12,9 @@ use winit::{
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, ScreenSpaceFluidRenderer, WireframeRenderer};
+use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, ScreenSpaceFluidRenderer, WireframeRenderer};
 use crate::simulation::{SphSimulation3DGrid, create_particle_block};
-use crate::state::{AppState, FluidRenderMode, GpuMouseForce};
+use crate::state::{AppState, FluidRenderMode, GpuMouseForce, quat_mul, quat_normalize};
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -23,6 +23,8 @@ pub struct App {
     ss_renderer: Option<ScreenSpaceFluidRenderer>,
     mc_renderer: Option<MarchingCubesRenderer>,
     wireframe_renderer: Option<WireframeRenderer>,
+    rigid_body_renderer: Option<RigidBodyRenderer>,
+    rigid_body_depth_view: Option<wgpu::TextureView>,  // Fallback depth for modes without shared depth
     post_process_renderer: Option<PostProcessRenderer>,
     sph_simulation: Option<SphSimulation3DGrid>,
     camera: Camera,
@@ -52,6 +54,8 @@ impl App {
             ss_renderer: None,
             mc_renderer: None,
             wireframe_renderer: None,
+            rigid_body_renderer: None,
+            rigid_body_depth_view: None,
             post_process_renderer: None,
             sph_simulation: None,
             camera: Camera::default(),
@@ -146,6 +150,21 @@ impl App {
             &container_params,
         );
 
+        // Create rigid body renderer + fallback depth texture
+        let rb_render_params = self.state.rigid_body.to_gpu_render(
+            self.state.lighting.sun_direction_normalized(),
+        );
+        let rigid_body_renderer = RigidBodyRenderer::new(
+            &gpu.device,
+            gpu.config.format,
+            &camera_params,
+            &rb_render_params,
+            self.state.quality.msaa.as_u32(),
+        );
+        let rigid_body_depth_view = create_depth_texture(
+            &gpu.device, gpu.config.width, gpu.config.height,
+        );
+
         // Create post-process renderer
         let post_process_params = self.state.post_process.to_gpu_params();
         let post_process_renderer = PostProcessRenderer::new(
@@ -177,6 +196,8 @@ impl App {
         self.ss_renderer = Some(ss_renderer);
         self.mc_renderer = Some(mc_renderer);
         self.wireframe_renderer = Some(wireframe_renderer);
+        self.rigid_body_renderer = Some(rigid_body_renderer);
+        self.rigid_body_depth_view = Some(rigid_body_depth_view);
         self.post_process_renderer = Some(post_process_renderer);
         self.sph_simulation = Some(sph_simulation);
         self.egui_winit = Some(egui_winit);
@@ -184,6 +205,11 @@ impl App {
     }
 
     fn reset_simulation(&mut self) {
+        // Reset rigid body velocity and rotation (keep position)
+        self.state.rigid_body.velocity = [0.0; 3];
+        self.state.rigid_body.angular_velocity = [0.0; 3];
+        self.state.rigid_body.orientation = [0.0, 0.0, 0.0, 1.0];
+
         if let Some(gpu) = &self.gpu {
             let spacing = self.state.sph.kernel_radius * 0.6;
             let particles = create_particle_block(spacing, self.state.simulation.initial_cube_size);
@@ -227,6 +253,7 @@ impl App {
         self.state.camera.reset_defaults();
         self.state.lighting.reset_defaults();
         self.state.container.reset_defaults();
+        self.state.rigid_body.reset_defaults();
         // Reset camera to defaults
         self.camera.distance = self.state.camera.distance;
         self.camera.yaw = self.state.camera.yaw;
@@ -284,6 +311,9 @@ impl ApplicationHandler for App {
                     if let Some(mc_renderer) = &mut self.mc_renderer {
                         mc_renderer.resize(&gpu.device, new_size.width, new_size.height);
                     }
+                    self.rigid_body_depth_view = Some(create_depth_texture(
+                        &gpu.device, new_size.width, new_size.height,
+                    ));
                     if let Some(pp_renderer) = &mut self.post_process_renderer {
                         pp_renderer.resize(&gpu.device, new_size.width, new_size.height);
                     }
@@ -339,27 +369,27 @@ impl ApplicationHandler for App {
                             }
                             // Arrow keys for tilting
                             KeyCode::ArrowLeft => {
-                                self.state.container.tilt_z -= tilt_speed;
+                                self.state.container.tilt_z_target -= tilt_speed;
                             }
                             KeyCode::ArrowRight => {
-                                self.state.container.tilt_z += tilt_speed;
+                                self.state.container.tilt_z_target += tilt_speed;
                             }
                             KeyCode::ArrowUp => {
-                                self.state.container.tilt_x -= tilt_speed;
+                                self.state.container.tilt_x_target -= tilt_speed;
                             }
                             KeyCode::ArrowDown => {
-                                self.state.container.tilt_x += tilt_speed;
+                                self.state.container.tilt_x_target += tilt_speed;
                             }
                             // Home to reset tilt AND camera
                             KeyCode::Home => {
-                                self.state.container.tilt_x = 0.0;
-                                self.state.container.tilt_z = 0.0;
+                                self.state.container.tilt_x_target = 0.0;
+                                self.state.container.tilt_z_target = 0.0;
                                 self.camera.reset();
                             }
                             // End to flip upside down
                             KeyCode::End => {
-                                self.state.container.tilt_x = std::f32::consts::PI;
-                                self.state.container.tilt_z = 0.0;
+                                self.state.container.tilt_x_target = std::f32::consts::PI;
+                                self.state.container.tilt_z_target = 0.0;
                             }
                             _ => {}
                         }
@@ -434,11 +464,22 @@ impl App {
 
             sph_sim.update_mouse_force(&gpu.queue, &mouse_force);
 
+            // Update rigid body
+            let rb_params = self.state.rigid_body.to_gpu_rigid_body(self.state.sph.wall_stiffness);
+            sph_sim.update_rigid_body(&gpu.queue, &rb_params);
+
             // Update camera
             let camera_params = self.camera.to_gpu_params();
             renderer.update_camera(&gpu.queue, &camera_params);
             if let Some(wireframe) = &self.wireframe_renderer {
                 wireframe.update_camera(&gpu.queue, &camera_params);
+            }
+            if let Some(rb_renderer) = &self.rigid_body_renderer {
+                rb_renderer.update_camera(&gpu.queue, &camera_params);
+                let rb_render = self.state.rigid_body.to_gpu_render(
+                    self.state.lighting.sun_direction_normalized(),
+                );
+                rb_renderer.update_params(&gpu.queue, &rb_render);
             }
 
             let render_params = self.state.rendering.to_gpu_params();
@@ -533,13 +574,149 @@ impl App {
                 label: Some("Main Encoder"),
             });
 
+        // Smoothly interpolate container tilt toward target each frame
+        self.state.container.update_tilt(self.state.simulation.delta_time);
+
         // Run SPH simulation if not paused (multiple sub-steps for stability)
         // Note: Grid simulation manages its own command encoding/submission
+        let num_substeps = 2u32;
         if !self.state.simulation.paused {
-            if let Some(sph_sim) = &self.sph_simulation {
-                // Run 2 sub-steps per frame (matches reference)
-                for _ in 0..2 {
+            if let Some(sph_sim) = &mut self.sph_simulation {
+                // Clear accumulator once, then accumulate over all sub-steps
+                sph_sim.clear_rigid_body_accum(&gpu.queue);
+                for _ in 0..num_substeps {
                     sph_sim.step(&gpu.device, &gpu.queue);
+                }
+                // Read back total accumulated rigid body forces
+                sph_sim.read_rigid_body_accum(&gpu.device);
+            }
+        }
+
+        // Integrate rigid body on CPU
+        if self.state.rigid_body.enabled && !self.state.rigid_body.held && !self.state.simulation.paused {
+            if let Some(sph_sim) = &self.sph_simulation {
+                let accum = sph_sim.rigid_body_accum();
+                let reaction = [
+                    accum.force_x as f32 / 1000.0,
+                    accum.force_y as f32 / 1000.0,
+                    accum.force_z as f32 / 1000.0,
+                ];
+
+                let he = self.state.rigid_body.half_extent;
+                let volume = (2.0 * he) * (2.0 * he) * (2.0 * he);
+                let body_mass = self.state.rigid_body.density * volume;
+                let gravity = self.state.simulation.gravity_vector();
+                let dt = self.state.simulation.delta_time;
+                let total_dt = num_substeps as f32 * dt;
+
+                if body_mass > 0.0 {
+                    // Reaction-induced velocity change (clamped to prevent explosions with light bodies)
+                    let mut dv = [0.0f32; 3];
+                    for i in 0..3 {
+                        dv[i] = dt * reaction[i] / body_mass;
+                    }
+                    let max_dv = total_dt * 200.0; // Match SPH particle accel clamp
+                    let dv_mag = (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]).sqrt();
+                    if dv_mag > max_dv {
+                        let scale = max_dv / dv_mag;
+                        for i in 0..3 { dv[i] *= scale; }
+                    }
+                    for i in 0..3 {
+                        self.state.rigid_body.velocity[i] += dv[i] + total_dt * gravity[i];
+                        self.state.rigid_body.velocity[i] *= 0.995; // Light damping
+                    }
+                    for i in 0..3 {
+                        self.state.rigid_body.position[i] += total_dt * self.state.rigid_body.velocity[i];
+                    }
+
+                    // Angular dynamics: torque → angular acceleration → angular velocity → quaternion
+                    let torque = [
+                        accum.torque_x as f32 / 1000.0,
+                        accum.torque_y as f32 / 1000.0,
+                        accum.torque_z as f32 / 1000.0,
+                    ];
+                    let side = 2.0 * he;
+                    let inertia = (1.0 / 6.0) * body_mass * side * side;
+
+                    if inertia > 0.0 {
+                        let mut dw = [0.0f32; 3];
+                        for i in 0..3 {
+                            dw[i] = dt * torque[i] / inertia;
+                        }
+                        let max_dw = total_dt * 50.0; // Clamp angular accel for light bodies
+                        let dw_mag = (dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]).sqrt();
+                        if dw_mag > max_dw {
+                            let scale = max_dw / dw_mag;
+                            for i in 0..3 { dw[i] *= scale; }
+                        }
+                        for i in 0..3 {
+                            self.state.rigid_body.angular_velocity[i] += dw[i];
+                            self.state.rigid_body.angular_velocity[i] *= 0.98; // Angular damping
+                        }
+
+                        // Quaternion integration: q += 0.5 * dt * [ω, 0] * q
+                        let av = self.state.rigid_body.angular_velocity;
+                        let omega_quat = [av[0], av[1], av[2], 0.0];
+                        let q = self.state.rigid_body.orientation;
+                        let q_dot = quat_mul(omega_quat, q);
+                        self.state.rigid_body.orientation = quat_normalize([
+                            q[0] + 0.5 * total_dt * q_dot[0],
+                            q[1] + 0.5 * total_dt * q_dot[1],
+                            q[2] + 0.5 * total_dt * q_dot[2],
+                            q[3] + 0.5 * total_dt * q_dot[3],
+                        ]);
+                    }
+
+                    // Container collision in tilted local space
+                    // (same rotation matrix as particle boundary handling)
+                    let (sin_x, cos_x) = self.state.container.tilt_x.sin_cos();
+                    let (sin_z, cos_z) = self.state.container.tilt_z.sin_cos();
+                    // Rotation rows (world → container local): Rz * Rx
+                    let r0 = [cos_z, -sin_z * cos_x, sin_z * sin_x];
+                    let r1 = [sin_z,  cos_z * cos_x, -cos_z * sin_x];
+                    let r2 = [0.0,    sin_x,           cos_x];
+
+                    let rb = &mut self.state.rigid_body;
+                    let rhe = rb.half_extent;
+                    let pos = rb.position;
+                    let vel = rb.velocity;
+
+                    // Transform to local space
+                    let mut lp = [
+                        r0[0]*pos[0] + r0[1]*pos[1] + r0[2]*pos[2],
+                        r1[0]*pos[0] + r1[1]*pos[1] + r1[2]*pos[2],
+                        r2[0]*pos[0] + r2[1]*pos[1] + r2[2]*pos[2],
+                    ];
+                    let mut lv = [
+                        r0[0]*vel[0] + r0[1]*vel[1] + r0[2]*vel[2],
+                        r1[0]*vel[0] + r1[1]*vel[1] + r1[2]*vel[2],
+                        r2[0]*vel[0] + r2[1]*vel[1] + r2[2]*vel[2],
+                    ];
+
+                    let hw = self.state.container.half_width();
+                    let hd = self.state.container.half_depth();
+                    let floor_y = self.state.container.floor_y;
+                    let ceil_y = self.state.container.ceiling_y();
+
+                    // Clamp in local space
+                    if lp[0] - rhe < -hw  { lp[0] = -hw + rhe;  lv[0] =  lv[0].abs() * 0.3; }
+                    if lp[0] + rhe >  hw  { lp[0] =  hw - rhe;  lv[0] = -lv[0].abs() * 0.3; }
+                    if lp[1] - rhe < floor_y { lp[1] = floor_y + rhe; lv[1] =  lv[1].abs() * 0.3; }
+                    if lp[1] + rhe > ceil_y  { lp[1] = ceil_y - rhe;  lv[1] = -lv[1].abs() * 0.3; }
+                    if lp[2] - rhe < -hd  { lp[2] = -hd + rhe;  lv[2] =  lv[2].abs() * 0.3; }
+                    if lp[2] + rhe >  hd  { lp[2] =  hd - rhe;  lv[2] = -lv[2].abs() * 0.3; }
+
+                    // Transform back to world space (multiply by R^T)
+                    rb.position = [
+                        r0[0]*lp[0] + r1[0]*lp[1] + r2[0]*lp[2],
+                        r0[1]*lp[0] + r1[1]*lp[1] + r2[1]*lp[2],
+                        r0[2]*lp[0] + r1[2]*lp[1] + r2[2]*lp[2],
+                    ];
+                    rb.velocity = [
+                        r0[0]*lv[0] + r1[0]*lv[1] + r2[0]*lv[2],
+                        r0[1]*lv[0] + r1[1]*lv[1] + r2[1]*lv[2],
+                        r0[2]*lv[0] + r1[2]*lv[1] + r2[2]*lv[2],
+                    ];
                 }
             }
         }
@@ -556,7 +733,9 @@ impl App {
             &view
         };
 
-        // Render fluid or particles based on render mode
+        // Render fluid or particles based on render mode,
+        // then render rigid body with depth testing against the fluid
+        let mut fluid_depth_view: Option<&wgpu::TextureView> = None;
         if let Some(sph_sim) = &self.sph_simulation {
             match self.state.rendering.render_mode {
                 FluidRenderMode::ScreenSpace => {
@@ -590,6 +769,7 @@ impl App {
                             sph_sim.num_particles(),
                             &self.state.rendering.background_color,
                         );
+                        // SS mode: no shared depth buffer, use fallback
                     }
                 }
                 FluidRenderMode::Particles => {
@@ -602,6 +782,8 @@ impl App {
                             sph_sim.num_particles(),
                             &self.state.rendering.background_color,
                         );
+                        // Share particle depth buffer for rigid body occlusion
+                        fluid_depth_view = Some(renderer.depth_view());
                     }
                 }
                 FluidRenderMode::MarchingCubes => {
@@ -637,13 +819,59 @@ impl App {
                             &gpu.device,
                             sph_sim.particle_buffer(),
                         );
+                        // Pass rigid body renderer into MC pass for proper MSAA depth testing
+                        let rb_for_mc = if self.state.rigid_body.enabled {
+                            self.rigid_body_renderer.as_ref()
+                        } else {
+                            None
+                        };
                         mc_renderer.render(
                             &mut encoder,
                             render_target,
                             &self.state.rendering.background_color,
+                            rb_for_mc,
                         );
                     }
                 }
+            }
+        }
+
+        // Render rigid body cube with depth testing against fluid surface
+        // (MC mode handles this inside its own MSAA pass above)
+        if self.state.rigid_body.enabled && self.state.rendering.render_mode != FluidRenderMode::MarchingCubes {
+            if let Some(rb_renderer) = &self.rigid_body_renderer {
+                let depth_view = fluid_depth_view
+                    .unwrap_or_else(|| self.rigid_body_depth_view.as_ref().unwrap());
+                let use_fluid_depth = fluid_depth_view.is_some();
+
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Rigid Body Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: render_target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            // Load fluid depth if available, otherwise clear (everything passes)
+                            load: if use_fluid_depth {
+                                wgpu::LoadOp::Load
+                            } else {
+                                wgpu::LoadOp::Clear(1.0)
+                            },
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rb_renderer.render(&mut render_pass);
             }
         }
 
@@ -664,7 +892,7 @@ impl App {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load, // Keep fluid rendering
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -736,5 +964,23 @@ impl App {
             GuiAction::None => {}
         }
     }
+}
+
+fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("RigidBody Fallback Depth"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 

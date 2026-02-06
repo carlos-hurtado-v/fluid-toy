@@ -71,9 +71,9 @@ impl Default for PostProcessConfig {
 
             // Anamorphic streaks (cyan tint by default for sci-fi look)
             streaks_enabled: true,
-            streaks_intensity: 0.25,
-            streaks_threshold: 0.70,
-            streaks_tint: [0.6, 0.8, 1.0], // Slight cyan/blue tint
+            streaks_intensity: 0.15,
+            streaks_threshold: 0.75,
+            streaks_tint: [0.1, 0.17, 0.25], // Slight cyan/blue tint
         }
     }
 }

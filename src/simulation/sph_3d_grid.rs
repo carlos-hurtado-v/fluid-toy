@@ -1,7 +1,7 @@
 //! 3D SPH simulation with spatial hashing for O(n) neighbor search
 
 use crate::simulation::particle::SphParticle3D;
-use crate::state::{GpuBoundsParams3D, GpuGravity, GpuMouseForce, GpuSphParams3D};
+use crate::state::{GpuBoundsParams3D, GpuGravity, GpuMouseForce, GpuRigidBody, GpuRigidBodyAccum, GpuSphParams3D};
 use wgpu::util::DeviceExt;
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -70,6 +70,12 @@ pub struct SphSimulation3DGrid {
     density_bind_group: wgpu::BindGroup,
     force_bind_group: wgpu::BindGroup,
     integrate_bind_group: wgpu::BindGroup,
+
+    // Rigid body buffers
+    rigid_body_buffer: wgpu::Buffer,
+    rigid_body_accum_buffer: wgpu::Buffer,
+    rigid_body_accum_staging: wgpu::Buffer,
+    last_accum: GpuRigidBodyAccum,
 
     // Grid dimensions
     grid_params: GpuGridParams,
@@ -233,6 +239,25 @@ impl SphSimulation3DGrid {
             label: Some("Gravity Buffer"),
             contents: bytemuck::bytes_of(&default_gravity),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let rigid_body_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Rigid Body Buffer"),
+            contents: bytemuck::bytes_of(&GpuRigidBody::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let rigid_body_accum_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Rigid Body Accum Buffer"),
+            contents: bytemuck::bytes_of(&GpuRigidBodyAccum::default()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let rigid_body_accum_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Rigid Body Accum Staging"),
+            size: std::mem::size_of::<GpuRigidBodyAccum>() as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let grid_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -723,7 +748,7 @@ impl SphSimulation3DGrid {
             ],
         });
 
-        // Integrate (with mouse force)
+        // Integrate (with mouse force + rigid body)
         let integrate_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Integrate Layout"),
             entries: &[
@@ -751,6 +776,18 @@ impl SphSimulation3DGrid {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
 
@@ -775,6 +812,8 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: bounds_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: mouse_force_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: rigid_body_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: rigid_body_accum_buffer.as_entire_binding() },
             ],
         });
 
@@ -806,6 +845,10 @@ impl SphSimulation3DGrid {
             density_bind_group,
             force_bind_group,
             integrate_bind_group,
+            rigid_body_buffer,
+            rigid_body_accum_buffer,
+            rigid_body_accum_staging,
+            last_accum: GpuRigidBodyAccum::default(),
             grid_params,
             num_particles,
             max_particles,
@@ -951,7 +994,7 @@ impl SphSimulation3DGrid {
                 pass.dispatch_workgroups(particle_workgroups, 1, 1);
             }
 
-            // 7. Integration
+            // 7. Integration (+ rigid body penalty forces)
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Integrate Pass"),
@@ -961,6 +1004,15 @@ impl SphSimulation3DGrid {
                 pass.set_bind_group(0, &self.integrate_bind_group, &[]);
                 pass.dispatch_workgroups(particle_workgroups, 1, 1);
             }
+
+            // Copy accumulator to staging for CPU readback
+            encoder.copy_buffer_to_buffer(
+                &self.rigid_body_accum_buffer,
+                0,
+                &self.rigid_body_accum_staging,
+                0,
+                std::mem::size_of::<GpuRigidBodyAccum>() as u64,
+            );
 
             queue.submit(std::iter::once(encoder.finish()));
         }
@@ -985,6 +1037,35 @@ impl SphSimulation3DGrid {
 
     pub fn update_gravity(&self, queue: &wgpu::Queue, params: &GpuGravity) {
         queue.write_buffer(&self.gravity_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn update_rigid_body(&self, queue: &wgpu::Queue, params: &GpuRigidBody) {
+        queue.write_buffer(&self.rigid_body_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn clear_rigid_body_accum(&self, queue: &wgpu::Queue) {
+        queue.write_buffer(
+            &self.rigid_body_accum_buffer,
+            0,
+            bytemuck::bytes_of(&GpuRigidBodyAccum::default()),
+        );
+    }
+
+    pub fn read_rigid_body_accum(&mut self, device: &wgpu::Device) {
+        let slice = self.rigid_body_accum_staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        {
+            let data = slice.get_mapped_range();
+            let accum: &GpuRigidBodyAccum = bytemuck::from_bytes(&data);
+            self.last_accum = *accum;
+        }
+        self.rigid_body_accum_staging.unmap();
+    }
+
+    pub fn rigid_body_accum(&self) -> &GpuRigidBodyAccum {
+        &self.last_accum
     }
 
     pub fn particle_buffer(&self) -> &wgpu::Buffer {

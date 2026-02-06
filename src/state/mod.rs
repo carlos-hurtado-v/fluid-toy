@@ -32,7 +32,31 @@ pub struct AppState {
     pub quality: QualityConfig,
     pub post_process: PostProcessConfig,
     pub camera: CameraConfig,
+    pub rigid_body: RigidBodyConfig,
     pub runtime: RuntimeState,
+}
+
+/// Rigid body configuration
+#[derive(Debug, Clone)]
+pub struct RigidBodyConfig {
+    /// Whether the rigid body is active in the scene
+    pub enabled: bool,
+    /// Whether the body is held (user-positioned) or simulated
+    pub held: bool,
+    /// Position in world space
+    pub position: [f32; 3],
+    /// Linear velocity
+    pub velocity: [f32; 3],
+    /// Orientation quaternion [x, y, z, w]
+    pub orientation: [f32; 4],
+    /// Angular velocity (world space, radians/sec)
+    pub angular_velocity: [f32; 3],
+    /// Half-extent of the cube (uniform size)
+    pub half_extent: f32,
+    /// Body density (compared to fluid rest_density; < rest_density → floats)
+    pub density: f32,
+    /// Render color (RGB)
+    pub color: [f32; 3],
 }
 
 /// Lighting configuration
@@ -78,10 +102,14 @@ pub struct ContainerConfig {
     pub floor_y: f32,
     /// Container height (extends upward from floor_y)
     pub height: f32,
-    /// Container tilt around X axis (radians) - tilts forward/back
+    /// Container tilt around X axis (radians) - current smoothed value
     pub tilt_x: f32,
-    /// Container tilt around Z axis (radians) - tilts left/right
+    /// Container tilt around Z axis (radians) - current smoothed value
     pub tilt_z: f32,
+    /// Target tilt around X axis (radians) - set by GUI slider
+    pub tilt_x_target: f32,
+    /// Target tilt around Z axis (radians) - set by GUI slider
+    pub tilt_z_target: f32,
 }
 
 /// SPH physics configuration
@@ -201,9 +229,107 @@ impl Default for AppState {
             quality: QualityConfig::default(),
             post_process: PostProcessConfig::default(),
             camera: CameraConfig::default(),
+            rigid_body: RigidBodyConfig::default(),
             runtime: RuntimeState::default(),
         }
     }
+}
+
+impl Default for RigidBodyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            held: true,
+            position: [0.0, 0.2, 0.0],
+            velocity: [0.0; 3],
+            orientation: [0.0, 0.0, 0.0, 1.0],  // Identity quaternion
+            angular_velocity: [0.0; 3],
+            half_extent: 0.15,
+            density: 300.0,  // Lighter than default rest_density (6000) → floats
+            color: [0.9, 0.7, 0.2],  // Yellow/gold
+        }
+    }
+}
+
+impl RigidBodyConfig {
+    pub fn reset_defaults(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn to_gpu_rigid_body(&self, wall_stiffness: f32) -> GpuRigidBody {
+        let rows = quat_to_rotation_rows(self.orientation);
+        GpuRigidBody {
+            position: self.position,
+            half_extent: self.half_extent,
+            velocity: self.velocity,
+            is_active: if self.enabled { 1 } else { 0 },
+            stiffness: wall_stiffness,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            rot_row0: rows[0],
+            rot_row1: rows[1],
+            rot_row2: rows[2],
+        }
+    }
+
+    pub fn to_gpu_render(&self, light_dir: [f32; 3]) -> GpuRigidBodyRender {
+        let rows = quat_to_rotation_rows(self.orientation);
+        GpuRigidBodyRender {
+            position: self.position,
+            half_extent: self.half_extent,
+            color: [self.color[0], self.color[1], self.color[2], 1.0],
+            light_dir,
+            _pad: 0.0,
+            rot_row0: rows[0],
+            rot_row1: rows[1],
+            rot_row2: rows[2],
+        }
+    }
+}
+
+// --- Quaternion helpers ---
+
+/// Normalize a quaternion [x, y, z, w]
+pub fn quat_normalize(q: [f32; 4]) -> [f32; 4] {
+    let len = (q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]).sqrt();
+    if len < 1e-10 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    [q[0]/len, q[1]/len, q[2]/len, q[3]/len]
+}
+
+/// Quaternion multiplication: a * b (Hamilton product)
+pub fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let [ax, ay, az, aw] = a;
+    let [bx, by, bz, bw] = b;
+    [
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw,
+        aw*bw - ax*bx - ay*by - az*bz,
+    ]
+}
+
+/// Convert quaternion to 3 rotation matrix rows (world→local, i.e. R_quat transposed).
+/// Matches the container bounds convention used in the integrate shader.
+pub fn quat_to_rotation_rows(q: [f32; 4]) -> [[f32; 4]; 3] {
+    let [x, y, z, w] = q;
+    let xx = x*x; let yy = y*y; let zz = z*z;
+    let xy = x*y; let xz = x*z; let yz = y*z;
+    let wx = w*x; let wy = w*y; let wz = w*z;
+
+    // R_quat (local→world):
+    //   [1-2(yy+zz),  2(xy-wz),  2(xz+wy)]
+    //   [2(xy+wz),  1-2(xx+zz),  2(yz-wx)]
+    //   [2(xz-wy),  2(yz+wx),  1-2(xx+yy)]
+    //
+    // We store R_quat^T (world→local) rows = R_quat columns:
+    [
+        [1.0-2.0*(yy+zz), 2.0*(xy+wz), 2.0*(xz-wy), 0.0],
+        [2.0*(xy-wz), 1.0-2.0*(xx+zz), 2.0*(yz+wx), 0.0],
+        [2.0*(xz+wy), 2.0*(yz-wx), 1.0-2.0*(xx+yy), 0.0],
+    ]
 }
 
 impl Default for LightingConfig {
@@ -256,8 +382,10 @@ impl Default for ContainerConfig {
             depth: 1.8,          // Full Z dimension (-0.9 to +0.9)
             floor_y: -0.9,       // Floor at bottom
             height: 1.8,         // Extends to +0.9
-            tilt_x: 0.0,         // No tilt
+            tilt_x: 0.0,
             tilt_z: 0.0,
+            tilt_x_target: 0.0,
+            tilt_z_target: 0.0,
         }
     }
 }
@@ -265,6 +393,15 @@ impl Default for ContainerConfig {
 impl ContainerConfig {
     pub fn reset_defaults(&mut self) {
         *self = Self::default();
+    }
+
+    /// Smoothly interpolate current tilt toward target (call once per frame)
+    pub fn update_tilt(&mut self, dt: f32) {
+        // Exponential smoothing: ~90% of the way in 0.15 seconds
+        let rate = 15.0 * dt;
+        let t = rate.min(1.0);
+        self.tilt_x += (self.tilt_x_target - self.tilt_x) * t;
+        self.tilt_z += (self.tilt_z_target - self.tilt_z) * t;
     }
 
     /// Get the ceiling Y position
@@ -379,7 +516,7 @@ impl RenderConfig {
     pub fn visual_margin(&self) -> f32 {
         match self.render_mode {
             FluidRenderMode::ScreenSpace => self.particle_radius * 4.5,
-            FluidRenderMode::MarchingCubes => self.particle_radius * 4.5, // Similar to screen-space
+            FluidRenderMode::MarchingCubes => self.particle_radius, // MC isosurface doesn't inflate particles like screen-space
             FluidRenderMode::Particles => self.particle_radius,
         }
     }
@@ -391,8 +528,8 @@ impl Default for SphConfig {
         // Tuned values for realistic water-like behavior
         Self {
             kernel_radius: 0.08,
-            rest_density: 6000.0,
-            stiffness: 7.5,            // Fast pressure response for proper wave propagation
+            rest_density: 8000.0,
+            stiffness: 40.0,
             near_stiffness: 0.4,
             viscosity: 20.0,           // Low enough for waves to persist
             mass: 1.0,
@@ -619,4 +756,82 @@ impl LightingConfig {
             _pad1: 0.0,
         }
     }
+}
+
+/// GPU-compatible rigid body parameters for integrate shader (48 bytes)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuRigidBody {
+    pub position: [f32; 3],     // 12 bytes
+    pub half_extent: f32,       // 4 bytes  → 16
+    pub velocity: [f32; 3],     // 12 bytes
+    pub is_active: u32,         // 4 bytes  → 32
+    pub stiffness: f32,         // 4 bytes
+    pub _pad0: f32,             // 4 bytes
+    pub _pad1: f32,             // 4 bytes
+    pub _pad2: f32,             // 4 bytes  → 48
+    pub rot_row0: [f32; 4],     // 16 bytes → 64
+    pub rot_row1: [f32; 4],     // 16 bytes → 80
+    pub rot_row2: [f32; 4],     // 16 bytes → 96
+}
+
+impl Default for GpuRigidBody {
+    fn default() -> Self {
+        Self {
+            position: [0.0; 3],
+            half_extent: 0.15,
+            velocity: [0.0; 3],
+            is_active: 0,
+            stiffness: 200.0,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            rot_row0: [1.0, 0.0, 0.0, 0.0],
+            rot_row1: [0.0, 1.0, 0.0, 0.0],
+            rot_row2: [0.0, 0.0, 1.0, 0.0],
+        }
+    }
+}
+
+/// GPU rigid body force accumulator (16 bytes, atomic i32 on GPU side)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuRigidBodyAccum {
+    pub force_x: i32,       // fixed-point × 1000
+    pub force_y: i32,
+    pub force_z: i32,
+    pub contact_count: u32,
+    pub torque_x: i32,      // fixed-point × 1000
+    pub torque_y: i32,
+    pub torque_z: i32,
+    pub _pad: u32,
+}
+
+impl Default for GpuRigidBodyAccum {
+    fn default() -> Self {
+        Self {
+            force_x: 0,
+            force_y: 0,
+            force_z: 0,
+            contact_count: 0,
+            torque_x: 0,
+            torque_y: 0,
+            torque_z: 0,
+            _pad: 0,
+        }
+    }
+}
+
+/// GPU rigid body rendering parameters (96 bytes)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuRigidBodyRender {
+    pub position: [f32; 3],     // 12 bytes
+    pub half_extent: f32,       // 4 bytes  → 16
+    pub color: [f32; 4],        // 16 bytes → 32
+    pub light_dir: [f32; 3],    // 12 bytes
+    pub _pad: f32,              // 4 bytes  → 48
+    pub rot_row0: [f32; 4],     // 16 bytes → 64
+    pub rot_row1: [f32; 4],     // 16 bytes → 80
+    pub rot_row2: [f32; 4],     // 16 bytes → 96
 }
