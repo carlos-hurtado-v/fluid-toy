@@ -1072,6 +1072,14 @@ impl SphSimulation3DGrid {
         &self.particle_buffer
     }
 
+    pub fn sph_params_buffer(&self) -> &wgpu::Buffer {
+        &self.sph_params_buffer
+    }
+
+    pub fn bounds_buffer(&self) -> &wgpu::Buffer {
+        &self.bounds_buffer
+    }
+
     pub fn num_particles(&self) -> u32 {
         self.num_particles
     }

@@ -10,11 +10,14 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use wgpu::util::DeviceExt;
+
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, ScreenSpaceFluidRenderer, WireframeRenderer};
-use crate::simulation::{SphSimulation3DGrid, create_particle_block};
-use crate::state::{AppState, FluidRenderMode, GpuMouseForce, quat_mul, quat_normalize};
+use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, ScreenSpaceFluidRenderer, SprayRenderer, WireframeRenderer};
+use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
+use crate::render::environment::load_embedded_environment_map;
+use crate::state::{AppState, BackgroundMode, FluidRenderMode, GpuMouseForce, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, quat_mul, quat_normalize};
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -25,7 +28,20 @@ pub struct App {
     wireframe_renderer: Option<WireframeRenderer>,
     rigid_body_renderer: Option<RigidBodyRenderer>,
     rigid_body_depth_view: Option<wgpu::TextureView>,  // Fallback depth for modes without shared depth
+    spray_system: Option<SpraySystem>,
+    spray_renderer: Option<SprayRenderer>,
     post_process_renderer: Option<PostProcessRenderer>,
+    // Environment map (shared by SS + MC renderers)
+    #[allow(dead_code)]
+    env_texture: Option<wgpu::Texture>,
+    env_view: Option<wgpu::TextureView>,
+    env_sampler: Option<wgpu::Sampler>,
+    current_hdr: HdrEnvironment,
+    // Environment background rendering (for Particles mode)
+    env_bg_pipeline: Option<wgpu::RenderPipeline>,
+    env_bg_bind_group: Option<wgpu::BindGroup>,
+    env_bg_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    env_params_buffer: Option<wgpu::Buffer>,
     sph_simulation: Option<SphSimulation3DGrid>,
     camera: Camera,
     state: AppState,
@@ -56,7 +72,17 @@ impl App {
             wireframe_renderer: None,
             rigid_body_renderer: None,
             rigid_body_depth_view: None,
+            spray_system: None,
+            spray_renderer: None,
             post_process_renderer: None,
+            env_texture: None,
+            env_view: None,
+            env_sampler: None,
+            current_hdr: HdrEnvironment::Farmland,
+            env_bg_pipeline: None,
+            env_bg_bind_group: None,
+            env_bg_bind_group_layout: None,
+            env_params_buffer: None,
             sph_simulation: None,
             camera: Camera::default(),
             state: AppState::default(),
@@ -120,22 +146,31 @@ impl App {
             self.state.simulation.max_particles,
         );
 
+        // Load environment map (shared by SS + MC renderers)
+        let (env_texture, env_view, env_sampler) = load_embedded_environment_map(
+            &gpu.device,
+            &gpu.queue,
+            self.state.environment.hdr_selection,
+        ).expect("Failed to load environment map");
+
         // Create screen-space fluid renderer (photorealistic)
         let ss_renderer = ScreenSpaceFluidRenderer::new(
             &gpu.device,
             &gpu.queue,
             gpu.config.format,
             &camera_params,
+            &env_view,
+            &env_sampler,
             gpu.config.width,
             gpu.config.height,
         );
 
-        // Create marching cubes renderer (shares environment map with ss_renderer)
+        // Create marching cubes renderer (shares environment map)
         let mc_renderer = MarchingCubesRenderer::new(
             &gpu.device,
             gpu.config.format,
-            ss_renderer.env_texture_view(),
-            ss_renderer.env_sampler(),
+            &env_view,
+            &env_sampler,
             gpu.config.width,
             gpu.config.height,
             self.state.quality.msaa.as_u32(),
@@ -165,6 +200,43 @@ impl App {
             &gpu.device, gpu.config.width, gpu.config.height,
         );
 
+        // Create spray system and renderer
+        let spray_params = GpuSprayParams {
+            emission_threshold: self.state.spray.emission_threshold,
+            spray_count: self.state.spray.spray_count,
+            lifetime: self.state.spray.lifetime,
+            lifetime_variation: self.state.spray.lifetime_variation,
+            drag: self.state.spray.drag,
+            speed_multiplier: self.state.spray.speed_multiplier,
+            velocity_jitter: self.state.spray.velocity_jitter,
+            dt: self.state.simulation.delta_time,
+            max_particles: self.state.spray.max_particles,
+            num_sph_particles: self.state.runtime.particle_count,
+            frame_count: 0,
+            gravity_y: -self.state.simulation.gravity,
+        };
+        let spray_system = SpraySystem::new(
+            &gpu.device,
+            sph_simulation.particle_buffer(),
+            &sph_simulation.sph_params_buffer(),
+            &sph_simulation.bounds_buffer(),
+            self.state.spray.max_particles,
+            &spray_params,
+        );
+        let spray_render_params = GpuSprayRenderParams {
+            particle_size: self.state.spray.particle_size,
+            max_particles: self.state.spray.max_particles,
+            _pad: [0.0; 2],
+        };
+        let spray_renderer = SprayRenderer::new(
+            &gpu.device,
+            gpu.config.format,
+            &camera_params,
+            spray_system.spray_buffer(),
+            &spray_render_params,
+            self.state.quality.msaa.as_u32(),
+        );
+
         // Create post-process renderer
         let post_process_params = self.state.post_process.to_gpu_params();
         let post_process_renderer = PostProcessRenderer::new(
@@ -174,6 +246,119 @@ impl App {
             gpu.config.height,
             &post_process_params,
         );
+
+        // Create environment background pipeline (for Particles mode HDR background)
+        let env_bg_shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Env Background Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mc_environment.wgsl").into()),
+        });
+
+        let env_params_gpu = self.state.environment.to_gpu_params();
+        let env_params_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Env Params Buffer"),
+            contents: bytemuck::bytes_of(&env_params_gpu),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let env_bg_bind_group_layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Env BG BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let env_bg_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Env BG BG"),
+            layout: &env_bg_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: renderer.camera_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&env_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: env_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let env_bg_pipeline_layout = gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Env BG Pipeline Layout"),
+            bind_group_layouts: &[&env_bg_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let env_bg_pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Env BG Pipeline"),
+            layout: Some(&env_bg_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &env_bg_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &env_bg_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: gpu.config.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
 
         // Setup egui
         let egui_winit = egui_winit::State::new(
@@ -198,7 +383,17 @@ impl App {
         self.wireframe_renderer = Some(wireframe_renderer);
         self.rigid_body_renderer = Some(rigid_body_renderer);
         self.rigid_body_depth_view = Some(rigid_body_depth_view);
+        self.spray_system = Some(spray_system);
+        self.spray_renderer = Some(spray_renderer);
         self.post_process_renderer = Some(post_process_renderer);
+        self.env_texture = Some(env_texture);
+        self.env_view = Some(env_view);
+        self.env_sampler = Some(env_sampler);
+        self.current_hdr = self.state.environment.hdr_selection;
+        self.env_bg_pipeline = Some(env_bg_pipeline);
+        self.env_bg_bind_group = Some(env_bg_bind_group);
+        self.env_bg_bind_group_layout = Some(env_bg_bind_group_layout);
+        self.env_params_buffer = Some(env_params_buffer);
         self.sph_simulation = Some(sph_simulation);
         self.egui_winit = Some(egui_winit);
         self.egui_renderer = Some(egui_renderer);
@@ -243,6 +438,12 @@ impl App {
                 gpu.config.width,
                 gpu.config.height,
             ));
+
+            // Reset spray particles
+            if let Some(spray_sys) = &self.spray_system {
+                spray_sys.reset(&gpu.queue);
+            }
+            self.state.runtime.frame_count = 0;
         }
     }
 
@@ -254,6 +455,8 @@ impl App {
         self.state.lighting.reset_defaults();
         self.state.container.reset_defaults();
         self.state.rigid_body.reset_defaults();
+        self.state.spray.reset_defaults();
+        self.state.environment.reset_defaults();
         // Reset camera to defaults
         self.camera.distance = self.state.camera.distance;
         self.camera.yaw = self.state.camera.yaw;
@@ -305,11 +508,13 @@ impl ApplicationHandler for App {
                     if let Some(renderer) = &mut self.renderer {
                         renderer.resize(&gpu.device, new_size.width, new_size.height);
                     }
+                    let env_view = self.env_view.as_ref().unwrap();
+                    let env_sampler = self.env_sampler.as_ref().unwrap();
                     if let Some(ss_renderer) = &mut self.ss_renderer {
-                        ss_renderer.resize(&gpu.device, new_size.width, new_size.height);
+                        ss_renderer.resize(&gpu.device, env_view, env_sampler, new_size.width, new_size.height);
                     }
                     if let Some(mc_renderer) = &mut self.mc_renderer {
-                        mc_renderer.resize(&gpu.device, new_size.width, new_size.height);
+                        mc_renderer.resize(&gpu.device, env_view, env_sampler, new_size.width, new_size.height);
                     }
                     self.rigid_body_depth_view = Some(create_depth_texture(
                         &gpu.device, new_size.width, new_size.height,
@@ -418,6 +623,64 @@ impl App {
         )
     }
 
+    fn reload_environment_map(&mut self) {
+        let gpu = self.gpu.as_ref().unwrap();
+        let selection = self.state.environment.hdr_selection;
+
+        let (env_texture, env_view, env_sampler) = load_embedded_environment_map(
+            &gpu.device,
+            &gpu.queue,
+            selection,
+        ).expect("Failed to load environment map");
+
+        // Rebuild SS renderer bind group
+        if let Some(ss_renderer) = &mut self.ss_renderer {
+            ss_renderer.rebuild_env_bind_group(&gpu.device, &env_view, &env_sampler);
+        }
+
+        // Rebuild MC renderer bind groups
+        if let Some(mc_renderer) = &mut self.mc_renderer {
+            mc_renderer.rebuild_env_bind_groups(&gpu.device, &env_view, &env_sampler);
+        }
+
+        // Rebuild env background bind group (for Particles mode)
+        if let (Some(layout), Some(renderer), Some(buf)) = (
+            &self.env_bg_bind_group_layout,
+            &self.renderer,
+            &self.env_params_buffer,
+        ) {
+            self.env_bg_bind_group = Some(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Env BG BG"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: renderer.camera_buffer().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&env_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&env_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: buf.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
+
+        self.env_texture = Some(env_texture);
+        self.env_view = Some(env_view);
+        self.env_sampler = Some(env_sampler);
+        self.current_hdr = selection;
+
+        log::info!("Switched environment map to {:?}", selection);
+    }
+
     fn sync_gpu_state(&mut self) {
         // Compute mouse force before borrowing sph_sim mutably
         let mouse_force = if self.right_mouse_pressed {
@@ -480,6 +743,15 @@ impl App {
                     self.state.lighting.sun_direction_normalized(),
                 );
                 rb_renderer.update_params(&gpu.queue, &rb_render);
+            }
+            if let Some(spray_renderer) = &self.spray_renderer {
+                spray_renderer.update_camera(&gpu.queue, &camera_params);
+                let spray_render_params = GpuSprayRenderParams {
+                    particle_size: self.state.spray.particle_size,
+                    max_particles: self.state.spray.max_particles,
+                    _pad: [0.0; 2],
+                };
+                spray_renderer.update_params(&gpu.queue, &spray_render_params);
             }
 
             let render_params = self.state.rendering.to_gpu_params();
@@ -554,6 +826,11 @@ impl App {
         // Sync state to GPU
         self.sync_gpu_state();
 
+        // Detect HDR environment switch
+        if self.state.environment.hdr_selection != self.current_hdr {
+            self.reload_environment_map();
+        }
+
         // Handle particle spawning (middle mouse held = continuous stream)
         self.spawn_particles();
 
@@ -589,6 +866,29 @@ impl App {
                 }
                 // Read back total accumulated rigid body forces
                 sph_sim.read_rigid_body_accum(&gpu.device);
+            }
+
+            // Run spray system after SPH completes
+            if self.state.spray.enabled {
+                if let Some(spray_sys) = &self.spray_system {
+                    self.state.runtime.frame_count = self.state.runtime.frame_count.wrapping_add(1);
+                    let spray_params = GpuSprayParams {
+                        emission_threshold: self.state.spray.emission_threshold,
+                        spray_count: self.state.spray.spray_count,
+                        lifetime: self.state.spray.lifetime,
+                        lifetime_variation: self.state.spray.lifetime_variation,
+                        drag: self.state.spray.drag,
+                        speed_multiplier: self.state.spray.speed_multiplier,
+                        velocity_jitter: self.state.spray.velocity_jitter,
+                        dt: self.state.simulation.delta_time * num_substeps as f32,
+                        max_particles: self.state.spray.max_particles,
+                        num_sph_particles: self.state.runtime.particle_count,
+                        frame_count: self.state.runtime.frame_count,
+                        gravity_y: -self.state.simulation.gravity,
+                    };
+                    spray_sys.update_params(&gpu.queue, &spray_params);
+                    spray_sys.step(&gpu.device, &gpu.queue, self.state.runtime.particle_count);
+                }
             }
         }
 
@@ -751,6 +1051,7 @@ impl App {
                             [0.0, 0.0, 1.0, 0.0],
                             [0.0, 0.0, 0.0, 1.0],
                         ];
+                        let use_env = self.state.environment.background_mode == BackgroundMode::Environment;
                         ss_renderer.update_params(
                             &gpu.queue,
                             self.state.rendering.particle_radius,
@@ -761,26 +1062,70 @@ impl App {
                             self.state.rendering.ripple_scale,
                             self.state.rendering.ripple_strength,
                             self.state.runtime.time_elapsed,
+                            use_env,
+                            &self.state.environment.background_color,
+                            self.state.environment.environment_intensity,
                         );
                         ss_renderer.render(
                             &mut encoder,
                             render_target,
                             sph_sim.particle_buffer(),
                             sph_sim.num_particles(),
-                            &self.state.rendering.background_color,
+                            &self.state.environment.background_color,
                         );
                         // SS mode: no shared depth buffer, use fallback
                     }
                 }
                 FluidRenderMode::Particles => {
                     // Particle rendering (individual spheres)
+                    let use_env = self.state.environment.background_mode == BackgroundMode::Environment;
+
+                    // Render environment background if HDR mode
+                    if use_env {
+                        if let (Some(pipeline), Some(bind_group), Some(buf)) = (
+                            &self.env_bg_pipeline,
+                            &self.env_bg_bind_group,
+                            &self.env_params_buffer,
+                        ) {
+                            // Update env params
+                            let env_params = self.state.environment.to_gpu_params();
+                            gpu.queue.write_buffer(buf, 0, bytemuck::bytes_of(&env_params));
+
+                            // Update camera in particle renderer (needed for inv matrices in env shader)
+                            if let Some(renderer) = &self.renderer {
+                                let camera_params = self.camera.to_gpu_params();
+                                renderer.update_camera(&gpu.queue, &camera_params);
+                            }
+
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("Env Background Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: render_target,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                            pass.set_pipeline(pipeline);
+                            pass.set_bind_group(0, bind_group, &[]);
+                            pass.draw(0..3, 0..1);
+                        }
+                    }
+
                     if let Some(renderer) = &self.renderer {
                         renderer.render(
                             &mut encoder,
                             render_target,
                             sph_sim.particle_buffer(),
                             sph_sim.num_particles(),
-                            &self.state.rendering.background_color,
+                            &self.state.environment.background_color,
+                            !use_env, // clear_background: only clear if solid color mode
                         );
                         // Share particle depth buffer for rigid body occlusion
                         fluid_depth_view = Some(renderer.depth_view());
@@ -800,12 +1145,18 @@ impl App {
                         let camera_params = self.camera.to_gpu_params();
                         mc_renderer.update_camera(&gpu.queue, &camera_params);
                         mc_renderer.update_light_params(&gpu.queue, &self.state.lighting.to_gpu_params());
+                        let use_env = self.state.environment.background_mode == BackgroundMode::Environment;
                         mc_renderer.update_water_params(
                             &gpu.queue,
                             &self.state.rendering.particle_color,
                             self.state.rendering.ripple_scale,
                             self.state.rendering.ripple_strength,
+                            self.state.environment.environment_intensity,
+                            use_env,
+                            &self.state.environment.background_color,
                         );
+                        let env_params = self.state.environment.to_gpu_params();
+                        mc_renderer.update_env_params(&gpu.queue, &env_params);
                         let iso_value = self.state.rendering.mc_iso_value;
                         mc_renderer.update_params(
                             &gpu.queue,
@@ -824,14 +1175,57 @@ impl App {
                         } else {
                             None
                         };
+                        let spray_for_mc = if self.state.spray.enabled {
+                            self.spray_renderer.as_ref()
+                        } else {
+                            None
+                        };
                         mc_renderer.render(
                             &mut encoder,
                             render_target,
-                            &self.state.rendering.background_color,
+                            &self.state.environment.background_color,
                             rb_for_mc,
+                            spray_for_mc,
                         );
                     }
                 }
+            }
+        }
+
+        // Render spray particles for non-MC modes
+        if self.state.spray.enabled && self.state.rendering.render_mode != FluidRenderMode::MarchingCubes {
+            if let Some(spray_renderer) = &self.spray_renderer {
+                let depth_view = fluid_depth_view
+                    .unwrap_or_else(|| self.rigid_body_depth_view.as_ref().unwrap());
+                let use_fluid_depth = fluid_depth_view.is_some();
+
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Spray Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: render_target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: if use_fluid_depth {
+                                wgpu::LoadOp::Load
+                            } else {
+                                wgpu::LoadOp::Clear(1.0)
+                            },
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                spray_renderer.render(&mut render_pass);
             }
         }
 

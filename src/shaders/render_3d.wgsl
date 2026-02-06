@@ -12,7 +12,6 @@ struct RenderParams {
     color_by_velocity: u32,
     _padding1: vec2<u32>,
     particle_color: vec4<f32>,
-    background_color: vec4<f32>,
 }
 
 struct VertexOutput {

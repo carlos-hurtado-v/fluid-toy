@@ -21,6 +21,14 @@ struct WaterParams {
     refraction_strength: f32,
     ripple_scale: f32,
     ripple_strength: f32,
+    env_intensity: f32,
+    use_env_background: u32,  // 1 = HDR environment, 0 = solid color
+    background_r: f32,
+    background_g: f32,
+    background_b: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 struct LightParams {
@@ -204,9 +212,14 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     let density = 1.5;  // Water density factor
     let transmittance = exp(-absorption_coeffs * density * thickness);
 
-    // Reflection - sample environment (sky, surroundings)
+    // Reflection — solid color or HDR environment
     let reflect_dir = reflect(-view_dir, normal);
-    let reflection_color = sample_environment(reflect_dir);
+    var reflection_color: vec3<f32>;
+    if (water.use_env_background == 0u) {
+        reflection_color = vec3<f32>(water.background_r, water.background_g, water.background_b);
+    } else {
+        reflection_color = sample_environment(reflect_dir) * water.env_intensity;
+    }
 
     // === SCREEN-SPACE REFRACTION ===
     // Transform normal to view space for screen-space distortion

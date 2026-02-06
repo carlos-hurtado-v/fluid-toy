@@ -184,6 +184,11 @@ impl ParticleRenderer3D {
         &self.depth_view
     }
 
+    /// Expose camera buffer for sharing with environment background pipeline
+    pub fn camera_buffer(&self) -> &wgpu::Buffer {
+        &self.camera_buffer
+    }
+
     /// Resize depth buffer if needed
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if self.current_size != (width, height) {
@@ -201,19 +206,26 @@ impl ParticleRenderer3D {
         particle_buffer: &wgpu::Buffer,
         num_particles: u32,
         background: &[f32; 3],
+        clear_background: bool,
     ) {
+        let color_load = if clear_background {
+            wgpu::LoadOp::Clear(wgpu::Color {
+                r: background[0] as f64,
+                g: background[1] as f64,
+                b: background[2] as f64,
+                a: 1.0,
+            })
+        } else {
+            wgpu::LoadOp::Load
+        };
+
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("3D Particle Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: background[0] as f64,
-                        g: background[1] as f64,
-                        b: background[2] as f64,
-                        a: 1.0,
-                    }),
+                    load: color_load,
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,

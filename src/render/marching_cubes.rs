@@ -7,8 +7,9 @@ use wgpu::util::DeviceExt;
 
 use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
 use super::RigidBodyRenderer;
+use super::SprayRenderer;
 use crate::render::GpuCameraParams;
-use crate::state::GpuLightParams;
+use crate::state::{GpuEnvironmentParams, GpuLightParams};
 
 /// Grid resolution for marching cubes (cells per dimension)
 const GRID_SIZE: u32 = 70;
@@ -41,6 +42,12 @@ pub struct GpuWaterParams {
     pub refraction_strength: f32,
     pub ripple_scale: f32,
     pub ripple_strength: f32,
+    pub env_intensity: f32,
+    pub use_env_background: u32,
+    pub background_r: f32,
+    pub background_g: f32,
+    pub background_b: f32,
+    pub _pad: [f32; 3],
 }
 
 impl Default for GpuWaterParams {
@@ -52,6 +59,12 @@ impl Default for GpuWaterParams {
             refraction_strength: 0.05,
             ripple_scale: 25.0,
             ripple_strength: 0.05,
+            env_intensity: 1.0,
+            use_env_background: 1,
+            background_r: 0.15,
+            background_g: 0.15,
+            background_b: 0.2,
+            _pad: [0.0; 3],
         }
     }
 }
@@ -203,6 +216,7 @@ pub struct MarchingCubesRenderer {
     camera_buffer: wgpu::Buffer,
     water_params_buffer: wgpu::Buffer,
     light_params_buffer: wgpu::Buffer,
+    env_params_buffer: wgpu::Buffer,
     indirect_buffer: wgpu::Buffer,  // For indirect draw calls
 
     // Pipelines
@@ -238,9 +252,6 @@ pub struct MarchingCubesRenderer {
     height: u32,
     surface_format: wgpu::TextureFormat,
 
-    // Keep references for bind group recreation
-    env_texture_view: wgpu::TextureView,
-    env_sampler: wgpu::Sampler,
 }
 
 impl MarchingCubesRenderer {
@@ -411,6 +422,21 @@ impl MarchingCubesRenderer {
         let light_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MC Light Params"),
             contents: bytemuck::bytes_of(&light_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Environment params buffer (background mode, color, intensity)
+        let env_params = GpuEnvironmentParams {
+            use_env_background: 1,
+            background_r: 0.0,
+            background_g: 0.0,
+            background_b: 0.0,
+            env_intensity: 1.0,
+            _pad: [0.0; 3],
+        };
+        let env_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MC Env Params"),
+            contents: bytemuck::bytes_of(&env_params),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -920,6 +946,16 @@ impl MarchingCubesRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1020,6 +1056,10 @@ impl MarchingCubesRenderer {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(env_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: env_params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -1049,23 +1089,6 @@ impl MarchingCubesRenderer {
             ],
         });
 
-        // Clone the texture view for storage (needed for resize)
-        let env_texture_view_owned = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("MC Env Texture Placeholder"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }).create_view(&wgpu::TextureViewDescriptor::default());
-
-        let env_sampler_owned = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("MC Env Sampler Owned"),
-            ..Default::default()
-        });
-
         Self {
             _density_texture: density_texture,
             density_view,
@@ -1089,6 +1112,7 @@ impl MarchingCubesRenderer {
             camera_buffer,
             water_params_buffer,
             light_params_buffer,
+            env_params_buffer,
             indirect_buffer,
             density_pipeline,
             generate_pipeline,
@@ -1109,8 +1133,6 @@ impl MarchingCubesRenderer {
             width,
             height,
             surface_format,
-            env_texture_view: env_texture_view_owned,
-            env_sampler: env_sampler_owned,
         }
     }
 
@@ -1160,6 +1182,11 @@ impl MarchingCubesRenderer {
         queue.write_buffer(&self.grid_params_buffer, 0, bytemuck::bytes_of(&params));
     }
 
+    /// Update environment parameters (background mode, color, intensity)
+    pub fn update_env_params(&self, queue: &wgpu::Queue, params: &GpuEnvironmentParams) {
+        queue.write_buffer(&self.env_params_buffer, 0, bytemuck::bytes_of(params));
+    }
+
     /// Update grid bounds to match container dimensions
     pub fn set_bounds(&mut self, min: [f32; 3], max: [f32; 3]) {
         self.grid_min = min;
@@ -1167,11 +1194,16 @@ impl MarchingCubesRenderer {
     }
 
     /// Update water shading parameters
-    pub fn update_water_params(&self, queue: &wgpu::Queue, water_color: &[f32; 3], ripple_scale: f32, ripple_strength: f32) {
+    pub fn update_water_params(&self, queue: &wgpu::Queue, water_color: &[f32; 3], ripple_scale: f32, ripple_strength: f32, env_intensity: f32, use_env_background: bool, background_color: &[f32; 3]) {
         let params = GpuWaterParams {
             water_color: *water_color,
             ripple_scale,
             ripple_strength,
+            env_intensity,
+            use_env_background: if use_env_background { 1 } else { 0 },
+            background_r: background_color[0],
+            background_g: background_color[1],
+            background_b: background_color[2],
             ..Default::default()
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
@@ -1256,6 +1288,7 @@ impl MarchingCubesRenderer {
         color_view: &wgpu::TextureView,
         _background_color: &[f32; 3],
         rigid_body: Option<&RigidBodyRenderer>,
+        spray: Option<&SprayRenderer>,
     ) {
         // Pass 1: Render back faces to back_depth_texture (for thickness calculation)
         {
@@ -1313,6 +1346,11 @@ impl MarchingCubesRenderer {
             if let Some(rb) = rigid_body {
                 rb.render(&mut env_pass);
             }
+
+            // Render spray into background (visible through water refraction)
+            if let Some(sp) = spray {
+                sp.render(&mut env_pass);
+            }
         }
 
         // Pass 3: Render water mesh with screen-space refraction from background
@@ -1357,6 +1395,11 @@ impl MarchingCubesRenderer {
                 rb.render_msaa(&mut pass);
             }
 
+            // Draw spray particles before water mesh
+            if let Some(sp) = spray {
+                sp.render_msaa(&mut pass);
+            }
+
             // Draw water mesh on top (samples background_texture for refraction)
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, &self.render_bind_group, &[]);
@@ -1364,7 +1407,7 @@ impl MarchingCubesRenderer {
         }
     }
 
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+    pub fn resize(&mut self, device: &wgpu::Device, env_view: &wgpu::TextureView, env_sampler: &wgpu::Sampler, width: u32, height: u32) {
         if self.width == width && self.height == height {
             return;
         }
@@ -1421,11 +1464,11 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.env_texture_view),
+                    resource: wgpu::BindingResource::TextureView(env_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&self.env_sampler),
+                    resource: wgpu::BindingResource::Sampler(env_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
@@ -1447,4 +1490,75 @@ impl MarchingCubesRenderer {
         });
     }
 
+    /// Rebuild bind groups that reference environment texture (for HDR switching)
+    pub fn rebuild_env_bind_groups(&mut self, device: &wgpu::Device, env_view: &wgpu::TextureView, env_sampler: &wgpu::Sampler) {
+        // Rebuild env_bind_group (camera + env texture)
+        let env_layout = self.env_pipeline.get_bind_group_layout(0);
+        self.env_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MC Env BG"),
+            layout: &env_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(env_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.env_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Rebuild render_bind_group (includes env texture)
+        self.render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MC Render BG"),
+            layout: &self.render_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.water_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.vertex_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(env_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.back_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.back_depth_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&self.background_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.light_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+    }
 }

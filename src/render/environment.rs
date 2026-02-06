@@ -4,13 +4,19 @@
 use half::f16;
 use std::io::Cursor;
 
+use crate::state::HdrEnvironment;
+
 /// Load the embedded environment map (compile-time included)
 pub fn load_embedded_environment_map(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    selection: HdrEnvironment,
 ) -> Result<(wgpu::Texture, wgpu::TextureView, wgpu::Sampler), String> {
-    // Include the HDR file at compile time
-    let hdr_bytes = include_bytes!("../assets/farmland.hdr");
+    // Include both HDR files at compile time
+    let hdr_bytes: &[u8] = match selection {
+        HdrEnvironment::Farmland => include_bytes!("../assets/farmland.hdr"),
+        HdrEnvironment::PureSky => include_bytes!("../assets/puresky.hdr"),
+    };
 
     // Use the high-level image API to load HDR
     let reader = image::ImageReader::new(Cursor::new(hdr_bytes))

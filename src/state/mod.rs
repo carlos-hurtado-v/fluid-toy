@@ -21,6 +21,33 @@ impl Default for FluidRenderMode {
     }
 }
 
+/// Which HDR environment map to use
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HdrEnvironment {
+    Farmland,
+    PureSky,
+}
+
+/// Whether background shows solid color or HDR environment
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundMode {
+    SolidColor,
+    Environment,
+}
+
+/// Environment/background configuration (unified for all modes)
+#[derive(Debug, Clone)]
+pub struct EnvironmentConfig {
+    /// Whether to show solid color or HDR environment as background
+    pub background_mode: BackgroundMode,
+    /// Solid background color (RGB, 0-1)
+    pub background_color: [f32; 3],
+    /// Which HDR environment to load
+    pub hdr_selection: HdrEnvironment,
+    /// Environment intensity/exposure multiplier
+    pub environment_intensity: f32,
+}
+
 /// Complete application state - GUI binds to this
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -28,11 +55,13 @@ pub struct AppState {
     pub container: ContainerConfig,
     pub sph: SphConfig,
     pub rendering: RenderConfig,
+    pub environment: EnvironmentConfig,
     pub lighting: LightingConfig,
     pub quality: QualityConfig,
     pub post_process: PostProcessConfig,
     pub camera: CameraConfig,
     pub rigid_body: RigidBodyConfig,
+    pub spray: SprayConfig,
     pub runtime: RuntimeState,
 }
 
@@ -142,8 +171,6 @@ pub struct RenderConfig {
     pub particle_color: [f32; 3],
     /// Color particles by velocity
     pub color_by_velocity: bool,
-    /// Background color (RGB, 0-1)
-    pub background_color: [f32; 3],
     /// Rendering mode (particles or marching cubes)
     pub render_mode: FluidRenderMode,
     /// Ripple scale - frequency of surface detail ripples (higher = more dense)
@@ -211,6 +238,21 @@ pub struct CameraConfig {
     pub fov: f32,
 }
 
+/// Spray particle configuration
+#[derive(Debug, Clone)]
+pub struct SprayConfig {
+    pub enabled: bool,
+    pub emission_threshold: f32,
+    pub spray_count: u32,
+    pub lifetime: f32,
+    pub lifetime_variation: f32,
+    pub drag: f32,
+    pub speed_multiplier: f32,
+    pub velocity_jitter: f32,
+    pub particle_size: f32,
+    pub max_particles: u32,
+}
+
 /// Runtime state - changes during execution
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
@@ -220,6 +262,8 @@ pub struct RuntimeState {
     pub fps: f32,
     /// Simulation time elapsed
     pub time_elapsed: f32,
+    /// Frame counter for spray RNG seed
+    pub frame_count: u32,
 }
 
 impl Default for AppState {
@@ -229,12 +273,45 @@ impl Default for AppState {
             container: ContainerConfig::default(),
             sph: SphConfig::default(),
             rendering: RenderConfig::default(),
+            environment: EnvironmentConfig::default(),
             lighting: LightingConfig::default(),
             quality: QualityConfig::default(),
             post_process: PostProcessConfig::default(),
             camera: CameraConfig::default(),
             rigid_body: RigidBodyConfig::default(),
+            spray: SprayConfig::default(),
             runtime: RuntimeState::default(),
+        }
+    }
+}
+
+impl Default for EnvironmentConfig {
+    fn default() -> Self {
+        Self {
+            background_mode: BackgroundMode::Environment,
+            background_color: [0.02, 0.02, 0.05],
+            hdr_selection: HdrEnvironment::Farmland,
+            environment_intensity: 1.0,
+        }
+    }
+}
+
+impl EnvironmentConfig {
+    pub fn reset_defaults(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn to_gpu_params(&self) -> GpuEnvironmentParams {
+        GpuEnvironmentParams {
+            use_env_background: match self.background_mode {
+                BackgroundMode::Environment => 1,
+                BackgroundMode::SolidColor => 0,
+            },
+            background_r: self.background_color[0],
+            background_g: self.background_color[1],
+            background_b: self.background_color[2],
+            env_intensity: self.environment_intensity,
+            _pad: [0.0; 3],
         }
     }
 }
@@ -502,7 +579,6 @@ impl Default for RenderConfig {
             particle_radius: 0.02,
             particle_color: [0.2, 0.4, 0.9],
             color_by_velocity: true,
-            background_color: [0.02, 0.02, 0.05],
             render_mode: FluidRenderMode::ScreenSpace,
             ripple_scale: 10.0,
             ripple_strength: 0.25,
@@ -550,12 +626,36 @@ impl SphConfig {
     }
 }
 
+impl Default for SprayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            emission_threshold: 10.0,
+            spray_count: 5,
+            lifetime: 0.4,
+            lifetime_variation: 0.4,
+            drag: 3.0,
+            speed_multiplier: 0.65,
+            velocity_jitter: 1.5,
+            particle_size: 0.004,
+            max_particles: 100_000,
+        }
+    }
+}
+
+impl SprayConfig {
+    pub fn reset_defaults(&mut self) {
+        *self = Self::default();
+    }
+}
+
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
             particle_count: 0,
             fps: 0.0,
             time_elapsed: 0.0,
+            frame_count: 0,
         }
     }
 }
@@ -573,12 +673,6 @@ impl RenderConfig {
                 self.particle_color[2],
                 1.0,
             ],
-            background_color: [
-                self.background_color[0],
-                self.background_color[1],
-                self.background_color[2],
-                1.0,
-            ],
         }
     }
 }
@@ -591,7 +685,6 @@ pub struct GpuRenderParams {
     pub color_by_velocity: u32,
     pub _padding1: [u32; 2],
     pub particle_color: [f32; 4],
-    pub background_color: [f32; 4],
 }
 
 /// GPU-compatible 3D SPH parameters (matches WGSL struct layout)
@@ -844,4 +937,57 @@ pub struct GpuRigidBodyRender {
     pub rot_row0: [f32; 4],     // 16 bytes → 64
     pub rot_row1: [f32; 4],     // 16 bytes → 80
     pub rot_row2: [f32; 4],     // 16 bytes → 96
+}
+
+/// GPU spray simulation parameters (48 bytes, uniform buffer)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuSprayParams {
+    pub emission_threshold: f32,  // 0
+    pub spray_count: u32,         // 4
+    pub lifetime: f32,            // 8
+    pub lifetime_variation: f32,  // 12
+    pub drag: f32,                // 16
+    pub speed_multiplier: f32,    // 20
+    pub velocity_jitter: f32,     // 24
+    pub dt: f32,                  // 28
+    pub max_particles: u32,       // 32
+    pub num_sph_particles: u32,   // 36
+    pub frame_count: u32,         // 40
+    pub gravity_y: f32,           // 44
+}
+
+/// GPU spray particle (32 bytes, scalar f32 to avoid WGSL vec3 alignment issues)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuSprayParticle {
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub lifetime: f32,
+    pub vel_x: f32,
+    pub vel_y: f32,
+    pub vel_z: f32,
+    pub max_lifetime: f32,
+}
+
+/// GPU spray render parameters (16 bytes)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuSprayRenderParams {
+    pub particle_size: f32,
+    pub max_particles: u32,
+    pub _pad: [f32; 2],
+}
+
+/// GPU environment parameters (32 bytes, uniform buffer)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuEnvironmentParams {
+    pub use_env_background: u32,  // 0 = solid color, 1 = environment map
+    pub background_r: f32,
+    pub background_g: f32,
+    pub background_b: f32,
+    pub env_intensity: f32,
+    pub _pad: [f32; 3],
 }

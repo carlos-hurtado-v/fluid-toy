@@ -14,9 +14,21 @@ struct CameraParams {
     _pad2: f32,
 }
 
+struct EnvParams {
+    use_env_background: u32,
+    background_r: f32,
+    background_g: f32,
+    background_b: f32,
+    env_intensity: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
 @group(0) @binding(0) var<uniform> camera: CameraParams;
 @group(0) @binding(1) var env_tex: texture_2d<f32>;
 @group(0) @binding(2) var env_sampler: sampler;
+@group(0) @binding(3) var<uniform> env_params: EnvParams;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -54,12 +66,17 @@ fn sample_environment(dir: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Solid color background
+    if (env_params.use_env_background == 0u) {
+        return vec4<f32>(env_params.background_r, env_params.background_g, env_params.background_b, 1.0);
+    }
+
     // Compute world-space ray direction using inverse matrices (same as screen-space shader)
     let ndc = vec2<f32>(input.uv.x * 2.0 - 1.0, 1.0 - 2.0 * input.uv.y);
     let view_ray = normalize((camera.inv_projection * vec4<f32>(ndc, 1.0, 1.0)).xyz);
     let world_ray = normalize((camera.inv_view * vec4<f32>(view_ray, 0.0)).xyz);
 
-    var color = sample_environment(world_ray);
+    var color = sample_environment(world_ray) * env_params.env_intensity;
 
     // Simple tone mapping (match screen-space HDR handling)
     color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));

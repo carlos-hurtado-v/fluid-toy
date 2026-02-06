@@ -18,7 +18,12 @@ struct WaterParams {
     ripple_scale: f32,      // Frequency of ripples (higher = more dense)
     ripple_strength: f32,   // How much ripples perturb normals
     time: f32,              // For animated ripples
-    _padding2: f32,
+    // Environment/background parameters
+    use_env_background: u32,  // 1 = HDR environment, 0 = solid color
+    background_r: f32,
+    background_g: f32,
+    background_b: f32,
+    env_intensity: f32,
 }
 
 struct LightParams {
@@ -200,10 +205,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let view_ray = normalize((water.inv_projection * vec4<f32>(ndc, 1.0, 1.0)).xyz);
     let world_ray = normalize((water.inv_view * vec4<f32>(view_ray, 0.0)).xyz);
 
-    // Background - sample environment map
+    // Background - solid color or environment map
     if (depth == 0.0 || depth >= 1e4) {
-        let env_color = sample_environment(world_ray);
-        // Apply tone mapping and gamma for HDR (exposure = 1.0 for neutral)
+        if (water.use_env_background == 0u) {
+            return vec4<f32>(water.background_r, water.background_g, water.background_b, 1.0);
+        }
+        let env_color = sample_environment(world_ray) * water.env_intensity;
         let mapped = hdr_to_sdr(env_color, 1.0);
         return vec4<f32>(mapped, 1.0);
     }
@@ -281,8 +288,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Reflection direction in world space
     let reflect_world = reflect(ray_world, normal_world);
 
-    // Sample environment for reflection
-    let reflection_color = sample_environment(reflect_world);
+    // Sample environment for reflection — solid color or HDR
+    var reflection_color: vec3<f32>;
+    if (water.use_env_background == 0u) {
+        reflection_color = vec3<f32>(water.background_r, water.background_g, water.background_b);
+    } else {
+        reflection_color = sample_environment(reflect_world) * water.env_intensity;
+    }
 
     // === DIRECTIONAL LIGHT (SUN) ===
     var sun_specular = vec3<f32>(0.0);
@@ -313,8 +325,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (length(refract_dir) < 0.001) {
         // Total internal reflection
         refraction_color = reflection_color;
+    } else if (water.use_env_background == 0u) {
+        refraction_color = vec3<f32>(water.background_r, water.background_g, water.background_b) * transmittance;
     } else {
-        refraction_color = sample_environment(refract_dir) * transmittance;
+        refraction_color = sample_environment(refract_dir) * water.env_intensity * transmittance;
     }
 
     // Fresnel (Schlick approximation)

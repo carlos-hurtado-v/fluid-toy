@@ -8,14 +8,13 @@
 //! 4. Composite Pass - Final water shading with normals from depth
 
 use crate::render::camera::GpuCameraParams;
-use crate::render::environment::load_embedded_environment_map;
 use crate::simulation::SphParticle3D;
 use crate::state::GpuLightParams;
 use wgpu::util::DeviceExt;
 
 // Compile-time size assertions for debugging
 const _: () = assert!(std::mem::size_of::<GpuCameraParams>() == 288, "GpuCameraParams must be 288 bytes");
-const _: () = assert!(std::mem::size_of::<GpuWaterParams>() == 160, "GpuWaterParams must be 160 bytes");
+const _: () = assert!(std::mem::size_of::<GpuWaterParams>() == 176, "GpuWaterParams must be 176 bytes");
 const _: () = assert!(std::mem::size_of::<GpuBlurParams>() == 48, "GpuBlurParams must be 48 bytes (WGSL std140)");
 const _: () = assert!(std::mem::size_of::<GpuFluidParams>() == 80, "GpuFluidParams must be 80 bytes");
 
@@ -58,9 +57,14 @@ pub struct GpuWaterParams {
     pub ripple_scale: f32,
     pub ripple_strength: f32,
     pub time: f32,
-    pub _padding2: f32,
+    // Environment/background parameters
+    pub use_env_background: u32,
+    pub background_r: f32,
+    pub background_g: f32,
+    pub background_b: f32,
+    pub env_intensity: f32,
 }
-// Total: 160 bytes
+// Total: 176 bytes
 
 pub struct ScreenSpaceFluidRenderer {
     // Textures
@@ -74,12 +78,6 @@ pub struct ScreenSpaceFluidRenderer {
     blur_view_b: wgpu::TextureView,
     thickness_texture: wgpu::Texture,
     thickness_view: wgpu::TextureView,
-
-    // Environment map
-    #[allow(dead_code)]
-    env_texture: wgpu::Texture,
-    env_view: wgpu::TextureView,
-    env_sampler: wgpu::Sampler,
 
     // Buffers
     camera_buffer: wgpu::Buffer,
@@ -117,9 +115,11 @@ pub struct ScreenSpaceFluidRenderer {
 impl ScreenSpaceFluidRenderer {
     pub fn new(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         surface_format: wgpu::TextureFormat,
         camera_params: &GpuCameraParams,
+        env_view: &wgpu::TextureView,
+        env_sampler: &wgpu::Sampler,
         width: u32,
         height: u32,
     ) -> Self {
@@ -133,10 +133,6 @@ impl ScreenSpaceFluidRenderer {
         let (blur_texture_b, blur_view_b) = create_color_texture(device, width, height, "SS Blur B");
         // Thickness needs blendable format for additive accumulation
         let (thickness_texture, thickness_view) = create_thickness_texture(device, width, height);
-
-        // Load environment map (embedded at compile time)
-        let (env_texture, env_view, env_sampler) = load_embedded_environment_map(device, queue)
-            .expect("Failed to load environment map");
 
         // Create buffers - use explicit size to ensure alignment
         let camera_size = std::mem::size_of::<GpuCameraParams>() as u64;
@@ -218,7 +214,7 @@ impl ScreenSpaceFluidRenderer {
         });
 
         // Default ripple parameters (can be adjusted via update_water_params)
-        let water_params = create_water_params(width, height, camera_params, 15.0, 0.3, 0.0);
+        let water_params = create_water_params(width, height, camera_params, 15.0, 0.3, 0.0, true, &[0.0; 3], 1.0);
         let water_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SS Water Params Buffer"),
             contents: bytemuck::bytes_of(&water_params),
@@ -564,11 +560,11 @@ impl ScreenSpaceFluidRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&env_view),
+                    resource: wgpu::BindingResource::TextureView(env_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: wgpu::BindingResource::Sampler(&env_sampler),
+                    resource: wgpu::BindingResource::Sampler(env_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
@@ -588,9 +584,6 @@ impl ScreenSpaceFluidRenderer {
             blur_view_b,
             thickness_texture,
             thickness_view,
-            env_texture,
-            env_view,
-            env_sampler,
             camera_buffer,
             fluid_params_buffer,
             blur_params_buffer_h,
@@ -636,6 +629,9 @@ impl ScreenSpaceFluidRenderer {
         ripple_scale: f32,
         ripple_strength: f32,
         time: f32,
+        use_env_background: bool,
+        background_color: &[f32; 3],
+        env_intensity: f32,
     ) {
         let fluid_params = GpuFluidParams {
             particle_radius,
@@ -646,11 +642,11 @@ impl ScreenSpaceFluidRenderer {
         };
         queue.write_buffer(&self.fluid_params_buffer, 0, bytemuck::bytes_of(&fluid_params));
 
-        let water_params = create_water_params(width, height, camera_params, ripple_scale, ripple_strength, time);
+        let water_params = create_water_params(width, height, camera_params, ripple_scale, ripple_strength, time, use_env_background, background_color, env_intensity);
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&water_params));
     }
 
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+    pub fn resize(&mut self, device: &wgpu::Device, env_view: &wgpu::TextureView, env_sampler: &wgpu::Sampler, width: u32, height: u32) {
         let width = width.max(1);
         let height = height.max(1);
 
@@ -776,11 +772,11 @@ impl ScreenSpaceFluidRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&self.env_view),
+                    resource: wgpu::BindingResource::TextureView(env_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: wgpu::BindingResource::Sampler(&self.env_sampler),
+                    resource: wgpu::BindingResource::Sampler(env_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
@@ -990,14 +986,42 @@ impl ScreenSpaceFluidRenderer {
         }
     }
 
-    /// Get environment texture view for sharing with other renderers
-    pub fn env_texture_view(&self) -> &wgpu::TextureView {
-        &self.env_view
-    }
-
-    /// Get environment sampler for sharing with other renderers
-    pub fn env_sampler(&self) -> &wgpu::Sampler {
-        &self.env_sampler
+    /// Rebuild composite bind group with new environment texture (for HDR switching)
+    pub fn rebuild_env_bind_group(&mut self, device: &wgpu::Device, env_view: &wgpu::TextureView, env_sampler: &wgpu::Sampler) {
+        self.composite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SS Composite Bind Group"),
+            layout: &self.composite_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.blur_view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.thickness_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.water_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(env_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.light_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
     }
 }
 
@@ -1008,6 +1032,9 @@ fn create_water_params(
     ripple_scale: f32,
     ripple_strength: f32,
     time: f32,
+    use_env_background: bool,
+    background_color: &[f32; 3],
+    env_intensity: f32,
 ) -> GpuWaterParams {
     GpuWaterParams {
         texel_size: [1.0 / width as f32, 1.0 / height as f32],
@@ -1018,7 +1045,11 @@ fn create_water_params(
         ripple_scale,
         ripple_strength,
         time,
-        _padding2: 0.0,
+        use_env_background: if use_env_background { 1 } else { 0 },
+        background_r: background_color[0],
+        background_g: background_color[1],
+        background_b: background_color[2],
+        env_intensity,
     }
 }
 

@@ -1,6 +1,6 @@
 //! GUI module - egui integration for parameter control
 
-use crate::state::{AppState, FluidRenderMode, SimulationConfig};
+use crate::state::{AppState, BackgroundMode, FluidRenderMode, HdrEnvironment, SimulationConfig};
 
 /// Renders the control panel and returns any triggered action
 pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAction {
@@ -214,6 +214,51 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
 
             ui.add_space(8.0);
 
+            // Spray Particles controls
+            ui.collapsing("Spray Particles", |ui| {
+                ui.checkbox(&mut state.spray.enabled, "Enable");
+
+                if state.spray.enabled {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.emission_threshold, 1.0..=200.0)
+                            .text("Emission Threshold")
+                            .logarithmic(true)
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.spray_count, 1..=16)
+                            .text("Spray Count")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.lifetime, 0.1..=3.0)
+                            .text("Lifetime")
+                            .suffix("s")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.lifetime_variation, 0.0..=1.0)
+                            .text("Lifetime Variation")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.drag, 0.0..=5.0)
+                            .text("Air Drag")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.speed_multiplier, 0.5..=5.0)
+                            .text("Speed Multiplier")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.velocity_jitter, 0.0..=3.0)
+                            .text("Velocity Jitter")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.particle_size, 0.001..=0.05)
+                            .text("Spray Size")
+                    );
+                }
+            });
+
+            ui.add_space(8.0);
+
             // Rendering controls
             ui.collapsing("Rendering", |ui| {
                 ui.label("Render Mode:");
@@ -260,10 +305,37 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.add_space(4.0);
                 ui.label("Particle Color:");
                 egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.particle_color);
+            });
+
+            ui.add_space(8.0);
+
+            // Environment controls
+            ui.collapsing("Environment", |ui| {
+                ui.label("Background Mode:");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut state.environment.background_mode, BackgroundMode::Environment, "HDR Environment");
+                    ui.selectable_value(&mut state.environment.background_mode, BackgroundMode::SolidColor, "Solid Color");
+                });
+
+                if state.environment.background_mode == BackgroundMode::SolidColor {
+                    ui.add_space(4.0);
+                    ui.label("Background Color:");
+                    egui::color_picker::color_edit_button_rgb(ui, &mut state.environment.background_color);
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label("HDR Environment Map:");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut state.environment.hdr_selection, HdrEnvironment::Farmland, "Farmland");
+                    ui.selectable_value(&mut state.environment.hdr_selection, HdrEnvironment::PureSky, "Pure Sky");
+                });
 
                 ui.add_space(4.0);
-                ui.label("Background:");
-                egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.background_color);
+                ui.add(
+                    egui::Slider::new(&mut state.environment.environment_intensity, 0.1..=3.0)
+                        .text("Intensity")
+                );
             });
 
             ui.add_space(8.0);
