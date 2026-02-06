@@ -396,7 +396,7 @@ impl Default for SphConfig {
             near_stiffness: 5.0,
             viscosity: 20.0,           // Low enough for waves to persist
             mass: 1.0,
-            wall_stiffness: 16000.0,
+            wall_stiffness: 200.0,
         }
     }
 }
@@ -478,7 +478,8 @@ pub struct GpuBoundsParams3D {
     pub floor_y: f32,        // Floor Y position
     pub ceiling_y: f32,      // Ceiling Y position
     pub wall_stiffness: f32,
-    pub _padding: [f32; 3],  // Padding for 16-byte alignment
+    pub damping: f32,         // Restitution coefficient for boundary bounce (0=inelastic, 1=elastic)
+    pub _padding: [f32; 2],  // Padding for 16-byte alignment
     // Rotation matrix for container orientation (3x3 stored as 3 vec4s for alignment)
     pub rotation_row0: [f32; 4],  // First row + padding
     pub rotation_row1: [f32; 4],  // Second row + padding
@@ -558,7 +559,7 @@ impl ContainerConfig {
     /// `particle_visual_radius` is used to shrink bounds so the rendered fluid
     /// surface stays within the visual wireframe (particle centers are constrained
     /// inside bounds minus this margin)
-    pub fn to_gpu_bounds_3d(&self, wall_stiffness: f32, particle_visual_radius: f32) -> GpuBoundsParams3D {
+    pub fn to_gpu_bounds_3d(&self, wall_stiffness: f32, damping: f32, particle_visual_radius: f32) -> GpuBoundsParams3D {
         // Compute rotation matrix from tilt angles
         // Rotation around X (tilt_x) then around Z (tilt_z)
         let (sin_x, cos_x) = self.tilt_x.sin_cos();
@@ -580,7 +581,8 @@ impl ContainerConfig {
             floor_y: self.floor_y + margin,
             ceiling_y: (self.ceiling_y() - margin).max(self.floor_y + margin + 0.1),
             wall_stiffness,
-            _padding: [0.0; 3],
+            damping,
+            _padding: [0.0; 2],
             rotation_row0,
             rotation_row1,
             rotation_row2,

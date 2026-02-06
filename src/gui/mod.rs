@@ -139,7 +139,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         .text("Particle Mass")
                 );
                 ui.add(
-                    egui::Slider::new(&mut state.sph.wall_stiffness, 1000.0..=20000.0)
+                    egui::Slider::new(&mut state.sph.wall_stiffness, 50.0..=500.0)
                         .text("Wall Stiffness")
                 );
             });

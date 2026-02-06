@@ -104,6 +104,7 @@ impl App {
         );
         let bounds_params = self.state.container.to_gpu_bounds_3d(
                 self.state.sph.wall_stiffness,
+                self.state.simulation.damping,
                 self.state.rendering.visual_margin(),
             );
         let sph_simulation = SphSimulation3DGrid::new(
@@ -194,6 +195,7 @@ impl App {
             );
             let bounds_params = self.state.container.to_gpu_bounds_3d(
                 self.state.sph.wall_stiffness,
+                self.state.simulation.damping,
                 self.state.rendering.visual_margin(),
             );
             self.sph_simulation = Some(SphSimulation3DGrid::new(
@@ -425,6 +427,7 @@ impl App {
 
             let bounds_params = self.state.container.to_gpu_bounds_3d(
                 self.state.sph.wall_stiffness,
+                self.state.simulation.damping,
                 self.state.rendering.visual_margin(),
             );
             sph_sim.update_bounds_params(&gpu.queue, &bounds_params);
