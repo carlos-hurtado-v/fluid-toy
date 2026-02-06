@@ -78,8 +78,4 @@ impl GpuContext {
             self.surface.configure(&self.device, &self.config);
         }
     }
-
-    pub fn aspect_ratio(&self) -> f32 {
-        self.config.width as f32 / self.config.height as f32
-    }
 }

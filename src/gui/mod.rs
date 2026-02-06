@@ -1,6 +1,6 @@
 //! GUI module - egui integration for parameter control
 
-use crate::state::{AppState, ContainerConfig, FluidRenderMode, SimulationConfig};
+use crate::state::{AppState, FluidRenderMode, SimulationConfig};
 
 /// Renders the control panel and returns any triggered action
 pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAction {
@@ -389,9 +389,4 @@ impl SimulationConfig {
     }
 }
 
-impl ContainerConfig {
-    pub fn gui_reset_defaults(&mut self) {
-        *self = Self::default();
-    }
-}
 

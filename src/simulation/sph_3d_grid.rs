@@ -45,14 +45,14 @@ pub struct SphSimulation3DGrid {
 
     // Particle buffers
     particle_buffer: wgpu::Buffer,
-    sorted_particle_buffer: wgpu::Buffer,
+    _sorted_particle_buffer: wgpu::Buffer,
 
     // Grid buffers
     cell_counts_buffer: wgpu::Buffer,
     cell_counts_temp_buffer: wgpu::Buffer, // For prefix sum ping-pong
     cell_starts_buffer: wgpu::Buffer,
     cell_offsets_buffer: wgpu::Buffer, // Reset for reorder atomic counter
-    particle_cell_indices_buffer: wgpu::Buffer,
+    _particle_cell_indices_buffer: wgpu::Buffer,
 
     // Parameter buffers
     sph_params_buffer: wgpu::Buffer,
@@ -780,12 +780,12 @@ impl SphSimulation3DGrid {
             force_pipeline,
             integrate_pipeline,
             particle_buffer,
-            sorted_particle_buffer,
+            _sorted_particle_buffer: sorted_particle_buffer,
             cell_counts_buffer,
             cell_counts_temp_buffer,
             cell_starts_buffer,
             cell_offsets_buffer,
-            particle_cell_indices_buffer,
+            _particle_cell_indices_buffer: particle_cell_indices_buffer,
             sph_params_buffer,
             bounds_buffer,
             mouse_force_buffer,
@@ -993,10 +993,6 @@ impl SphSimulation3DGrid {
 
     pub fn num_particles(&self) -> u32 {
         self.num_particles
-    }
-
-    pub fn max_particles(&self) -> u32 {
-        self.max_particles
     }
 
     /// Spawn new particles at a given position with some spread

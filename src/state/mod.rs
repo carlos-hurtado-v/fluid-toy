@@ -2,7 +2,7 @@
 
 pub mod post_process;
 
-pub use post_process::{GpuPostProcessParams, PostProcessConfig};
+pub use post_process::PostProcessConfig;
 
 /// Fluid render mode selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,9 +116,6 @@ pub struct RenderConfig {
     pub background_color: [f32; 3],
     /// Rendering mode (particles or marching cubes)
     pub render_mode: FluidRenderMode,
-    /// Scene rotation matrix (3x3, rotates the fluid in world space)
-    /// Camera and environment stays fixed, scene rotates
-    pub scene_rotation: [[f32; 3]; 3],
     /// Ripple scale - frequency of surface detail ripples (higher = more dense)
     pub ripple_scale: f32,
     /// Ripple strength - how much ripples perturb surface normals
@@ -366,11 +363,6 @@ impl Default for RenderConfig {
             color_by_velocity: true,
             background_color: [0.02, 0.02, 0.05],
             render_mode: FluidRenderMode::ScreenSpace,
-            scene_rotation: [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
             ripple_scale: 15.0,
             ripple_strength: 0.3,
         }
@@ -392,63 +384,6 @@ impl RenderConfig {
         }
     }
 
-    /// Apply trackball rotation from mouse delta
-    /// delta_x rotates around Y axis (vertical screen axis)
-    /// delta_y rotates around X axis (horizontal screen axis)
-    pub fn rotate_scene(&mut self, delta_x: f32, delta_y: f32) {
-        let sensitivity = 0.01;
-        let angle_y = -delta_x * sensitivity;
-        let angle_x = -delta_y * sensitivity;
-
-        // Rotation around Y axis
-        let rot_y = [
-            [angle_y.cos(), 0.0, angle_y.sin()],
-            [0.0, 1.0, 0.0],
-            [-angle_y.sin(), 0.0, angle_y.cos()],
-        ];
-
-        // Rotation around X axis
-        let rot_x = [
-            [1.0, 0.0, 0.0],
-            [0.0, angle_x.cos(), -angle_x.sin()],
-            [0.0, angle_x.sin(), angle_x.cos()],
-        ];
-
-        // Combine: new_rotation = rot_y * rot_x * current_rotation
-        let temp = mat3_mul(&rot_x, &self.scene_rotation);
-        self.scene_rotation = mat3_mul(&rot_y, &temp);
-    }
-
-    /// Reset scene rotation to identity
-    pub fn reset_scene_rotation(&mut self) {
-        self.scene_rotation = [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ];
-    }
-
-    /// Convert scene rotation to 4x4 matrix for GPU
-    pub fn scene_rotation_matrix_4x4(&self) -> [[f32; 4]; 4] {
-        let r = &self.scene_rotation;
-        [
-            [r[0][0], r[0][1], r[0][2], 0.0],
-            [r[1][0], r[1][1], r[1][2], 0.0],
-            [r[2][0], r[2][1], r[2][2], 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ]
-    }
-}
-
-/// Multiply two 3x3 matrices
-fn mat3_mul(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut result = [[0.0; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            result[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
-        }
-    }
-    result
 }
 
 impl Default for SphConfig {
@@ -467,25 +402,6 @@ impl Default for SphConfig {
 }
 
 impl SphConfig {
-    /// Convert to GPU-compatible uniform struct
-    pub fn to_gpu_params(&self, num_particles: u32, dt: f32, gravity: f32) -> GpuSphParams {
-        let h = self.kernel_radius;
-        GpuSphParams {
-            kernel_radius: h,
-            kernel_radius_sq: h * h,
-            kernel_radius_4: h * h * h * h,
-            kernel_radius_5: h * h * h * h * h,
-            mass: self.mass,
-            rest_density: self.rest_density,
-            stiffness: self.stiffness,
-            viscosity: self.viscosity,
-            dt,
-            gravity,
-            num_particles,
-            _padding: 0,
-        }
-    }
-
     pub fn reset_defaults(&mut self) {
         *self = Self::default();
     }
@@ -497,21 +413,6 @@ impl Default for RuntimeState {
             particle_count: 0,
             fps: 0.0,
             time_elapsed: 0.0,
-        }
-    }
-}
-
-impl SimulationConfig {
-    /// Convert to GPU-compatible uniform struct (legacy 2D - bounds now in ContainerConfig)
-    pub fn to_gpu_params(&self, num_particles: u32) -> GpuSimParams {
-        GpuSimParams {
-            delta_time: self.delta_time,
-            gravity: self.gravity,
-            bound_x: 0.9,  // Legacy - use ContainerConfig for 3D
-            bound_y: 0.9,  // Legacy - use ContainerConfig for 3D
-            damping: self.damping,
-            num_particles,
-            _padding: [0.0; 2],
         }
     }
 }
@@ -539,19 +440,6 @@ impl RenderConfig {
     }
 }
 
-/// GPU-compatible simulation parameters (matches WGSL struct layout)
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GpuSimParams {
-    pub delta_time: f32,
-    pub gravity: f32,
-    pub bound_x: f32,
-    pub bound_y: f32,
-    pub damping: f32,
-    pub num_particles: u32,
-    pub _padding: [f32; 2],
-}
-
 /// GPU-compatible render parameters (matches WGSL struct layout)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -561,34 +449,6 @@ pub struct GpuRenderParams {
     pub _padding1: [u32; 2],
     pub particle_color: [f32; 4],
     pub background_color: [f32; 4],
-}
-
-/// GPU-compatible SPH parameters (matches WGSL struct layout)
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GpuSphParams {
-    pub kernel_radius: f32,
-    pub kernel_radius_sq: f32,
-    pub kernel_radius_4: f32,
-    pub kernel_radius_5: f32,
-    pub mass: f32,
-    pub rest_density: f32,
-    pub stiffness: f32,
-    pub viscosity: f32,
-    pub dt: f32,
-    pub gravity: f32,
-    pub num_particles: u32,
-    pub _padding: u32,
-}
-
-/// GPU-compatible boundary parameters
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GpuBoundsParams {
-    pub bound_x: f32,
-    pub bound_y: f32,
-    pub damping: f32,
-    pub wall_stiffness: f32,
 }
 
 /// GPU-compatible 3D SPH parameters (matches WGSL struct layout)

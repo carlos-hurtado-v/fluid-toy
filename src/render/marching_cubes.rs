@@ -171,7 +171,7 @@ fn create_msaa_depth_texture(device: &wgpu::Device, width: u32, height: u32, sam
 
 pub struct MarchingCubesRenderer {
     // Density field (3D texture)
-    density_texture: wgpu::Texture,
+    _density_texture: wgpu::Texture,
     density_view: wgpu::TextureView,
 
     // MSAA render targets
@@ -195,8 +195,8 @@ pub struct MarchingCubesRenderer {
 
     // Buffers
     grid_params_buffer: wgpu::Buffer,
-    edge_table_buffer: wgpu::Buffer,
-    tri_table_buffer: wgpu::Buffer,
+    _edge_table_buffer: wgpu::Buffer,
+    _tri_table_buffer: wgpu::Buffer,
     counter_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
     camera_buffer: wgpu::Buffer,
@@ -213,7 +213,7 @@ pub struct MarchingCubesRenderer {
     env_pipeline_1x: wgpu::RenderPipeline,     // Single-sampled for background pass
 
     // Bind groups
-    density_bind_group: wgpu::BindGroup,
+    _density_bind_group: wgpu::BindGroup,
     generate_bind_group: wgpu::BindGroup,
     back_face_bind_group: wgpu::BindGroup,
     render_bind_group: wgpu::BindGroup,
@@ -1066,7 +1066,7 @@ impl MarchingCubesRenderer {
         });
 
         Self {
-            density_texture,
+            _density_texture: density_texture,
             density_view,
             msaa_texture,
             msaa_view,
@@ -1081,8 +1081,8 @@ impl MarchingCubesRenderer {
             background_texture,
             background_view,
             grid_params_buffer,
-            edge_table_buffer,
-            tri_table_buffer,
+            _edge_table_buffer: edge_table_buffer,
+            _tri_table_buffer: tri_table_buffer,
             counter_buffer,
             vertex_buffer,
             camera_buffer,
@@ -1095,7 +1095,7 @@ impl MarchingCubesRenderer {
             render_pipeline,
             env_pipeline,
             env_pipeline_1x,
-            density_bind_group,
+            _density_bind_group: density_bind_group,
             generate_bind_group,
             back_face_bind_group,
             render_bind_group,
@@ -1438,7 +1438,4 @@ impl MarchingCubesRenderer {
         });
     }
 
-    pub fn vertex_count(&self) -> u32 {
-        self.current_vertex_count
-    }
 }

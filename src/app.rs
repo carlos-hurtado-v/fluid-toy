@@ -12,7 +12,7 @@ use winit::{
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, FluidRenderer, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, ScreenSpaceFluidRenderer, WireframeRenderer};
+use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, ScreenSpaceFluidRenderer, WireframeRenderer};
 use crate::simulation::{SphParticle3D, SphSimulation3DGrid};
 use crate::state::{AppState, FluidRenderMode, GpuMouseForce};
 
@@ -20,7 +20,6 @@ pub struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
     renderer: Option<ParticleRenderer3D>,
-    fluid_renderer: Option<FluidRenderer>,
     ss_renderer: Option<ScreenSpaceFluidRenderer>,
     mc_renderer: Option<MarchingCubesRenderer>,
     wireframe_renderer: Option<WireframeRenderer>,
@@ -50,7 +49,6 @@ impl App {
             window: None,
             gpu: None,
             renderer: None,
-            fluid_renderer: None,
             ss_renderer: None,
             mc_renderer: None,
             wireframe_renderer: None,
@@ -117,15 +115,6 @@ impl App {
             self.state.simulation.max_particles,
         );
 
-        // Create fluid renderer (screen-space, kept for comparison)
-        let fluid_renderer = FluidRenderer::new(
-            &gpu.device,
-            gpu.config.format,
-            &camera_params,
-            gpu.config.width,
-            gpu.config.height,
-        );
-
         // Create screen-space fluid renderer (photorealistic)
         let ss_renderer = ScreenSpaceFluidRenderer::new(
             &gpu.device,
@@ -184,7 +173,6 @@ impl App {
 
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
-        self.fluid_renderer = Some(fluid_renderer);
         self.ss_renderer = Some(ss_renderer);
         self.mc_renderer = Some(mc_renderer);
         self.wireframe_renderer = Some(wireframe_renderer);
@@ -235,6 +223,8 @@ impl App {
         self.state.sph.reset_defaults();
         self.state.rendering.reset_defaults();
         self.state.camera.reset_defaults();
+        self.state.lighting.reset_defaults();
+        self.state.container.reset_defaults();
         // Reset camera to defaults
         self.camera.distance = self.state.camera.distance;
         self.camera.yaw = self.state.camera.yaw;

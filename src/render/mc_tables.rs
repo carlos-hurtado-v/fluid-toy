@@ -301,28 +301,3 @@ pub const TRI_TABLE: [[i32; 16]; 256] = [
     [-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1],
 ];
 
-/// Edge vertex pairs: which two vertices form each edge
-pub const EDGE_VERTICES: [(usize, usize); 12] = [
-    (0, 1), (1, 2), (2, 3), (3, 0),  // bottom face
-    (4, 5), (5, 6), (6, 7), (7, 4),  // top face
-    (0, 4), (1, 5), (2, 6), (3, 7),  // vertical edges
-];
-
-/// Cube vertex offsets (relative to cube origin)
-/// Vertex layout:
-///        3-------7
-///       /|      /|
-///      2-------6 |
-///      | 1-----|-5
-///      |/      |/
-///      0-------4
-pub const VERTEX_OFFSETS: [[f32; 3]; 8] = [
-    [0.0, 0.0, 0.0],  // 0
-    [0.0, 1.0, 0.0],  // 1
-    [0.0, 1.0, 1.0],  // 2
-    [0.0, 0.0, 1.0],  // 3
-    [1.0, 0.0, 0.0],  // 4
-    [1.0, 1.0, 0.0],  // 5
-    [1.0, 1.0, 1.0],  // 6
-    [1.0, 0.0, 1.0],  // 7
-];
