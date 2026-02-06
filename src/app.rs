@@ -418,7 +418,7 @@ impl App {
         }
 
         // Sync state to GPU
-        if let (Some(sph_sim), Some(renderer)) = (&self.sph_simulation, &self.renderer) {
+        if let (Some(sph_sim), Some(renderer)) = (&mut self.sph_simulation, &self.renderer) {
             let sph_params = self.state.sph.to_gpu_params_3d(
                 self.state.runtime.particle_count,
                 self.state.simulation.delta_time,

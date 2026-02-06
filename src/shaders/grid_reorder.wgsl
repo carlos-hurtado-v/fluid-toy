@@ -24,7 +24,7 @@ struct GridParams {
 
 @group(0) @binding(0) var<storage, read> particles_in: array<SphParticle3D>;
 @group(0) @binding(1) var<storage, read_write> particles_out: array<SphParticle3D>;
-@group(0) @binding(2) var<storage, read> particle_cell_indices: array<u32>;
+@group(0) @binding(2) var<storage, read_write> particle_cell_indices: array<u32>;
 @group(0) @binding(3) var<storage, read_write> cell_offsets: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read> cell_starts: array<u32>;
 @group(0) @binding(5) var<storage, read> cell_counts: array<u32>;
@@ -49,4 +49,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Copy particle to sorted position
     particles_out[dest_idx] = particles_in[i];
+
+    // Store mapping so density shader can write to both buffers
+    particle_cell_indices[i] = dest_idx;
 }

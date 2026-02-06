@@ -39,7 +39,8 @@ struct GridParams {
 
 @group(0) @binding(0) var<uniform> params: SphParams;
 @group(0) @binding(1) var<storage, read_write> particles: array<SphParticle3D>;
-@group(0) @binding(2) var<storage, read> sorted_particles: array<SphParticle3D>;
+@group(0) @binding(2) var<storage, read_write> sorted_particles: array<SphParticle3D>;
+@group(0) @binding(6) var<storage, read> sorted_index: array<u32>;
 @group(0) @binding(3) var<storage, read> cell_starts: array<u32>;
 @group(0) @binding(4) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(5) var<uniform> grid: GridParams;
@@ -121,4 +122,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     particles[i].density = density;
     particles[i].near_density = near_density;
+
+    // Also update sorted buffer so force shader can read neighbor densities
+    // without needing a second reorder pass
+    let si = sorted_index[i];
+    sorted_particles[si].density = density;
+    sorted_particles[si].near_density = near_density;
 }

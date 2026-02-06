@@ -495,7 +495,7 @@ impl SphSimulation3DGrid {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -590,7 +590,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
@@ -609,6 +609,12 @@ impl SphSimulation3DGrid {
                     binding: 5,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
             ],
@@ -637,6 +643,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 3, resource: cell_starts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cell_counts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: grid_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: particle_cell_indices_buffer.as_entire_binding() },
             ],
         });
 
@@ -933,18 +940,6 @@ impl SphSimulation3DGrid {
                 pass.dispatch_workgroups(particle_workgroups, 1, 1);
             }
 
-            // 5b. Reorder again to copy updated densities to sorted buffer
-            encoder.clear_buffer(&self.cell_offsets_buffer, 0, None);
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Grid Reorder Pass 2"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.grid_reorder_pipeline);
-                pass.set_bind_group(0, &self.grid_reorder_bind_group, &[]);
-                pass.dispatch_workgroups(particle_workgroups, 1, 1);
-            }
-
             // 6. Force computation
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -971,8 +966,13 @@ impl SphSimulation3DGrid {
         }
     }
 
-    pub fn update_sph_params(&self, queue: &wgpu::Queue, params: &GpuSphParams3D) {
+    pub fn update_sph_params(&mut self, queue: &wgpu::Queue, params: &GpuSphParams3D) {
         queue.write_buffer(&self.sph_params_buffer, 0, bytemuck::bytes_of(params));
+        // Keep num_particles in sync between both uniform buffers
+        if self.grid_params.num_particles != params.num_particles {
+            self.grid_params.num_particles = params.num_particles;
+            queue.write_buffer(&self.grid_params_buffer, 0, bytemuck::bytes_of(&self.grid_params));
+        }
     }
 
     pub fn update_bounds_params(&self, queue: &wgpu::Queue, params: &GpuBoundsParams3D) {
