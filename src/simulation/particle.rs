@@ -36,3 +36,41 @@ impl Default for SphParticle3D {
         Self::new(0.0, 0.0, 0.0)
     }
 }
+
+/// Create a cube of particles (N×N×N) centered horizontally, starting above center vertically.
+pub fn create_particle_block(spacing: f32, cube_size: u32) -> Vec<SphParticle3D> {
+    let mut particles = Vec::new();
+
+    let size = (cube_size as f32 - 1.0) * spacing;
+    let half = size / 2.0;
+
+    for y in 0..cube_size {
+        for z in 0..cube_size {
+            for x in 0..cube_size {
+                let px = -half + (x as f32) * spacing;
+                let py = 0.2 + (y as f32) * spacing; // Start above center
+                let pz = -half + (z as f32) * spacing;
+                // Small jitter to prevent perfectly aligned particles
+                let jitter = 0.0005 * rand_f32();
+                particles.push(SphParticle3D::new(px + jitter, py + jitter, pz + jitter));
+            }
+        }
+    }
+
+    particles
+}
+
+/// Simple pseudo-random float (not cryptographic, just for jitter)
+fn rand_f32() -> f32 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static mut SEED: u64 = 0;
+    unsafe {
+        SEED = SEED.wrapping_add(1);
+        let mut hasher = DefaultHasher::new();
+        (SEED, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()).hash(&mut hasher);
+        (hasher.finish() % 1000) as f32 / 1000.0
+    }
+}

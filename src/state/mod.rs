@@ -211,8 +211,8 @@ impl Default for LightingConfig {
         // Default sun position: upper-right-front, warm sunlight color
         Self {
             sun_enabled: true,
-            sun_direction: [0.5, 0.8, 0.3],  // Will be normalized in shader
-            sun_color: [1.0, 0.95, 0.85],    // Warm white sunlight
+            sun_direction: [0.0, 0.15, 0.3],  // Will be normalized in shader
+            sun_color: [0.98, 0.82, 0.6],    // Warm white sunlight
             sun_intensity: 2.0,
             specular_power: 128.0,           // Sharp highlights for water
         }
@@ -363,8 +363,8 @@ impl Default for RenderConfig {
             color_by_velocity: true,
             background_color: [0.02, 0.02, 0.05],
             render_mode: FluidRenderMode::ScreenSpace,
-            ripple_scale: 15.0,
-            ripple_strength: 0.3,
+            ripple_scale: 10.0,
+            ripple_strength: 0.25,
         }
     }
 }

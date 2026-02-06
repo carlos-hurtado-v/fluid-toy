@@ -67,7 +67,7 @@ impl Default for PostProcessConfig {
 
             // Chromatic aberration
             chromatic_aberration_enabled: true,
-            chromatic_aberration_intensity: 0.0065,
+            chromatic_aberration_intensity: 0.0060,
 
             // Anamorphic streaks (cyan tint by default for sci-fi look)
             streaks_enabled: true,

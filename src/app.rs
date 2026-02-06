@@ -13,7 +13,7 @@ use winit::{
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
 use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, ScreenSpaceFluidRenderer, WireframeRenderer};
-use crate::simulation::{SphParticle3D, SphSimulation3DGrid};
+use crate::simulation::{SphSimulation3DGrid, create_particle_block};
 use crate::state::{AppState, FluidRenderMode, GpuMouseForce};
 
 pub struct App {
@@ -94,7 +94,7 @@ impl App {
         // Create initial 3D SPH particles (dam break style - half the box)
         // Spacing = 0.6 * h (slightly looser than reference to reduce initial pressure)
         let spacing = self.state.sph.kernel_radius * 0.6;
-        let particles = create_sph_particle_block(spacing, &self.state);
+        let particles = create_particle_block(spacing, self.state.simulation.initial_cube_size);
         self.state.runtime.particle_count = particles.len() as u32;
 
         // Create 3D SPH simulation (O(n²) version - works correctly)
@@ -186,7 +186,7 @@ impl App {
     fn reset_simulation(&mut self) {
         if let Some(gpu) = &self.gpu {
             let spacing = self.state.sph.kernel_radius * 0.6;
-            let particles = create_sph_particle_block(spacing, &self.state);
+            let particles = create_particle_block(spacing, self.state.simulation.initial_cube_size);
             self.state.runtime.particle_count = particles.len() as u32;
 
             let sph_params = self.state.sph.to_gpu_params_3d(
@@ -378,6 +378,99 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn cursor_ray(&self) -> ([f32; 3], [f32; 3]) {
+        let gpu = self.gpu.as_ref().unwrap();
+        self.camera.screen_to_ray(
+            self.current_mouse_pos.0 as f32,
+            self.current_mouse_pos.1 as f32,
+            gpu.config.width as f32,
+            gpu.config.height as f32,
+        )
+    }
+
+    fn sync_gpu_state(&mut self) {
+        // Compute mouse force before borrowing sph_sim mutably
+        let mouse_force = if self.right_mouse_pressed {
+            let (ray_origin, ray_dir) = self.cursor_ray();
+            let hit = self.camera.ray_plane_intersection(ray_origin, ray_dir, -0.6)
+                .or_else(|| self.camera.ray_plane_intersection(ray_origin, ray_dir, 0.0))
+                .unwrap_or([0.0, 0.0, 0.0]);
+
+            GpuMouseForce {
+                position: hit,
+                radius: 0.5,
+                strength: 30.0,
+                is_active: 1,
+                _padding: [0.0; 2],
+            }
+        } else {
+            GpuMouseForce::default()
+        };
+
+        let gpu = self.gpu.as_ref().unwrap();
+        if let (Some(sph_sim), Some(renderer)) = (&mut self.sph_simulation, &self.renderer) {
+            let sph_params = self.state.sph.to_gpu_params_3d(
+                self.state.runtime.particle_count,
+                self.state.simulation.delta_time,
+            );
+            sph_sim.update_sph_params(&gpu.queue, &sph_params);
+
+            let bounds_params = self.state.container.to_gpu_bounds_3d(
+                self.state.sph.wall_stiffness,
+                self.state.simulation.damping,
+                self.state.rendering.visual_margin(),
+            );
+            sph_sim.update_bounds_params(&gpu.queue, &bounds_params);
+
+            // Update wireframe container visualization
+            if let Some(wireframe) = &self.wireframe_renderer {
+                let container_params = GpuContainerParams::from_config(&self.state.container);
+                wireframe.update_container(&gpu.queue, &container_params);
+            }
+
+            // Update gravity (based on tilt)
+            let gravity = self.state.simulation.to_gpu_gravity();
+            sph_sim.update_gravity(&gpu.queue, &gravity);
+
+            sph_sim.update_mouse_force(&gpu.queue, &mouse_force);
+
+            // Update camera
+            let camera_params = self.camera.to_gpu_params();
+            renderer.update_camera(&gpu.queue, &camera_params);
+            if let Some(wireframe) = &self.wireframe_renderer {
+                wireframe.update_camera(&gpu.queue, &camera_params);
+            }
+
+            let render_params = self.state.rendering.to_gpu_params();
+            renderer.update_params(&gpu.queue, &render_params);
+        }
+    }
+
+    fn spawn_particles(&mut self) {
+        if !self.middle_mouse_pressed {
+            return;
+        }
+        let (ray_origin, ray_dir) = self.cursor_ray();
+        let spawn_pos = self.camera.ray_plane_intersection(ray_origin, ray_dir, -0.5)
+            .or_else(|| self.camera.ray_plane_intersection(ray_origin, ray_dir, 0.0))
+            .unwrap_or([0.0, 0.0, 0.0]);
+
+        let gpu = self.gpu.as_ref().unwrap();
+        if let Some(sph_sim) = &mut self.sph_simulation {
+
+            let spawned = sph_sim.spawn_particles(&gpu.queue, spawn_pos, 10, 0.08);
+            self.state.runtime.particle_count = sph_sim.num_particles();
+
+            if spawned > 0 {
+                let sph_params = self.state.sph.to_gpu_params_3d(
+                    self.state.runtime.particle_count,
+                    self.state.simulation.delta_time,
+                );
+                sph_sim.update_sph_params(&gpu.queue, &sph_params);
+            }
+        }
+    }
+
     fn update_and_render(&mut self) {
         // Early return if not initialized
         if self.gpu.is_none() || self.sph_simulation.is_none() || self.renderer.is_none() {
@@ -418,104 +511,13 @@ impl App {
         }
 
         // Sync state to GPU
-        if let (Some(sph_sim), Some(renderer)) = (&mut self.sph_simulation, &self.renderer) {
-            let sph_params = self.state.sph.to_gpu_params_3d(
-                self.state.runtime.particle_count,
-                self.state.simulation.delta_time,
-            );
-            sph_sim.update_sph_params(&gpu.queue, &sph_params);
-
-            let bounds_params = self.state.container.to_gpu_bounds_3d(
-                self.state.sph.wall_stiffness,
-                self.state.simulation.damping,
-                self.state.rendering.visual_margin(),
-            );
-            sph_sim.update_bounds_params(&gpu.queue, &bounds_params);
-
-            // Update wireframe container visualization
-            if let Some(wireframe) = &self.wireframe_renderer {
-                let container_params = GpuContainerParams::from_config(&self.state.container);
-                wireframe.update_container(&gpu.queue, &container_params);
-            }
-
-            // Update gravity (based on tilt)
-            let gravity = self.state.simulation.to_gpu_gravity();
-            sph_sim.update_gravity(&gpu.queue, &gravity);
-
-            // Update mouse force
-            let mouse_force = if self.right_mouse_pressed {
-                // Cast ray from camera through mouse position
-                let screen_width = gpu.config.width as f32;
-                let screen_height = gpu.config.height as f32;
-                let (ray_origin, ray_dir) = self.camera.screen_to_ray(
-                    self.current_mouse_pos.0 as f32,
-                    self.current_mouse_pos.1 as f32,
-                    screen_width,
-                    screen_height,
-                );
-
-                // Intersect with horizontal plane at y = -0.6 (where fluid settles)
-                // If that fails, try y = 0 (center), then use origin as fallback
-                let hit = self.camera.ray_plane_intersection(ray_origin, ray_dir, -0.6)
-                    .or_else(|| self.camera.ray_plane_intersection(ray_origin, ray_dir, 0.0))
-                    .unwrap_or([0.0, 0.0, 0.0]);
-
-                GpuMouseForce {
-                    position: hit,
-                    radius: 0.5,
-                    strength: 30.0,
-                    is_active: 1,
-                    _padding: [0.0; 2],
-                }
-            } else {
-                GpuMouseForce::default()
-            };
-            sph_sim.update_mouse_force(&gpu.queue, &mouse_force);
-
-            // Update camera
-            let camera_params = self.camera.to_gpu_params();
-            renderer.update_camera(&gpu.queue, &camera_params);
-            if let Some(wireframe) = &self.wireframe_renderer {
-                wireframe.update_camera(&gpu.queue, &camera_params);
-            }
-
-            let render_params = self.state.rendering.to_gpu_params();
-            renderer.update_params(&gpu.queue, &render_params);
-        }
+        self.sync_gpu_state();
 
         // Handle particle spawning (middle mouse held = continuous stream)
-        if self.middle_mouse_pressed {
-            if let Some(sph_sim) = &mut self.sph_simulation {
-                let screen_width = gpu.config.width as f32;
-                let screen_height = gpu.config.height as f32;
-                let (ray_origin, ray_dir) = self.camera.screen_to_ray(
-                    self.current_mouse_pos.0 as f32,
-                    self.current_mouse_pos.1 as f32,
-                    screen_width,
-                    screen_height,
-                );
-
-                // Find spawn position via ray-plane intersection
-                let spawn_pos = self.camera.ray_plane_intersection(ray_origin, ray_dir, -0.5)
-                    .or_else(|| self.camera.ray_plane_intersection(ray_origin, ray_dir, 0.0))
-                    .unwrap_or([0.0, 0.0, 0.0]);
-
-                // Spawn a small batch each frame for continuous stream effect
-                let spawned = sph_sim.spawn_particles(&gpu.queue, spawn_pos, 10, 0.08);
-                self.state.runtime.particle_count = sph_sim.num_particles();
-
-                if spawned > 0 {
-                    // Update SPH params with new particle count
-                    let sph_params = self.state.sph.to_gpu_params_3d(
-                        self.state.runtime.particle_count,
-                        self.state.simulation.delta_time,
-                    );
-                    sph_sim.update_sph_params(&gpu.queue, &sph_params);
-                }
-            }
-        }
+        self.spawn_particles();
 
         // Get current frame texture
+        let gpu = self.gpu.as_ref().unwrap();
         let output = match gpu.surface.get_current_texture() {
             Ok(t) => t,
             Err(_) => return,
@@ -675,6 +677,8 @@ impl App {
         }
 
         // Render egui
+        let egui_renderer = self.egui_renderer.as_mut().unwrap();
+        let window = self.window.as_ref().unwrap();
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [gpu.config.width, gpu.config.height],
             pixels_per_point: window.scale_factor() as f32,
@@ -734,42 +738,3 @@ impl App {
     }
 }
 
-/// Create a cube of particles for testing (controlled count)
-fn create_sph_particle_block(spacing: f32, state: &AppState) -> Vec<SphParticle3D> {
-    let mut particles = Vec::new();
-
-    // Create a cube based on initial_cube_size setting (N×N×N particles)
-    let count = state.simulation.initial_cube_size;
-    let size = (count as f32 - 1.0) * spacing;
-    let half = size / 2.0;
-
-    for y in 0..count {
-        for z in 0..count {
-            for x in 0..count {
-                let px = -half + (x as f32) * spacing;
-                let py = 0.2 + (y as f32) * spacing;  // Start above center
-                let pz = -half + (z as f32) * spacing;
-                // Small jitter to prevent perfectly aligned particles
-                let jitter = 0.0005 * rand_f32();
-                particles.push(SphParticle3D::new(px + jitter, py + jitter, pz + jitter));
-            }
-        }
-    }
-
-    particles
-}
-
-/// Simple pseudo-random float (not cryptographic, just for jitter)
-fn rand_f32() -> f32 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static mut SEED: u64 = 0;
-    unsafe {
-        SEED = SEED.wrapping_add(1);
-        let mut hasher = DefaultHasher::new();
-        (SEED, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()).hash(&mut hasher);
-        (hasher.finish() % 1000) as f32 / 1000.0
-    }
-}
