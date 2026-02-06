@@ -35,7 +35,7 @@ impl GpuContext {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Primary Device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::default(),

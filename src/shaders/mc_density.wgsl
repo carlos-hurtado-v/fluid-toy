@@ -18,7 +18,7 @@ struct GridParams {
     kernel_radius: f32,
     iso_value: f32,
     num_particles: u32,
-    _padding: f32,
+    max_vertices: u32,
 }
 
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;

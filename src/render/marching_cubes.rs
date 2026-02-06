@@ -12,7 +12,7 @@ use crate::render::GpuCameraParams;
 use crate::state::{GpuEnvironmentParams, GpuLightParams};
 
 /// Grid resolution for marching cubes (cells per dimension)
-const GRID_SIZE: u32 = 70;
+const GRID_SIZE: u32 = 100;
 
 /// Maximum vertices (5 triangles * 3 verts * grid_size^3 cells)
 /// In practice, only ~10-30% of cells are active
@@ -29,7 +29,7 @@ pub struct GpuGridParams {
     pub kernel_radius: f32,
     pub iso_value: f32,
     pub num_particles: u32,
-    pub _padding: f32,
+    pub max_vertices: u32,
 }
 
 /// Water shading parameters
@@ -345,7 +345,7 @@ impl MarchingCubesRenderer {
             kernel_radius: 0.1,
             iso_value: 500.0,  // Will be tuned based on rest_density
             num_particles: 0,
-            _padding: 0.0,
+            max_vertices: MAX_VERTICES,
         };
         let grid_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MC Grid Params"),
@@ -1185,7 +1185,7 @@ impl MarchingCubesRenderer {
             kernel_radius,
             iso_value,
             num_particles,
-            _padding: 0.0,
+            max_vertices: MAX_VERTICES,
         };
         queue.write_buffer(&self.grid_params_buffer, 0, bytemuck::bytes_of(&params));
     }

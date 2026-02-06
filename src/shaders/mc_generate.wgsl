@@ -9,7 +9,7 @@ struct GridParams {
     kernel_radius: f32,
     iso_value: f32,
     num_particles: u32,
-    _padding: f32,
+    max_vertices: u32,
 }
 
 struct Vertex {
@@ -190,6 +190,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         // Claim space for 3 vertices
         let vertex_offset = atomicAdd(&counter.vertex_count, 3u);
+
+        // Bounds check — don't write past the vertex buffer
+        if (vertex_offset + 2u >= params.max_vertices) {
+            break;
+        }
 
         // Get vertex positions and smooth normals
         let p0 = edge_verts[edge0];
