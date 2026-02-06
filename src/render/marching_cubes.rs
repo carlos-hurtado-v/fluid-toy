@@ -7,6 +7,7 @@ use wgpu::util::DeviceExt;
 
 use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
 use crate::render::GpuCameraParams;
+use crate::state::GpuLightParams;
 
 /// Grid resolution for marching cubes (cells per dimension)
 const GRID_SIZE: u32 = 70;
@@ -35,7 +36,7 @@ pub struct GpuGridParams {
 pub struct GpuWaterParams {
     pub water_color: [f32; 3],
     pub specular_power: f32,
-    pub fresnel_bias: f32,
+    pub ior: f32,  // Index of refraction (water = 1.333)
     pub refraction_strength: f32,
     pub ripple_scale: f32,
     pub ripple_strength: f32,
@@ -46,8 +47,8 @@ impl Default for GpuWaterParams {
         Self {
             water_color: [0.1, 0.4, 0.8],
             specular_power: 64.0,
-            fresnel_bias: 0.02,
-            refraction_strength: 0.5,
+            ior: 1.333,  // Water
+            refraction_strength: 0.05,
             ripple_scale: 25.0,
             ripple_strength: 0.15,
         }
@@ -108,18 +109,89 @@ fn create_samplable_depth_texture(device: &wgpu::Device, width: u32, height: u32
     (texture, view)
 }
 
+/// Create a color texture for rendering the background (for screen-space refraction)
+fn create_background_texture(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("MC Background Texture"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// Create MSAA color texture (for multisampled rendering)
+fn create_msaa_texture(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32, sample_count: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("MC MSAA Color Texture"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// Create multisampled depth texture
+fn create_msaa_depth_texture(device: &wgpu::Device, width: u32, height: u32, sample_count: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("MC MSAA Depth Texture"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
 pub struct MarchingCubesRenderer {
     // Density field (3D texture)
     density_texture: wgpu::Texture,
     density_view: wgpu::TextureView,
 
-    // Depth buffers for rendering
+    // MSAA render targets
+    msaa_texture: Option<wgpu::Texture>,
+    msaa_view: Option<wgpu::TextureView>,
+    sample_count: u32,
+
+    // Depth buffers for rendering (multisampled if MSAA enabled)
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    // Single-sampled depth for background pass (always 1x)
+    background_depth_texture: wgpu::Texture,
+    background_depth_view: wgpu::TextureView,
     // Back face depth for thickness calculation
     back_depth_texture: wgpu::Texture,
     back_depth_view: wgpu::TextureView,
     back_depth_sampler: wgpu::Sampler,
+    // Background texture for screen-space refraction
+    background_texture: wgpu::Texture,
+    background_view: wgpu::TextureView,
 
     // Buffers
     grid_params_buffer: wgpu::Buffer,
@@ -129,13 +201,16 @@ pub struct MarchingCubesRenderer {
     vertex_buffer: wgpu::Buffer,
     camera_buffer: wgpu::Buffer,
     water_params_buffer: wgpu::Buffer,
+    light_params_buffer: wgpu::Buffer,
+    indirect_buffer: wgpu::Buffer,  // For indirect draw calls
 
     // Pipelines
     density_pipeline: wgpu::ComputePipeline,
     generate_pipeline: wgpu::ComputePipeline,
     back_face_pipeline: wgpu::RenderPipeline,  // Renders back faces for thickness
     render_pipeline: wgpu::RenderPipeline,
-    env_pipeline: wgpu::RenderPipeline,
+    env_pipeline: wgpu::RenderPipeline,        // MSAA version for main render
+    env_pipeline_1x: wgpu::RenderPipeline,     // Single-sampled for background pass
 
     // Bind groups
     density_bind_group: wgpu::BindGroup,
@@ -160,6 +235,7 @@ pub struct MarchingCubesRenderer {
     // Screen dimensions for depth buffer
     width: u32,
     height: u32,
+    surface_format: wgpu::TextureFormat,
 
     // Keep references for bind group recreation
     env_texture_view: wgpu::TextureView,
@@ -174,7 +250,18 @@ impl MarchingCubesRenderer {
         env_sampler: &wgpu::Sampler,
         width: u32,
         height: u32,
+        sample_count: u32,
     ) -> Self {
+        // Clamp sample count to valid values (1, 2, 4, 8)
+        // Note: Not all GPUs support 8x MSAA - wgpu will validate this
+        let sample_count = match sample_count {
+            1 => 1,
+            2 => 2,
+            4 => 4,
+            8 => 8,
+            _ => 4, // Default to 4x if invalid
+        };
+
         // Grid bounds (matching simulation domain)
         let grid_min = [-1.0f32, -1.0, -1.0];
         let grid_max = [1.0f32, 1.0, 1.0];
@@ -197,10 +284,22 @@ impl MarchingCubesRenderer {
         });
         let density_view = density_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Create depth texture for rendering
-        let (depth_texture, depth_view) = create_depth_texture(device, width, height);
+        // Create MSAA textures if sample_count > 1
+        let (msaa_texture, msaa_view) = if sample_count > 1 {
+            let (tex, view) = create_msaa_texture(device, surface_format, width, height, sample_count);
+            (Some(tex), Some(view))
+        } else {
+            (None, None)
+        };
 
-        // Create back-face depth texture for thickness calculation (samplable)
+        // Create depth texture for rendering (multisampled if MSAA enabled)
+        let (depth_texture, depth_view) = if sample_count > 1 {
+            create_msaa_depth_texture(device, width, height, sample_count)
+        } else {
+            create_depth_texture(device, width, height)
+        };
+
+        // Create back-face depth texture for thickness calculation (samplable, always single-sampled)
         let (back_depth_texture, back_depth_view) = create_samplable_depth_texture(device, width, height);
         let back_depth_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("MC Back Depth Sampler"),
@@ -210,6 +309,12 @@ impl MarchingCubesRenderer {
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+
+        // Create background texture for screen-space refraction
+        let (background_texture, background_view) = create_background_texture(device, surface_format, width, height);
+
+        // Create single-sampled depth texture for background pass (always 1x)
+        let (background_depth_texture, background_depth_view) = create_depth_texture(device, width, height);
 
         // Create buffers
         let grid_params = GpuGridParams {
@@ -259,6 +364,14 @@ impl MarchingCubesRenderer {
             mapped_at_creation: false,
         });
 
+        // Indirect draw buffer: [vertex_count, instance_count, first_vertex, first_instance]
+        let indirect_data: [u32; 4] = [0, 1, 0, 0];
+        let indirect_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MC Indirect Draw"),
+            contents: bytemuck::cast_slice(&indirect_data),
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+        });
+
         // Vertex buffer
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("MC Vertices"),
@@ -280,6 +393,23 @@ impl MarchingCubesRenderer {
         let water_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MC Water Params"),
             contents: bytemuck::bytes_of(&water_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Light params buffer
+        let light_params = GpuLightParams {
+            sun_direction: [0.5, 0.8, 0.3],
+            sun_enabled: 1,
+            sun_color: [1.0, 0.95, 0.85],
+            sun_intensity: 2.0,
+            specular_power: 128.0,
+            _pad0: [0.0; 3],
+            _padding: [0.0; 3],
+            _pad1: 0.0,
+        };
+        let light_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MC Light Params"),
+            contents: bytemuck::bytes_of(&light_params),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -557,6 +687,28 @@ impl MarchingCubesRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Background texture (for screen-space refraction)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Light params
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -601,7 +753,11 @@ impl MarchingCubesRenderer {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview: None,
             cache: None,
         });
@@ -722,6 +878,14 @@ impl MarchingCubesRenderer {
                     binding: 6,
                     resource: wgpu::BindingResource::Sampler(&back_depth_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&background_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: light_params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -794,7 +958,47 @@ impl MarchingCubesRenderer {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        // Single-sampled env pipeline for background pass
+        let env_pipeline_1x = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("MC Env Pipeline 1x"),
+            layout: Some(&env_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &env_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &env_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),  // 1x
             multiview: None,
             cache: None,
         });
@@ -864,11 +1068,18 @@ impl MarchingCubesRenderer {
         Self {
             density_texture,
             density_view,
+            msaa_texture,
+            msaa_view,
+            sample_count,
             depth_texture,
             depth_view,
+            background_depth_texture,
+            background_depth_view,
             back_depth_texture,
             back_depth_view,
             back_depth_sampler,
+            background_texture,
+            background_view,
             grid_params_buffer,
             edge_table_buffer,
             tri_table_buffer,
@@ -876,11 +1087,14 @@ impl MarchingCubesRenderer {
             vertex_buffer,
             camera_buffer,
             water_params_buffer,
+            light_params_buffer,
+            indirect_buffer,
             density_pipeline,
             generate_pipeline,
             back_face_pipeline,
             render_pipeline,
             env_pipeline,
+            env_pipeline_1x,
             density_bind_group,
             generate_bind_group,
             back_face_bind_group,
@@ -893,6 +1107,7 @@ impl MarchingCubesRenderer {
             grid_max,
             width,
             height,
+            surface_format,
             env_texture_view: env_texture_view_owned,
             env_sampler: env_sampler_owned,
         }
@@ -925,6 +1140,10 @@ impl MarchingCubesRenderer {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(params));
     }
 
+    pub fn update_light_params(&self, queue: &wgpu::Queue, params: &GpuLightParams) {
+        queue.write_buffer(&self.light_params_buffer, 0, bytemuck::bytes_of(params));
+    }
+
     pub fn update_params(&self, queue: &wgpu::Queue, kernel_radius: f32, iso_value: f32, num_particles: u32) {
         let cell_size = (self.grid_max[0] - self.grid_min[0]) / GRID_SIZE as f32;
         let params = GpuGridParams {
@@ -948,10 +1167,15 @@ impl MarchingCubesRenderer {
 
     /// Update water shading parameters
     pub fn update_water_params(&self, queue: &wgpu::Queue, water_color: &[f32; 3], ripple_scale: f32, ripple_strength: f32) {
+        // MC works in world space [-1,1], so ripple parameters need scaling
+        // to match the screen-space renderer's expectations
+        let mc_ripple_scale = ripple_scale / 30.0;
+        let mc_ripple_strength = ripple_strength / 2.0;
+
         let params = GpuWaterParams {
             water_color: *water_color,
-            ripple_scale,
-            ripple_strength,
+            ripple_scale: mc_ripple_scale,
+            ripple_strength: mc_ripple_strength,
             ..Default::default()
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
@@ -994,7 +1218,16 @@ impl MarchingCubesRenderer {
             pass.dispatch_workgroups(workgroups, workgroups, workgroups);
         }
 
-        // Copy counter to staging buffer for readback
+        // Copy counter to indirect buffer for GPU-driven draw
+        encoder.copy_buffer_to_buffer(
+            &self.counter_buffer,
+            0,
+            &self.indirect_buffer,
+            0,
+            std::mem::size_of::<u32>() as u64,  // Just the vertex_count
+        );
+
+        // Copy counter to staging buffer for readback (for stats display)
         encoder.copy_buffer_to_buffer(
             &self.counter_buffer,
             0,
@@ -1026,7 +1259,7 @@ impl MarchingCubesRenderer {
         _background_color: &[f32; 3],
     ) {
         // Pass 1: Render back faces to back_depth_texture (for thickness calculation)
-        if self.current_vertex_count > 0 {
+        {
             let mut back_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MC Back Face Pass"),
                 color_attachments: &[],  // Depth only
@@ -1043,43 +1276,81 @@ impl MarchingCubesRenderer {
             });
             back_pass.set_pipeline(&self.back_face_pipeline);
             back_pass.set_bind_group(0, &self.back_face_bind_group, &[]);
-            back_pass.draw(0..self.current_vertex_count, 0..1);
+            // Use indirect draw - vertex count comes from GPU buffer
+            back_pass.draw_indirect(&self.indirect_buffer, 0);
         }
 
-        // Pass 2: Render environment and front faces
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("MC Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
+        // Pass 2: Render environment to background texture (for screen-space refraction)
+        // Uses single-sampled depth and pipeline since background_texture is single-sampled
+        {
+            let mut env_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MC Environment Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.background_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.background_depth_view,  // Use single-sampled depth
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,  // Don't need to keep it
+                    }),
+                    stencil_ops: None,
                 }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            env_pass.set_pipeline(&self.env_pipeline_1x);  // Use single-sampled pipeline
+            env_pass.set_bind_group(0, &self.env_bind_group, &[]);
+            env_pass.draw(0..3, 0..1);
+        }
 
-        // Draw environment background first (fullscreen triangle at far plane)
-        pass.set_pipeline(&self.env_pipeline);
-        pass.set_bind_group(0, &self.env_bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        // Pass 3: Render water mesh with screen-space refraction from background
+        // Uses MSAA if enabled (renders to msaa_view, resolves to color_view)
+        {
+            let (render_view, resolve_target) = if let Some(msaa_view) = &self.msaa_view {
+                (msaa_view, Some(color_view))
+            } else {
+                (color_view, None)
+            };
 
-        // Draw water mesh on top (front faces only, with thickness from back depth)
-        if self.current_vertex_count > 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MC Water Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: render_view,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            // Draw environment background first (at far plane, will show through where no water)
+            pass.set_pipeline(&self.env_pipeline);
+            pass.set_bind_group(0, &self.env_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+
+            // Draw water mesh on top (samples background_texture for refraction)
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, &self.render_bind_group, &[]);
-            pass.draw(0..self.current_vertex_count, 0..1);
+            pass.draw_indirect(&self.indirect_buffer, 0);
         }
     }
 
@@ -1090,9 +1361,81 @@ impl MarchingCubesRenderer {
         }
         self.width = width;
         self.height = height;
-        let (depth_texture, depth_view) = create_depth_texture(device, width, height);
+
+        // Recreate MSAA texture if enabled
+        if self.sample_count > 1 {
+            let (msaa_texture, msaa_view) = create_msaa_texture(device, self.surface_format, width, height, self.sample_count);
+            self.msaa_texture = Some(msaa_texture);
+            self.msaa_view = Some(msaa_view);
+        }
+
+        // Recreate depth texture (multisampled if MSAA enabled)
+        let (depth_texture, depth_view) = if self.sample_count > 1 {
+            create_msaa_depth_texture(device, width, height, self.sample_count)
+        } else {
+            create_depth_texture(device, width, height)
+        };
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
+
+        // Recreate back depth texture (always single-sampled for sampling)
+        let (back_depth_texture, back_depth_view) = create_samplable_depth_texture(device, width, height);
+        self.back_depth_texture = back_depth_texture;
+        self.back_depth_view = back_depth_view;
+
+        // Recreate background depth texture (always single-sampled for background pass)
+        let (background_depth_texture, background_depth_view) = create_depth_texture(device, width, height);
+        self.background_depth_texture = background_depth_texture;
+        self.background_depth_view = background_depth_view;
+
+        // Recreate background texture
+        let (background_texture, background_view) = create_background_texture(device, self.surface_format, width, height);
+        self.background_texture = background_texture;
+        self.background_view = background_view;
+
+        // Recreate render bind group with new textures
+        self.render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MC Render BG"),
+            layout: &self.render_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.water_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.vertex_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.env_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.env_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.back_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.back_depth_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&self.background_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.light_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
     }
 
     pub fn vertex_count(&self) -> u32 {

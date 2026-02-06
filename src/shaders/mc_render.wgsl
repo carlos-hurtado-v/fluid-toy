@@ -7,16 +7,29 @@ struct CameraParams {
     inv_view: mat4x4<f32>,
     inv_projection: mat4x4<f32>,
     camera_pos: vec3<f32>,
-    _padding: f32,
+    near: f32,
+    far: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 struct WaterParams {
     water_color: vec3<f32>,
     specular_power: f32,
-    fresnel_bias: f32,
+    ior: f32,  // Index of refraction (water = 1.333)
     refraction_strength: f32,
     ripple_scale: f32,
     ripple_strength: f32,
+}
+
+struct LightParams {
+    sun_direction: vec3<f32>,
+    sun_enabled: u32,
+    sun_color: vec3<f32>,
+    sun_intensity: f32,
+    specular_power: f32,
+    _padding: vec3<f32>,
 }
 
 struct Vertex {
@@ -31,6 +44,8 @@ struct Vertex {
 @group(0) @binding(4) var env_sampler: sampler;
 @group(0) @binding(5) var back_depth_tex: texture_depth_2d;
 @group(0) @binding(6) var depth_sampler: sampler;
+@group(0) @binding(7) var background_tex: texture_2d<f32>;
+@group(0) @binding(8) var<uniform> light: LightParams;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -178,11 +193,9 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     let back_depth_raw = textureSample(back_depth_tex, depth_sampler, screen_uv);
     let front_depth_raw = input.clip_position.z;
 
-    // Convert to linear depth (approximate with near=0.1, far=100)
-    let near = 0.1;
-    let far = 100.0;
-    let front_linear = linearize_depth(front_depth_raw, near, far);
-    let back_linear = linearize_depth(back_depth_raw, near, far);
+    // Convert to linear depth using actual camera near/far planes
+    let front_linear = linearize_depth(front_depth_raw, camera.near, camera.far);
+    let back_linear = linearize_depth(back_depth_raw, camera.near, camera.far);
 
     // Thickness in world units (clamped to reasonable range)
     var thickness = max(0.0, back_linear - front_linear);
@@ -195,51 +208,65 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     let density = 2.5;  // Water density factor
     let transmittance = exp(-absorption_coeffs * density * thickness);
 
-    // Light direction (approximate sun)
-    let light_dir = normalize(vec3<f32>(0.5, 0.8, 0.3));
-
     // Reflection - sample environment (sky, surroundings)
     let reflect_dir = reflect(-view_dir, normal);
     let reflection_color = sample_environment(reflect_dir);
 
-    // Refraction direction for environment sampling
-    let refract_dir = refract(-view_dir, normal, 0.75);  // water IOR ~1.33
-    var refraction_env = sample_environment(refract_dir);
+    // === SCREEN-SPACE REFRACTION ===
+    // Transform normal to view space for screen-space distortion
+    let normal_view = (camera.view * vec4<f32>(normal, 0.0)).xyz;
 
-    // Apply absorption to refracted/transmitted light
-    let absorbed_color = refraction_env * transmittance;
+    // Compute refraction UV offset based on normal and thickness
+    // Stronger distortion for thicker water and more angled surfaces
+    let refract_strength = water.refraction_strength * (1.0 + thickness * 0.5);
+    let uv_offset = normal_view.xy * refract_strength;
+
+    // Sample background with distorted UVs (clamp to avoid sampling outside)
+    let refract_uv = clamp(screen_uv + uv_offset, vec2<f32>(0.001), vec2<f32>(0.999));
+    var refracted_background = textureSample(background_tex, env_sampler, refract_uv).rgb;
+
+    // Apply absorption to refracted light (Beer-Lambert)
+    refracted_background = refracted_background * transmittance;
 
     // Deep water color (what you see when looking deep)
     let deep_color = vec3<f32>(0.01, 0.04, 0.1);
 
-    // Blend between absorbed environment and deep water based on thickness
+    // Blend between refracted background and deep water based on thickness
     let depth_blend = 1.0 - exp(-thickness * 1.5);
-    let water_interior = mix(absorbed_color, deep_color, depth_blend);
+    let water_interior = mix(refracted_background, deep_color, depth_blend);
 
-    // Add water's own color contribution
+    // Add water's own color contribution (subsurface scattering approximation)
     let scatter_color = water.water_color * 0.3;
     let interior_with_scatter = water_interior + scatter_color * (1.0 - transmittance);
 
     // Fresnel (Schlick approximation) - controls reflection vs transmission
+    // F0 = ((n1 - n2) / (n1 + n2))^2 where n1=1.0 (air), n2=IOR (water)
     let cos_theta = max(0.0, dot(normal, view_dir));
-    let F0 = water.fresnel_bias;
+    let F0 = pow((water.ior - 1.0) / (water.ior + 1.0), 2.0);  // ~0.02 for water
     let fresnel = clamp(F0 + (1.0 - F0) * pow(1.0 - cos_theta, 5.0), 0.0, 1.0);
 
-    // Specular highlight (Blinn-Phong)
-    let half_vec = normalize(light_dir + view_dir);
-    let specular = pow(max(0.0, dot(half_vec, normal)), water.specular_power) * 1.5;
+    // === DIRECTIONAL LIGHT (SUN) SPECULAR ===
+    var sun_specular = vec3<f32>(0.0);
+    if (light.sun_enabled == 1u) {
+        let light_dir = normalize(light.sun_direction);
+        let half_vec = normalize(light_dir + view_dir);
+        let NdotH = max(0.0, dot(normal, half_vec));
+        let spec_intensity = pow(NdotH, light.specular_power);
+        sun_specular = light.sun_color * light.sun_intensity * spec_intensity;
+    }
 
-    // Combine reflection and interior based on Fresnel
+    // Combine reflection and refraction based on Fresnel
+    // At grazing angles (high fresnel): more reflection
+    // Looking straight on (low fresnel): more refraction/transmission
     var color = mix(interior_with_scatter, reflection_color, fresnel);
 
-    // Add specular highlight
-    color += vec3<f32>(1.0, 1.0, 0.95) * specular;
+    // Add sun specular highlight
+    color += sun_specular;
 
-    // Subtle overall tint
-    color = color * mix(vec3<f32>(1.0), water.water_color, 0.15);
-
-    // Tone mapping
+    // Tone mapping (Reinhard)
     color = color / (color + vec3<f32>(1.0));
+
+    // Gamma correction
     color = pow(color, vec3<f32>(1.0 / 2.2));
 
     return vec4<f32>(color, 1.0);

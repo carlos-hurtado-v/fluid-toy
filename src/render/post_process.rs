@@ -28,6 +28,9 @@ pub struct PostProcessRenderer {
     streak_view_a: wgpu::TextureView,
     streak_texture_b: wgpu::Texture,
     streak_view_b: wgpu::TextureView,
+    // FXAA intermediate texture (composite renders here, then FXAA to final output)
+    fxaa_texture: wgpu::Texture,
+    fxaa_view: wgpu::TextureView,
 
     // Sampler
     sampler: wgpu::Sampler,
@@ -37,6 +40,7 @@ pub struct PostProcessRenderer {
     bloom_threshold_pipeline: wgpu::RenderPipeline,
     bloom_blur_pipeline: wgpu::RenderPipeline,
     streak_blur_pipeline: wgpu::RenderPipeline,
+    fxaa_pipeline: wgpu::RenderPipeline,
 
     // Bind groups
     composite_bind_group: wgpu::BindGroup,
@@ -47,14 +51,17 @@ pub struct PostProcessRenderer {
     streak_threshold_bind_group: wgpu::BindGroup,
     streak_blur_h1_bind_group: wgpu::BindGroup,
     streak_blur_h2_bind_group: wgpu::BindGroup,
+    // FXAA bind group
+    fxaa_bind_group: wgpu::BindGroup,
 
     // Buffers
     params_buffer: wgpu::Buffer,
     blur_h_buffer: wgpu::Buffer,
     blur_v_buffer: wgpu::Buffer,
 
-    // Bind group layout (needed for recreating bind groups on resize)
+    // Bind group layouts (needed for recreating bind groups on resize)
     bind_group_layout: wgpu::BindGroupLayout,
+    fxaa_bind_group_layout: wgpu::BindGroupLayout,
 
     // Surface format for scene texture (must match what fluid renderers output)
     scene_format: wgpu::TextureFormat,
@@ -80,6 +87,8 @@ impl PostProcessRenderer {
         // Streak textures (can be lower res for performance, wider blur hides it)
         let (streak_texture_a, streak_view_a) = Self::create_texture(device, width / 4, height / 4, "Streak A", wgpu::TextureFormat::Rgba16Float);
         let (streak_texture_b, streak_view_b) = Self::create_texture(device, width / 4, height / 4, "Streak B", wgpu::TextureFormat::Rgba16Float);
+        // FXAA intermediate texture (composite renders here when FXAA enabled)
+        let (fxaa_texture, fxaa_view) = Self::create_texture(device, width, height, "FXAA", surface_format);
 
         // Sampler
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -318,6 +327,84 @@ impl PostProcessRenderer {
             cache: None,
         });
 
+        // FXAA shader and pipeline
+        let fxaa_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FXAA Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fxaa.wgsl").into()),
+        });
+
+        let fxaa_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("FXAA Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let fxaa_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("FXAA Pipeline Layout"),
+            bind_group_layouts: &[&fxaa_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let fxaa_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("FXAA Pipeline"),
+            layout: Some(&fxaa_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &fxaa_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fxaa_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let fxaa_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FXAA Bind Group"),
+            layout: &fxaa_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&fxaa_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
         // Create bind groups
         // Composite: scene + bloom + streak
         let composite_bind_group = Self::create_bind_group(
@@ -414,11 +501,14 @@ impl PostProcessRenderer {
             streak_view_a,
             streak_texture_b,
             streak_view_b,
+            fxaa_texture,
+            fxaa_view,
             sampler,
             composite_pipeline,
             bloom_threshold_pipeline,
             bloom_blur_pipeline,
             streak_blur_pipeline,
+            fxaa_pipeline,
             composite_bind_group,
             bloom_threshold_bind_group,
             bloom_blur_h_bind_group,
@@ -426,10 +516,12 @@ impl PostProcessRenderer {
             streak_threshold_bind_group,
             streak_blur_h1_bind_group,
             streak_blur_h2_bind_group,
+            fxaa_bind_group,
             params_buffer,
             blur_h_buffer,
             blur_v_buffer,
             bind_group_layout,
+            fxaa_bind_group_layout,
             scene_format: surface_format,
             width,
             height,
@@ -519,6 +611,7 @@ impl PostProcessRenderer {
         output_view: &wgpu::TextureView,
         bloom_enabled: bool,
         streaks_enabled: bool,
+        fxaa_enabled: bool,
     ) {
         // If bloom is enabled, do bloom passes
         if bloom_enabled {
@@ -659,11 +752,18 @@ impl PostProcessRenderer {
         }
 
         // Final composite pass
+        // If FXAA enabled, render to fxaa_texture; otherwise render directly to output
+        let composite_target = if fxaa_enabled {
+            &self.fxaa_view
+        } else {
+            output_view
+        };
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("PostProcess Composite Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: output_view,
+                    view: composite_target,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -677,6 +777,28 @@ impl PostProcessRenderer {
             });
             pass.set_pipeline(&self.composite_pipeline);
             pass.set_bind_group(0, &self.composite_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // FXAA pass (if enabled)
+        if fxaa_enabled {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("FXAA Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.fxaa_pipeline);
+            pass.set_bind_group(0, &self.fxaa_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
     }
@@ -695,6 +817,7 @@ impl PostProcessRenderer {
         let (bloom_texture_b, bloom_view_b) = Self::create_texture(device, width / 2, height / 2, "Bloom B", wgpu::TextureFormat::Rgba16Float);
         let (streak_texture_a, streak_view_a) = Self::create_texture(device, width / 4, height / 4, "Streak A", wgpu::TextureFormat::Rgba16Float);
         let (streak_texture_b, streak_view_b) = Self::create_texture(device, width / 4, height / 4, "Streak B", wgpu::TextureFormat::Rgba16Float);
+        let (fxaa_texture, fxaa_view) = Self::create_texture(device, width, height, "FXAA", self.scene_format);
 
         self.scene_texture = scene_texture;
         self.scene_view = scene_view;
@@ -706,6 +829,8 @@ impl PostProcessRenderer {
         self.streak_view_a = streak_view_a;
         self.streak_texture_b = streak_texture_b;
         self.streak_view_b = streak_view_b;
+        self.fxaa_texture = fxaa_texture;
+        self.fxaa_view = fxaa_view;
 
         // Recreate bind groups
         self.composite_bind_group = Self::create_bind_group(
@@ -784,5 +909,21 @@ impl PostProcessRenderer {
             &self.params_buffer,
             &self.blur_h_buffer,
         );
+
+        // Recreate FXAA bind group
+        self.fxaa_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FXAA Bind Group"),
+            layout: &self.fxaa_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.fxaa_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
     }
 }

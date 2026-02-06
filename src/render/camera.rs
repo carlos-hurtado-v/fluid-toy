@@ -161,9 +161,11 @@ pub struct GpuCameraParams {
     pub inv_view: [[f32; 4]; 4],       // 64 bytes, offset 128
     pub inv_projection: [[f32; 4]; 4], // 64 bytes, offset 192
     pub camera_pos: [f32; 3],          // 12 bytes
-    pub _padding: f32,                 // 4 bytes
+    pub near: f32,                     // 4 bytes
+    pub far: f32,                      // 4 bytes
+    pub _padding: [f32; 3],            // 12 bytes (align to 16)
 }
-// Total: 272 bytes
+// Total: 288 bytes
 
 /// Invert a 4x4 matrix (for view/projection inverse)
 fn invert_matrix(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
@@ -216,7 +218,9 @@ impl Camera {
             inv_view: invert_matrix(view),
             inv_projection: invert_matrix(projection),
             camera_pos: pos,
-            _padding: 0.0,
+            near: self.near,
+            far: self.far,
+            _padding: [0.0; 3],
         }
     }
 

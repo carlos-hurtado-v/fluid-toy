@@ -21,12 +21,22 @@ struct WaterParams {
     _padding2: f32,
 }
 
+struct LightParams {
+    sun_direction: vec3<f32>,
+    sun_enabled: u32,
+    sun_color: vec3<f32>,
+    sun_intensity: f32,
+    specular_power: f32,
+    _padding: vec3<f32>,
+}
+
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
 @group(0) @binding(1) var thickness_tex: texture_2d<f32>;
 @group(0) @binding(2) var<uniform> camera: CameraParams;
 @group(0) @binding(3) var<uniform> water: WaterParams;
 @group(0) @binding(4) var env_tex: texture_2d<f32>;
 @group(0) @binding(5) var env_sampler: sampler;
+@group(0) @binding(6) var<uniform> light: LightParams;
 
 const PI: f32 = 3.14159265359;
 
@@ -274,13 +284,19 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Sample environment for reflection
     let reflection_color = sample_environment(reflect_world);
 
-    // Light direction (from environment - approximate sun direction)
-    // For "puresky" type HDRIs, sun is typically near the horizon
-    let light_dir = normalize(vec3<f32>(0.5, 0.3, 0.8));
+    // === DIRECTIONAL LIGHT (SUN) ===
+    var sun_specular = vec3<f32>(0.0);
+    if (light.sun_enabled == 1u) {
+        let light_dir = normalize(light.sun_direction);
 
-    // Specular highlight (Blinn-Phong)
-    let H = normalize(light_dir - ray_world);
-    let specular = pow(max(0.0, dot(H, normal_world)), water.specular_power) * 2.0;
+        // Blinn-Phong specular
+        let H = normalize(light_dir - ray_world);
+        let NdotH = max(0.0, dot(normal_world, H));
+        let spec_intensity = pow(NdotH, light.specular_power);
+
+        // Sun specular contribution
+        sun_specular = light.sun_color * light.sun_intensity * spec_intensity;
+    }
 
     // Thickness for absorption
     let thickness = textureLoad(thickness_tex, iuv, 0).r;
@@ -309,8 +325,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Combine reflection and refraction based on Fresnel
     var color = mix(refraction_color, reflection_color, fresnel);
 
-    // Add specular highlight
-    color += vec3<f32>(1.0) * specular;
+    // Add sun specular highlight
+    color += sun_specular;
 
     // Subtle water tint based on thickness
     color = mix(color, color * water_color, clamp(thickness * 0.3, 0.0, 0.5));

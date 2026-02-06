@@ -46,33 +46,33 @@ impl Default for PostProcessConfig {
             enabled: true,
 
             // Exposure / Tonemapping
-            exposure: 1.0,
-            tonemapping_enabled: false,
+            exposure: 1.15,
+            tonemapping_enabled: true,
 
-            // Color grading (neutral defaults)
-            saturation: 1.0,
-            contrast: 1.0,
+            // Color grading
+            saturation: 1.2,
+            contrast: 1.05,
             brightness: 0.0,
             temperature: 0.0,
 
-            // Vignette (subtle by default)
-            vignette_enabled: false,
-            vignette_intensity: 0.3,
-            vignette_smoothness: 0.5,
+            // Vignette
+            vignette_enabled: true,
+            vignette_intensity: 0.30,
+            vignette_smoothness: 0.35,
 
             // Bloom
-            bloom_enabled: false,
-            bloom_intensity: 0.5,
-            bloom_threshold: 0.8,
+            bloom_enabled: true,
+            bloom_intensity: 0.40,
+            bloom_threshold: 0.85,
 
             // Chromatic aberration
-            chromatic_aberration_enabled: false,
-            chromatic_aberration_intensity: 0.005,
+            chromatic_aberration_enabled: true,
+            chromatic_aberration_intensity: 0.0065,
 
             // Anamorphic streaks (cyan tint by default for sci-fi look)
-            streaks_enabled: false,
-            streaks_intensity: 0.5,
-            streaks_threshold: 0.7,
+            streaks_enabled: true,
+            streaks_intensity: 0.25,
+            streaks_threshold: 0.70,
             streaks_tint: [0.6, 0.8, 1.0], // Slight cyan/blue tint
         }
     }

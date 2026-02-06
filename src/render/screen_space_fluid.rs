@@ -10,10 +10,11 @@
 use crate::render::camera::GpuCameraParams;
 use crate::render::environment::load_embedded_environment_map;
 use crate::simulation::SphParticle3D;
+use crate::state::GpuLightParams;
 use wgpu::util::DeviceExt;
 
 // Compile-time size assertions for debugging
-const _: () = assert!(std::mem::size_of::<GpuCameraParams>() == 272, "GpuCameraParams must be 272 bytes");
+const _: () = assert!(std::mem::size_of::<GpuCameraParams>() == 288, "GpuCameraParams must be 288 bytes");
 const _: () = assert!(std::mem::size_of::<GpuWaterParams>() == 160, "GpuWaterParams must be 160 bytes");
 const _: () = assert!(std::mem::size_of::<GpuBlurParams>() == 48, "GpuBlurParams must be 48 bytes (WGSL std140)");
 const _: () = assert!(std::mem::size_of::<GpuFluidParams>() == 80, "GpuFluidParams must be 80 bytes");
@@ -87,6 +88,7 @@ pub struct ScreenSpaceFluidRenderer {
     blur_params_buffer_v: wgpu::Buffer,
     flow_params_buffer: wgpu::Buffer,  // Separate params for curvature flow (different dt)
     water_params_buffer: wgpu::Buffer,
+    light_params_buffer: wgpu::Buffer,
 
     // Pipelines
     depth_pipeline: wgpu::RenderPipeline,
@@ -220,6 +222,23 @@ impl ScreenSpaceFluidRenderer {
         let water_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SS Water Params Buffer"),
             contents: bytemuck::bytes_of(&water_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Default light parameters
+        let light_params = GpuLightParams {
+            sun_direction: [0.5, 0.8, 0.3],
+            sun_enabled: 1,
+            sun_color: [1.0, 0.95, 0.85],
+            sun_intensity: 2.0,
+            specular_power: 128.0,
+            _pad0: [0.0; 3],
+            _padding: [0.0; 3],
+            _pad1: 0.0,
+        };
+        let light_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SS Light Params Buffer"),
+            contents: bytemuck::bytes_of(&light_params),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -394,6 +413,17 @@ impl ScreenSpaceFluidRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Light params (binding 6)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<GpuLightParams>() as u64),
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -540,6 +570,10 @@ impl ScreenSpaceFluidRenderer {
                     binding: 5,
                     resource: wgpu::BindingResource::Sampler(&env_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: light_params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -563,6 +597,7 @@ impl ScreenSpaceFluidRenderer {
             blur_params_buffer_v,
             flow_params_buffer,
             water_params_buffer,
+            light_params_buffer,
             depth_pipeline,
             bilateral_blur_pipeline,
             curvature_flow_pipeline,
@@ -584,6 +619,10 @@ impl ScreenSpaceFluidRenderer {
 
     pub fn update_camera(&self, queue: &wgpu::Queue, params: &GpuCameraParams) {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn update_light_params(&self, queue: &wgpu::Queue, params: &GpuLightParams) {
+        queue.write_buffer(&self.light_params_buffer, 0, bytemuck::bytes_of(params));
     }
 
     pub fn update_params(
@@ -742,6 +781,10 @@ impl ScreenSpaceFluidRenderer {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::Sampler(&self.env_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.light_params_buffer.as_entire_binding(),
                 },
             ],
         });

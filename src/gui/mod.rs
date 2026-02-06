@@ -192,6 +192,47 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
 
             ui.add_space(8.0);
 
+            // Lighting controls
+            ui.collapsing("Lighting", |ui| {
+                ui.checkbox(&mut state.lighting.sun_enabled, "Enable Sun Light");
+
+                if state.lighting.sun_enabled {
+                    ui.add_space(8.0);
+
+                    ui.label("Sun Direction:");
+                    ui.add(
+                        egui::Slider::new(&mut state.lighting.sun_direction[0], -1.0..=1.0)
+                            .text("X")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.lighting.sun_direction[1], 0.0..=1.0)
+                            .text("Y (up)")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.lighting.sun_direction[2], -1.0..=1.0)
+                            .text("Z")
+                    );
+
+                    ui.add_space(8.0);
+                    ui.label("Sun Color:");
+                    egui::color_picker::color_edit_button_rgb(ui, &mut state.lighting.sun_color);
+
+                    ui.add(
+                        egui::Slider::new(&mut state.lighting.sun_intensity, 0.0..=5.0)
+                            .text("Intensity")
+                    );
+
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Slider::new(&mut state.lighting.specular_power, 16.0..=512.0)
+                            .text("Specular Sharpness")
+                            .logarithmic(true)
+                    );
+                }
+            });
+
+            ui.add_space(8.0);
+
             // Post-processing controls
             ui.collapsing("Post Processing", |ui| {
                 ui.checkbox(&mut state.post_process.enabled, "Enable Post Processing");
@@ -297,6 +338,25 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         state.post_process.reset_defaults();
                     }
                 }
+            });
+
+            ui.add_space(8.0);
+
+            // Quality settings
+            ui.collapsing("Quality", |ui| {
+                ui.label("Anti-Aliasing (MSAA):");
+                ui.horizontal(|ui| {
+                    use crate::state::MsaaSamples;
+                    for option in [MsaaSamples::Off, MsaaSamples::X2, MsaaSamples::X4, MsaaSamples::X8] {
+                        if ui.selectable_label(state.quality.msaa == option, option.label()).clicked() {
+                            state.quality.msaa = option;
+                        }
+                    }
+                });
+                ui.label("(Requires restart to take effect)");
+
+                ui.add_space(8.0);
+                ui.checkbox(&mut state.quality.fxaa_enabled, "FXAA (Post-Process AA)");
             });
 
             ui.add_space(16.0);

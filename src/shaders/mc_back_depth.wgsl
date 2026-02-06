@@ -7,7 +7,11 @@ struct CameraParams {
     inv_view: mat4x4<f32>,
     inv_projection: mat4x4<f32>,
     camera_pos: vec3<f32>,
-    _padding: f32,
+    near: f32,
+    far: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 struct Vertex {

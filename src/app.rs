@@ -144,6 +144,7 @@ impl App {
             ss_renderer.env_sampler(),
             gpu.config.width,
             gpu.config.height,
+            self.state.quality.msaa.as_u32(),
         );
 
         // Create wireframe renderer for container visualization
@@ -287,6 +288,12 @@ impl ApplicationHandler for App {
                     }
                     if let Some(ss_renderer) = &mut self.ss_renderer {
                         ss_renderer.resize(&gpu.device, new_size.width, new_size.height);
+                    }
+                    if let Some(mc_renderer) = &mut self.mc_renderer {
+                        mc_renderer.resize(&gpu.device, new_size.width, new_size.height);
+                    }
+                    if let Some(pp_renderer) = &mut self.post_process_renderer {
+                        pp_renderer.resize(&gpu.device, new_size.width, new_size.height);
                     }
                 }
             }
@@ -562,6 +569,7 @@ impl App {
                     if let Some(ss_renderer) = &self.ss_renderer {
                         let camera_params = self.camera.to_gpu_params();
                         ss_renderer.update_camera(&gpu.queue, &camera_params);
+                        ss_renderer.update_light_params(&gpu.queue, &self.state.lighting.to_gpu_params());
                         // Identity scene rotation (camera orbits, scene stays fixed)
                         let identity = [
                             [1.0, 0.0, 0.0, 0.0],
@@ -614,6 +622,7 @@ impl App {
 
                         let camera_params = self.camera.to_gpu_params();
                         mc_renderer.update_camera(&gpu.queue, &camera_params);
+                        mc_renderer.update_light_params(&gpu.queue, &self.state.lighting.to_gpu_params());
                         mc_renderer.update_water_params(
                             &gpu.queue,
                             &self.state.rendering.particle_color,
@@ -648,7 +657,7 @@ impl App {
             if let Some(pp) = &self.post_process_renderer {
                 let pp_params = self.state.post_process.to_gpu_params();
                 pp.update_params(&gpu.queue, &pp_params);
-                pp.render(&mut encoder, &view, self.state.post_process.bloom_enabled, self.state.post_process.streaks_enabled);
+                pp.render(&mut encoder, &view, self.state.post_process.bloom_enabled, self.state.post_process.streaks_enabled, self.state.quality.fxaa_enabled);
             }
         }
 

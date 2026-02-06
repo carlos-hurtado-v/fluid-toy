@@ -28,9 +28,26 @@ pub struct AppState {
     pub container: ContainerConfig,
     pub sph: SphConfig,
     pub rendering: RenderConfig,
+    pub lighting: LightingConfig,
+    pub quality: QualityConfig,
     pub post_process: PostProcessConfig,
     pub camera: CameraConfig,
     pub runtime: RuntimeState,
+}
+
+/// Lighting configuration
+#[derive(Debug, Clone)]
+pub struct LightingConfig {
+    /// Enable directional light (sun)
+    pub sun_enabled: bool,
+    /// Sun direction (normalized, points toward the sun)
+    pub sun_direction: [f32; 3],
+    /// Sun color (RGB, can be > 1 for HDR)
+    pub sun_color: [f32; 3],
+    /// Sun intensity multiplier
+    pub sun_intensity: f32,
+    /// Specular power (shininess) for water highlights
+    pub specular_power: f32,
 }
 
 /// Simulation parameters - physics configuration
@@ -108,6 +125,48 @@ pub struct RenderConfig {
     pub ripple_strength: f32,
 }
 
+/// MSAA sample count options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsaaSamples {
+    Off = 1,
+    X2 = 2,
+    X4 = 4,
+    X8 = 8,
+}
+
+impl MsaaSamples {
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MsaaSamples::Off => "Off",
+            MsaaSamples::X2 => "2x",
+            MsaaSamples::X4 => "4x",
+            MsaaSamples::X8 => "8x",
+        }
+    }
+}
+
+/// Quality settings for rendering
+#[derive(Debug, Clone)]
+pub struct QualityConfig {
+    /// MSAA sample count
+    pub msaa: MsaaSamples,
+    /// FXAA (Fast Approximate Anti-Aliasing) - post-process AA
+    pub fxaa_enabled: bool,
+}
+
+impl Default for QualityConfig {
+    fn default() -> Self {
+        Self {
+            msaa: MsaaSamples::X4,  // 4x MSAA by default
+            fxaa_enabled: true,     // FXAA enabled by default
+        }
+    }
+}
+
 /// Camera configuration for 3D viewing
 #[derive(Debug, Clone)]
 pub struct CameraConfig {
@@ -141,9 +200,41 @@ impl Default for AppState {
             container: ContainerConfig::default(),
             sph: SphConfig::default(),
             rendering: RenderConfig::default(),
+            lighting: LightingConfig::default(),
+            quality: QualityConfig::default(),
             post_process: PostProcessConfig::default(),
             camera: CameraConfig::default(),
             runtime: RuntimeState::default(),
+        }
+    }
+}
+
+impl Default for LightingConfig {
+    fn default() -> Self {
+        // Default sun position: upper-right-front, warm sunlight color
+        Self {
+            sun_enabled: true,
+            sun_direction: [0.5, 0.8, 0.3],  // Will be normalized in shader
+            sun_color: [1.0, 0.95, 0.85],    // Warm white sunlight
+            sun_intensity: 2.0,
+            specular_power: 128.0,           // Sharp highlights for water
+        }
+    }
+}
+
+impl LightingConfig {
+    pub fn reset_defaults(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Get normalized sun direction
+    pub fn sun_direction_normalized(&self) -> [f32; 3] {
+        let [x, y, z] = self.sun_direction;
+        let len = (x * x + y * y + z * z).sqrt();
+        if len > 0.0001 {
+            [x / len, y / len, z / len]
+        } else {
+            [0.0, 1.0, 0.0]
         }
     }
 }
@@ -633,6 +724,37 @@ impl ContainerConfig {
             rotation_row0,
             rotation_row1,
             rotation_row2,
+        }
+    }
+}
+
+/// GPU-compatible lighting parameters
+/// Note: WGSL vec3<f32> has 16-byte alignment, so we need explicit padding
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuLightParams {
+    pub sun_direction: [f32; 3],   // 12 bytes, offset 0
+    pub sun_enabled: u32,           // 4 bytes, offset 12
+    pub sun_color: [f32; 3],        // 12 bytes, offset 16
+    pub sun_intensity: f32,         // 4 bytes, offset 28
+    pub specular_power: f32,        // 4 bytes, offset 32
+    pub _pad0: [f32; 3],            // 12 bytes, offset 36 (aligns _padding to offset 48)
+    pub _padding: [f32; 3],         // 12 bytes, offset 48 (matches WGSL vec3 alignment)
+    pub _pad1: f32,                 // 4 bytes, offset 60 (struct padding to reach 64)
+}
+// Total: 64 bytes (matches WGSL struct alignment)
+
+impl LightingConfig {
+    pub fn to_gpu_params(&self) -> GpuLightParams {
+        GpuLightParams {
+            sun_direction: self.sun_direction_normalized(),
+            sun_enabled: if self.sun_enabled { 1 } else { 0 },
+            sun_color: self.sun_color,
+            sun_intensity: self.sun_intensity,
+            specular_power: self.specular_power,
+            _pad0: [0.0; 3],
+            _padding: [0.0; 3],
+            _pad1: 0.0,
         }
     }
 }
