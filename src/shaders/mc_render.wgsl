@@ -17,15 +17,19 @@ struct CameraParams {
 struct WaterParams {
     water_color: vec3<f32>,
     specular_power: f32,
-    ior: f32,  // Index of refraction (water = 1.333)
+    ior: f32,
     refraction_strength: f32,
     ripple_scale: f32,
     ripple_strength: f32,
     env_intensity: f32,
-    use_env_background: u32,  // 1 = HDR environment, 0 = solid color
+    use_env_background: u32,
     background_r: f32,
     background_g: f32,
     background_b: f32,
+    time: f32,
+    deep_color_r: f32,
+    deep_color_g: f32,
+    deep_color_b: f32,
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
@@ -92,34 +96,35 @@ fn noise(p: vec2<f32>) -> f32 {
 
 // Compute procedural normal perturbation for water surface detail
 // Uses sum of directional sine waves with analytic gradients
-fn surface_detail_normal(world_pos: vec3<f32>, base_normal: vec3<f32>, scale: f32, strength: f32) -> vec3<f32> {
+fn surface_detail_normal(world_pos: vec3<f32>, base_normal: vec3<f32>, scale: f32, strength: f32, time: f32) -> vec3<f32> {
     let p = world_pos.xz * scale;
+    let t = time * 0.5;
 
-    // Sum of directional sine waves (capillary ripples)
-    // Analytic gradient: d/dp [A*sin(dot(p,k))] = A*cos(dot(p,k))*k
+    // Sum of directional sine waves (capillary ripples) with time-based animation
+    // Analytic gradient: d/dp [A*sin(dot(p,k) + phase)] = A*cos(dot(p,k) + phase)*k
     var grad = vec2<f32>(0.0, 0.0);
 
     // Low-frequency swell
     let k0 = vec2<f32>(1.31, 0.97);
-    grad += 0.040 * cos(dot(p, k0)) * k0;
+    grad += 0.040 * cos(dot(p, k0) + t * 0.7) * k0;
     let k1 = vec2<f32>(-1.07, 1.43);
-    grad += 0.035 * cos(dot(p, k1)) * k1;
+    grad += 0.035 * cos(dot(p, k1) - t * 0.5) * k1;
 
     // Medium-frequency ripples
     let k2 = vec2<f32>(2.71, -1.83);
-    grad += 0.025 * cos(dot(p, k2)) * k2;
+    grad += 0.025 * cos(dot(p, k2) + t * 1.1) * k2;
     let k3 = vec2<f32>(-1.67, -2.31);
-    grad += 0.020 * cos(dot(p, k3)) * k3;
+    grad += 0.020 * cos(dot(p, k3) - t * 0.8) * k3;
 
     // High-frequency capillary detail
     let k4 = vec2<f32>(4.37, 1.51);
-    grad += 0.015 * cos(dot(p, k4)) * k4;
+    grad += 0.015 * cos(dot(p, k4) + t * 1.5) * k4;
     let k5 = vec2<f32>(-2.17, 3.93);
-    grad += 0.012 * cos(dot(p, k5)) * k5;
+    grad += 0.012 * cos(dot(p, k5) - t * 1.3) * k5;
     let k6 = vec2<f32>(3.91, -3.17);
-    grad += 0.010 * cos(dot(p, k6)) * k6;
+    grad += 0.010 * cos(dot(p, k6) + t * 1.7) * k6;
     let k7 = vec2<f32>(-4.53, -1.79);
-    grad += 0.008 * cos(dot(p, k7)) * k7;
+    grad += 0.008 * cos(dot(p, k7) - t * 1.1) * k7;
 
     // Modulate amplitude with noise to break repetition
     let n = noise(p * 0.5) * 0.4;
@@ -187,7 +192,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
 
     // Add procedural surface detail to break up the polygonal look
     if (water.ripple_strength > 0.001) {
-        normal = surface_detail_normal(input.world_position, normal, water.ripple_scale, water.ripple_strength);
+        normal = surface_detail_normal(input.world_position, normal, water.ripple_scale, water.ripple_strength, water.time);
     }
 
     // === THICKNESS CALCULATION ===
@@ -221,6 +226,10 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         reflection_color = sample_environment(reflect_dir) * water.env_intensity;
     }
 
+    // Apply partial absorption to reflections (light enters, scatters internally, exits)
+    let reflection_absorption = exp(-absorption_coeffs * density * thickness * 0.3);
+    reflection_color *= mix(vec3<f32>(1.0), reflection_absorption, 0.5);
+
     // === SCREEN-SPACE REFRACTION ===
     // Transform normal to view space for screen-space distortion
     let normal_view = (camera.view * vec4<f32>(normal, 0.0)).xyz;
@@ -238,21 +247,29 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     refracted_background = refracted_background * transmittance;
 
     // Deep water color (what you see when looking deep)
-    let deep_color = vec3<f32>(0.01, 0.04, 0.1);
+    let deep_color = vec3<f32>(water.deep_color_r, water.deep_color_g, water.deep_color_b);
 
     // Blend between refracted background and deep water based on thickness
     let depth_blend = 1.0 - exp(-thickness * 0.6);
     let water_interior = mix(refracted_background, deep_color, depth_blend);
 
     // Add water's own color contribution (subsurface scattering approximation)
-    let scatter_color = water.water_color * 0.1;
+    let scatter_strength = 0.3 * (1.0 - exp(-thickness * 1.5));
+    let scatter_color = water.water_color * scatter_strength;
     let interior_with_scatter = water_interior + scatter_color * (1.0 - transmittance);
 
     // Fresnel (Schlick approximation) - controls reflection vs transmission
     // F0 = ((n1 - n2) / (n1 + n2))^2 where n1=1.0 (air), n2=IOR (water)
     let cos_theta = max(0.0, dot(normal, view_dir));
     let F0 = pow((water.ior - 1.0) / (water.ior + 1.0), 2.0);  // ~0.02 for water
-    let fresnel = clamp(F0 + (1.0 - F0) * pow(1.0 - cos_theta, 5.0), 0.0, 1.0);
+    var fresnel = clamp(F0 + (1.0 - F0) * pow(1.0 - cos_theta, 5.0), 0.0, 1.0);
+
+    // Total internal reflection — at extreme grazing angles, all light reflects
+    let sin_theta_sq = 1.0 - cos_theta * cos_theta;
+    let sin_refracted_sq = sin_theta_sq / (water.ior * water.ior);
+    if (sin_refracted_sq > 1.0) {
+        fresnel = 1.0;
+    }
 
     // === DIRECTIONAL LIGHT (SUN) ===
     var sun_specular = vec3<f32>(0.0);
@@ -271,12 +288,12 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         // Subsurface illumination — light enters water, scatters, exits toward viewer
         let light_entering = NdotL * (1.0 - fresnel);
         let interior_glow = water.water_color * transmittance;
-        sun_subsurface = interior_glow * light_entering * light.sun_color * light.sun_intensity * 0.25;
+        sun_subsurface = interior_glow * light_entering * light.sun_color * light.sun_intensity * 0.4;
 
         // Forward scattering — thin areas glow when backlit (translucency)
         let VdotL = max(0.0, dot(-view_dir, light_dir));
         let forward_scatter = pow(VdotL, 4.0) * exp(-thickness * 2.0);
-        sun_subsurface += water.water_color * forward_scatter * light.sun_color * light.sun_intensity * 0.15;
+        sun_subsurface += water.water_color * forward_scatter * light.sun_color * light.sun_intensity * 0.25;
     }
 
     // Add sun subsurface to interior (before Fresnel blend, it's inside the water)
@@ -290,11 +307,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     // Add specular on top (pure surface reflection, independent of interior)
     color += sun_specular;
 
-    // Tone mapping (Reinhard)
-    color = color / (color + vec3<f32>(1.0));
-
-    // Gamma correction
-    color = pow(color, vec3<f32>(1.0 / 2.2));
+    // Output linear HDR — post-process pipeline handles tone mapping + gamma
 
     return vec4<f32>(color, 1.0);
 }

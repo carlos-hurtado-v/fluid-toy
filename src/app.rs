@@ -799,6 +799,7 @@ impl App {
             let instant_fps = 1.0 / delta;
             self.state.runtime.fps = self.state.runtime.fps * 0.9 + instant_fps * 0.1;
         }
+        self.state.runtime.time_elapsed += delta;
 
         let window = self.window.as_ref().unwrap();
         let egui_winit = self.egui_winit.as_mut().unwrap();
@@ -1154,6 +1155,9 @@ impl App {
                             self.state.environment.environment_intensity,
                             use_env,
                             &self.state.environment.background_color,
+                            self.state.runtime.time_elapsed,
+                            self.state.rendering.refraction_strength,
+                            &self.state.rendering.deep_water_color,
                         );
                         let env_params = self.state.environment.to_gpu_params();
                         mc_renderer.update_env_params(&gpu.queue, &env_params);

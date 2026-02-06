@@ -38,7 +38,7 @@ pub struct GpuGridParams {
 pub struct GpuWaterParams {
     pub water_color: [f32; 3],
     pub specular_power: f32,
-    pub ior: f32,  // Index of refraction (water = 1.333)
+    pub ior: f32,
     pub refraction_strength: f32,
     pub ripple_scale: f32,
     pub ripple_strength: f32,
@@ -47,6 +47,10 @@ pub struct GpuWaterParams {
     pub background_r: f32,
     pub background_g: f32,
     pub background_b: f32,
+    pub time: f32,
+    pub deep_color_r: f32,
+    pub deep_color_g: f32,
+    pub deep_color_b: f32,
     pub _pad: [f32; 3],
 }
 
@@ -55,15 +59,19 @@ impl Default for GpuWaterParams {
         Self {
             water_color: [0.1, 0.4, 0.8],
             specular_power: 64.0,
-            ior: 1.333,  // Water
-            refraction_strength: 0.05,
-            ripple_scale: 25.0,
-            ripple_strength: 0.05,
+            ior: 1.333,
+            refraction_strength: 0.15,
+            ripple_scale: 15.0,
+            ripple_strength: 0.4,
             env_intensity: 1.0,
             use_env_background: 1,
             background_r: 0.15,
             background_g: 0.15,
             background_b: 0.2,
+            time: 0.0,
+            deep_color_r: 0.01,
+            deep_color_g: 0.04,
+            deep_color_b: 0.1,
             _pad: [0.0; 3],
         }
     }
@@ -1194,7 +1202,19 @@ impl MarchingCubesRenderer {
     }
 
     /// Update water shading parameters
-    pub fn update_water_params(&self, queue: &wgpu::Queue, water_color: &[f32; 3], ripple_scale: f32, ripple_strength: f32, env_intensity: f32, use_env_background: bool, background_color: &[f32; 3]) {
+    pub fn update_water_params(
+        &self,
+        queue: &wgpu::Queue,
+        water_color: &[f32; 3],
+        ripple_scale: f32,
+        ripple_strength: f32,
+        env_intensity: f32,
+        use_env_background: bool,
+        background_color: &[f32; 3],
+        time: f32,
+        refraction_strength: f32,
+        deep_color: &[f32; 3],
+    ) {
         let params = GpuWaterParams {
             water_color: *water_color,
             ripple_scale,
@@ -1204,6 +1224,11 @@ impl MarchingCubesRenderer {
             background_r: background_color[0],
             background_g: background_color[1],
             background_b: background_color[2],
+            time,
+            refraction_strength,
+            deep_color_r: deep_color[0],
+            deep_color_g: deep_color[1],
+            deep_color_b: deep_color[2],
             ..Default::default()
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));

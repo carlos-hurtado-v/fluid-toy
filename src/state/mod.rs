@@ -179,6 +179,10 @@ pub struct RenderConfig {
     pub ripple_strength: f32,
     /// Marching cubes iso-value threshold (lower = shows smaller droplets but blobbier surface)
     pub mc_iso_value: f32,
+    /// Refraction strength - how much the background distorts through water
+    pub refraction_strength: f32,
+    /// Deep water color - what you see looking into deep water
+    pub deep_water_color: [f32; 3],
 }
 
 /// MSAA sample count options
@@ -580,9 +584,11 @@ impl Default for RenderConfig {
             particle_color: [0.2, 0.4, 0.9],
             color_by_velocity: true,
             render_mode: FluidRenderMode::ScreenSpace,
-            ripple_scale: 10.0,
-            ripple_strength: 0.25,
+            ripple_scale: 15.0,
+            ripple_strength: 0.4,
             mc_iso_value: 500.0,
+            refraction_strength: 0.15,
+            deep_water_color: [0.01, 0.04, 0.1],
         }
     }
 }
