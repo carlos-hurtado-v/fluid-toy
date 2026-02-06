@@ -177,6 +177,7 @@ impl App {
         );
         let rigid_body_renderer = RigidBodyRenderer::new(
             &gpu.device,
+            &gpu.queue,
             gpu.config.format,
             &camera_params,
             &rb_render_params,
@@ -714,12 +715,14 @@ impl App {
             if let Some(wireframe) = &self.wireframe_renderer {
                 wireframe.update_camera(&gpu.queue, &camera_params);
             }
-            if let Some(rb_renderer) = &self.rigid_body_renderer {
+            if let Some(rb_renderer) = &mut self.rigid_body_renderer {
                 rb_renderer.update_camera(&gpu.queue, &camera_params);
                 let rb_render = self.state.rigid_body.to_gpu_render(
                     self.state.lighting.sun_direction_normalized(),
                 );
                 rb_renderer.update_params(&gpu.queue, &rb_render);
+                rb_renderer.set_shape(self.state.rigid_body.shape);
+                rb_renderer.set_vertex_count(self.state.rigid_body.shape.vertex_count());
             }
             if let Some(spray_renderer) = &self.spray_renderer {
                 spray_renderer.update_camera(&gpu.queue, &camera_params);
@@ -881,7 +884,7 @@ impl App {
                 ];
 
                 let he = self.state.rigid_body.half_extent;
-                let volume = (2.0 * he) * (2.0 * he) * (2.0 * he);
+                let volume = self.state.rigid_body.shape.volume(he);
                 let body_mass = self.state.rigid_body.density * volume;
                 let gravity = self.state.simulation.gravity_vector();
                 let dt = self.state.simulation.delta_time;
@@ -913,8 +916,7 @@ impl App {
                         accum.torque_y as f32 / 1000.0,
                         accum.torque_z as f32 / 1000.0,
                     ];
-                    let side = 2.0 * he;
-                    let inertia = (1.0 / 6.0) * body_mass * side * side;
+                    let inertia = self.state.rigid_body.shape.moment_of_inertia(body_mass, he);
 
                     if inertia > 0.0 {
                         let mut dw = [0.0f32; 3];

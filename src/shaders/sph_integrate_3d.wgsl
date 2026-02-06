@@ -52,13 +52,19 @@ struct MouseForce {
     _padding: vec2<f32>,
 }
 
+const SHAPE_CUBE: u32 = 0u;
+const SHAPE_SPHERE: u32 = 1u;
+const SHAPE_CYLINDER: u32 = 2u;
+const SHAPE_TORUS: u32 = 3u;
+const SHAPE_CUSTOM: u32 = 4u;
+
 struct RigidBody {
     position: vec3<f32>,
     half_extent: f32,
     velocity: vec3<f32>,
     is_active: u32,
     stiffness: f32,
-    _pad0: f32,
+    shape: u32,
     _pad1: f32,
     _pad2: f32,
     rot_row0: vec4<f32>,
@@ -177,32 +183,97 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
 
-    // Rigid body penalty forces (oriented box SDF)
+    // Rigid body penalty forces (per-shape SDF)
     if (rigid_body.is_active != 0u) {
         // Transform particle position to body-local frame
         let world_rel = pos - rigid_body.position;
-        let local_pos = vec3<f32>(
+        let rb_local = vec3<f32>(
             dot(rigid_body.rot_row0.xyz, world_rel),
             dot(rigid_body.rot_row1.xyz, world_rel),
             dot(rigid_body.rot_row2.xyz, world_rel),
         );
 
-        // Axis-aligned box SDF in local space
-        let d = abs(local_pos) - vec3<f32>(rigid_body.half_extent);
-        let sdf = max(d.x, max(d.y, d.z));
+        let he = rigid_body.half_extent;
+        var sdf: f32;
+        var local_normal = vec3<f32>(0.0);
+
+        switch (rigid_body.shape) {
+            case SHAPE_SPHERE: {
+                // Sphere SDF: distance from origin minus radius
+                let dist = length(rb_local);
+                sdf = dist - he;
+                if (dist > 0.001) {
+                    local_normal = rb_local / dist;
+                } else {
+                    local_normal = vec3<f32>(0.0, 1.0, 0.0);
+                }
+            }
+            case SHAPE_CYLINDER: {
+                // Capped cylinder: radius=he, height=2*he (y-axis)
+                let radial_dist = length(rb_local.xz);
+                let d_radial = radial_dist - he;
+                let d_cap = abs(rb_local.y) - he;
+                sdf = max(d_radial, d_cap);
+
+                if (d_radial > d_cap) {
+                    // Closest to barrel
+                    if (radial_dist > 0.001) {
+                        local_normal = vec3<f32>(rb_local.x / radial_dist, 0.0, rb_local.z / radial_dist);
+                    } else {
+                        local_normal = vec3<f32>(1.0, 0.0, 0.0);
+                    }
+                } else {
+                    // Closest to cap
+                    local_normal = vec3<f32>(0.0, sign(rb_local.y), 0.0);
+                }
+            }
+            case SHAPE_TORUS: {
+                // Torus: major_radius=he, minor_radius=0.3*he
+                let minor_r = he * 0.3;
+                let xz_len = length(rb_local.xz);
+                let q = vec2<f32>(xz_len - he, rb_local.y);
+                sdf = length(q) - minor_r;
+
+                // Normal: direction from nearest point on ring to particle
+                let q_len = length(q);
+                if (q_len > 0.001 && xz_len > 0.001) {
+                    let ring_dir = vec2<f32>(q.x, q.y) / q_len;
+                    local_normal = vec3<f32>(
+                        ring_dir.x * rb_local.x / xz_len,
+                        ring_dir.y,
+                        ring_dir.x * rb_local.z / xz_len,
+                    );
+                } else {
+                    local_normal = vec3<f32>(0.0, 1.0, 0.0);
+                }
+            }
+            case SHAPE_CUSTOM: {
+                // Bounding sphere approximation for custom mesh
+                let dist = length(rb_local);
+                sdf = dist - he;
+                if (dist > 0.001) {
+                    local_normal = rb_local / dist;
+                } else {
+                    local_normal = vec3<f32>(0.0, 1.0, 0.0);
+                }
+            }
+            default: {
+                // Cube SDF: axis-aligned box
+                let d = abs(rb_local) - vec3<f32>(he);
+                sdf = max(d.x, max(d.y, d.z));
+                if (d.x >= d.y && d.x >= d.z) {
+                    local_normal = vec3<f32>(sign(rb_local.x), 0.0, 0.0);
+                } else if (d.y >= d.x && d.y >= d.z) {
+                    local_normal = vec3<f32>(0.0, sign(rb_local.y), 0.0);
+                } else {
+                    local_normal = vec3<f32>(0.0, 0.0, sign(rb_local.z));
+                }
+            }
+        }
+
         let interact_range = params.kernel_radius * 0.7;
 
         if (sdf < interact_range) {
-            // Outward normal in local space
-            var local_normal = vec3<f32>(0.0);
-            if (d.x >= d.y && d.x >= d.z) {
-                local_normal.x = sign(local_pos.x);
-            } else if (d.y >= d.x && d.y >= d.z) {
-                local_normal.y = sign(local_pos.y);
-            } else {
-                local_normal.z = sign(local_pos.z);
-            }
-
             // Transform normal from local to world (transpose multiply)
             let normal = vec3<f32>(
                 rigid_body.rot_row0.x * local_normal.x + rigid_body.rot_row1.x * local_normal.y + rigid_body.rot_row2.x * local_normal.z,

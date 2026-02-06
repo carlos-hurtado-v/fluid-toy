@@ -6,6 +6,7 @@ pub mod marching_cubes;
 pub mod mc_tables;
 pub mod particle_renderer_3d;
 pub mod post_process;
+pub mod mesh_loader;
 pub mod rigid_body_renderer;
 pub mod spray_renderer;
 pub mod wireframe;

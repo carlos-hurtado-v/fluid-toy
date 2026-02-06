@@ -1,6 +1,6 @@
 //! GUI module - egui integration for parameter control
 
-use crate::state::{AppState, BackgroundMode, FluidRenderMode, HdrEnvironment, SimulationConfig};
+use crate::state::{AppState, BackgroundMode, FluidRenderMode, HdrEnvironment, RigidBodyShape, SimulationConfig};
 
 /// Renders the control panel and returns any triggered action
 pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAction {
@@ -118,6 +118,16 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.checkbox(&mut state.rigid_body.enabled, "Enable");
 
                 if state.rigid_body.enabled {
+                    ui.add_space(4.0);
+                    ui.label("Shape:");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut state.rigid_body.shape, RigidBodyShape::Cube, "Cube");
+                        ui.selectable_value(&mut state.rigid_body.shape, RigidBodyShape::Sphere, "Sphere");
+                        ui.selectable_value(&mut state.rigid_body.shape, RigidBodyShape::Cylinder, "Cylinder");
+                        ui.selectable_value(&mut state.rigid_body.shape, RigidBodyShape::Torus, "Torus");
+                        ui.selectable_value(&mut state.rigid_body.shape, RigidBodyShape::Custom, "Duck");
+                    });
+
                     ui.add_space(4.0);
                     ui.checkbox(&mut state.rigid_body.held, "Held (manual position)");
 

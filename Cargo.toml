@@ -12,6 +12,7 @@ env_logger = "0.11"
 log = "0.4"
 image = { version = "0.25", features = ["hdr"] }
 half = "2.4"
+gltf = "1"
 
 # GUI
 egui = "0.33"

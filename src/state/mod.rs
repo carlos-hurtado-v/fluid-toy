@@ -63,6 +63,84 @@ pub struct AppState {
     pub runtime: RuntimeState,
 }
 
+/// Rigid body shape types (repr matches GPU constants)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RigidBodyShape {
+    Cube = 0,
+    Sphere = 1,
+    Cylinder = 2,
+    Torus = 3,
+    Custom = 4,
+}
+
+impl RigidBodyShape {
+    /// Number of vertices for the procedural mesh
+    pub fn vertex_count(self) -> u32 {
+        match self {
+            RigidBodyShape::Cube => 36,        // 6 faces × 2 tri × 3 verts
+            RigidBodyShape::Sphere => 3072,    // 32 slices × 16 stacks × 6
+            RigidBodyShape::Cylinder => 384,   // 32 segments: barrel(192) + 2 caps(192)
+            RigidBodyShape::Torus => 3072,     // 32 major × 16 minor × 6
+            RigidBodyShape::Custom => 0,       // Uses index buffer, not vertex_count
+        }
+    }
+
+    /// Volume of the shape given half_extent
+    pub fn volume(self, half_extent: f32) -> f32 {
+        let he = half_extent;
+        match self {
+            RigidBodyShape::Cube => {
+                let side = 2.0 * he;
+                side * side * side
+            }
+            RigidBodyShape::Sphere => {
+                (4.0 / 3.0) * std::f32::consts::PI * he * he * he
+            }
+            RigidBodyShape::Cylinder => {
+                // radius=he, height=2*he
+                std::f32::consts::PI * he * he * (2.0 * he)
+            }
+            RigidBodyShape::Torus => {
+                // major=he, minor=0.3*he
+                let small_r = he * 0.3;
+                2.0 * std::f32::consts::PI * std::f32::consts::PI * he * small_r * small_r
+            }
+            RigidBodyShape::Custom => {
+                // Approximate as sphere
+                (4.0 / 3.0) * std::f32::consts::PI * he * he * he
+            }
+        }
+    }
+
+    /// Moment of inertia for a solid body of given mass and half_extent
+    pub fn moment_of_inertia(self, mass: f32, half_extent: f32) -> f32 {
+        match self {
+            RigidBodyShape::Cube => {
+                let side = 2.0 * half_extent;
+                (1.0 / 6.0) * mass * side * side
+            }
+            RigidBodyShape::Sphere => {
+                (2.0 / 5.0) * mass * half_extent * half_extent
+            }
+            RigidBodyShape::Cylinder => {
+                // Approximate: average of axial and transverse
+                let r = half_extent;
+                let h = 2.0 * half_extent;
+                (1.0 / 12.0) * mass * (3.0 * r * r + h * h)
+            }
+            RigidBodyShape::Torus => {
+                let big_r = half_extent;
+                let small_r = half_extent * 0.3;
+                mass * (big_r * big_r + 0.75 * small_r * small_r)
+            }
+            RigidBodyShape::Custom => {
+                // Approximate as sphere
+                (2.0 / 5.0) * mass * half_extent * half_extent
+            }
+        }
+    }
+}
+
 /// Rigid body configuration
 #[derive(Debug, Clone)]
 pub struct RigidBodyConfig {
@@ -70,6 +148,8 @@ pub struct RigidBodyConfig {
     pub enabled: bool,
     /// Whether the body is held (user-positioned) or simulated
     pub held: bool,
+    /// Shape type
+    pub shape: RigidBodyShape,
     /// Position in world space
     pub position: [f32; 3],
     /// Linear velocity
@@ -78,7 +158,7 @@ pub struct RigidBodyConfig {
     pub orientation: [f32; 4],
     /// Angular velocity (world space, radians/sec)
     pub angular_velocity: [f32; 3],
-    /// Half-extent of the cube (uniform size)
+    /// Half-extent (radius for sphere/cylinder/torus, half side for cube)
     pub half_extent: f32,
     /// Body density (compared to fluid rest_density; < rest_density → floats)
     pub density: f32,
@@ -321,6 +401,7 @@ impl Default for RigidBodyConfig {
         Self {
             enabled: false,
             held: true,
+            shape: RigidBodyShape::Cube,
             position: [0.0, 0.2, 0.0],
             velocity: [0.0; 3],
             orientation: [0.0, 0.0, 0.0, 1.0],  // Identity quaternion
@@ -345,7 +426,7 @@ impl RigidBodyConfig {
             velocity: self.velocity,
             is_active: if self.enabled { 1 } else { 0 },
             stiffness: wall_stiffness,
-            _pad0: 0.0,
+            shape: self.shape as u32,
             _pad1: 0.0,
             _pad2: 0.0,
             rot_row0: rows[0],
@@ -361,7 +442,7 @@ impl RigidBodyConfig {
             half_extent: self.half_extent,
             color: [self.color[0], self.color[1], self.color[2], 1.0],
             light_dir,
-            _pad: 0.0,
+            shape: self.shape as u32,
             rot_row0: rows[0],
             rot_row1: rows[1],
             rot_row2: rows[2],
@@ -870,7 +951,7 @@ pub struct GpuRigidBody {
     pub velocity: [f32; 3],     // 12 bytes
     pub is_active: u32,         // 4 bytes  → 32
     pub stiffness: f32,         // 4 bytes
-    pub _pad0: f32,             // 4 bytes
+    pub shape: u32,             // 4 bytes
     pub _pad1: f32,             // 4 bytes
     pub _pad2: f32,             // 4 bytes  → 48
     pub rot_row0: [f32; 4],     // 16 bytes → 64
@@ -886,7 +967,7 @@ impl Default for GpuRigidBody {
             velocity: [0.0; 3],
             is_active: 0,
             stiffness: 200.0,
-            _pad0: 0.0,
+            shape: 0,
             _pad1: 0.0,
             _pad2: 0.0,
             rot_row0: [1.0, 0.0, 0.0, 0.0],
@@ -933,7 +1014,7 @@ pub struct GpuRigidBodyRender {
     pub half_extent: f32,       // 4 bytes  → 16
     pub color: [f32; 4],        // 16 bytes → 32
     pub light_dir: [f32; 3],    // 12 bytes
-    pub _pad: f32,              // 4 bytes  → 48
+    pub shape: u32,             // 4 bytes  → 48
     pub rot_row0: [f32; 4],     // 16 bytes → 64
     pub rot_row1: [f32; 4],     // 16 bytes → 80
     pub rot_row2: [f32; 4],     // 16 bytes → 96
