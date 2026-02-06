@@ -50,7 +50,7 @@ impl Default for GpuWaterParams {
             ior: 1.333,  // Water
             refraction_strength: 0.05,
             ripple_scale: 25.0,
-            ripple_strength: 0.15,
+            ripple_strength: 0.05,
         }
     }
 }
@@ -1167,15 +1167,10 @@ impl MarchingCubesRenderer {
 
     /// Update water shading parameters
     pub fn update_water_params(&self, queue: &wgpu::Queue, water_color: &[f32; 3], ripple_scale: f32, ripple_strength: f32) {
-        // MC works in world space [-1,1], so ripple parameters need scaling
-        // to match the screen-space renderer's expectations
-        let mc_ripple_scale = ripple_scale / 30.0;
-        let mc_ripple_strength = ripple_strength / 2.0;
-
         let params = GpuWaterParams {
             water_color: *water_color,
-            ripple_scale: mc_ripple_scale,
-            ripple_strength: mc_ripple_strength,
+            ripple_scale,
+            ripple_strength,
             ..Default::default()
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));

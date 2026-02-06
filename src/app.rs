@@ -626,7 +626,7 @@ impl App {
                         let iso_value = self.state.sph.rest_density * 0.3;
                         mc_renderer.update_params(
                             &gpu.queue,
-                            self.state.sph.kernel_radius * 1.5, // Slightly larger for density sampling
+                            self.state.sph.kernel_radius * 2.5, // Larger radius for smoother density field
                             iso_value,
                             sph_sim.num_particles(),
                         );
