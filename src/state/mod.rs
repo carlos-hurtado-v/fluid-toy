@@ -392,8 +392,8 @@ impl Default for SphConfig {
         Self {
             kernel_radius: 0.08,
             rest_density: 6000.0,
-            stiffness: 15.0,           // Fast pressure response for proper wave propagation
-            near_stiffness: 5.0,
+            stiffness: 7.5,            // Fast pressure response for proper wave propagation
+            near_stiffness: 0.4,
             viscosity: 20.0,           // Low enough for waves to persist
             mass: 1.0,
             wall_stiffness: 200.0,

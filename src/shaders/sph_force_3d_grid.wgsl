@@ -59,7 +59,7 @@ fn density_kernel_gradient(r: f32) -> f32 {
 }
 
 fn near_density_kernel_gradient(r: f32) -> f32 {
-    let scale = 45.0 / (PI * params.kernel_radius_pow5);
+    let scale = 45.0 / (PI * params.kernel_radius_pow6);
     let diff = params.kernel_radius - r;
     return scale * diff * diff;
 }
@@ -98,11 +98,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let density_i = max(particles[i].density, 1.0);
     let near_density_i = max(particles[i].near_density, 1.0);
 
-    let pressure_i = params.stiffness * (density_i - params.rest_density);
+    // Clamp pressure to non-negative to avoid tensile instability at the surface
+    let pressure_i = max(0.0, params.stiffness * (density_i - params.rest_density));
     let near_pressure_i = params.near_stiffness * near_density_i;
 
-    var f_pressure = vec3<f32>(0.0, 0.0, 0.0);
-    var f_viscosity = vec3<f32>(0.0, 0.0, 0.0);
+    // Accumulate acceleration (not force) using Monaghan symmetric formulation
+    var a_pressure = vec3<f32>(0.0, 0.0, 0.0);
+    var a_viscosity = vec3<f32>(0.0, 0.0, 0.0);
 
     // Iterate over 3x3x3 neighboring cells
     for (var dz = -1i; dz <= 1i; dz++) {
@@ -149,32 +151,34 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         let density_j = max(sorted_particles[j].density, 1.0);
                         let near_density_j = max(sorted_particles[j].near_density, 1.0);
 
-                        let pressure_j = params.stiffness * (density_j - params.rest_density);
+                        let pressure_j = max(0.0, params.stiffness * (density_j - params.rest_density));
                         let near_pressure_j = params.near_stiffness * near_density_j;
 
-                        let shared_pressure = (pressure_i + pressure_j) / 2.0;
-                        let near_shared_pressure = (near_pressure_i + near_pressure_j) / 2.0;
+                        // Monaghan symmetric pressure: conserves momentum exactly
+                        a_pressure += -params.mass * (pressure_i / (density_i * density_i) + pressure_j / (density_j * density_j)) * dir * density_kernel_gradient(r);
 
-                        f_pressure += -params.mass * shared_pressure * dir * density_kernel_gradient(r) / density_j;
-                        f_pressure += -params.mass * near_shared_pressure * dir * near_density_kernel_gradient(r) / near_density_j;
+                        // Near-pressure: averaged form (numerical stability tool, not physical force)
+                        a_pressure += -params.mass * (near_pressure_i + near_pressure_j) / (2.0 * density_i * near_density_j) * dir * near_density_kernel_gradient(r);
 
-                        // Extra separation force when extremely close (prevents collapse)
+                        // Extra separation acceleration when extremely close (prevents collapse)
                         if (r < min_dist) {
-                            let separation_strength = 1000.0 * (1.0 - r / min_dist);
-                            f_pressure += -separation_strength * dir;
+                            let separation_accel = 200.0 * (1.0 - r / min_dist);
+                            a_pressure += -separation_accel * dir;
                         }
 
+                        // Symmetric viscosity: m * (v_j - v_i) * lap_W / (rho_i * rho_j)
                         let vel_j = sorted_particles[j].velocity;
                         let relative_vel = vel_j - vel_i;
-                        f_viscosity += params.mass * relative_vel * viscosity_kernel_laplacian(r) / density_j;
+                        a_viscosity += params.mass * relative_vel * viscosity_kernel_laplacian(r) / (density_i * density_j);
                     }
                 }
             }
         }
     }
 
-    f_viscosity *= params.viscosity;
-    let f_gravity = density_i * gravity.direction;
+    a_viscosity *= params.viscosity;
+    let a_gravity = gravity.direction;
 
-    particles[i].force = f_pressure + f_viscosity + f_gravity;
+    // Store acceleration directly (integration shader uses it without dividing by density)
+    particles[i].force = a_pressure + a_viscosity + a_gravity;
 }

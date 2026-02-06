@@ -60,14 +60,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    // Use safety minimum for density to match force shader
-    let density = max(particles[i].density, 1.0);
     var pos = particles[i].position;
     var vel = particles[i].velocity;
-    let force = particles[i].force;
 
-    // Compute acceleration from SPH forces
-    var accel = force / density;
+    // Force field contains acceleration directly (Monaghan symmetric formulation)
+    var accel = particles[i].force;
 
     // Clamp SPH acceleration to prevent explosions from extreme pressure
     let max_accel = 200.0;
