@@ -1,5 +1,6 @@
 //! 3D SPH simulation with spatial hashing for O(n) neighbor search
 
+use crate::render::mesh_loader::SdfData;
 use crate::simulation::particle::SphParticle3D;
 use crate::state::{GpuBoundsParams3D, GpuGravity, GpuMouseForce, GpuRigidBody, GpuRigidBodyAccum, GpuSphParams3D};
 use wgpu::util::DeviceExt;
@@ -77,6 +78,10 @@ pub struct SphSimulation3DGrid {
     rigid_body_accum_staging: wgpu::Buffer,
     last_accum: GpuRigidBodyAccum,
 
+    // SDF texture for custom mesh collision (kept alive for bind group)
+    _sdf_texture: wgpu::Texture,
+    _sdf_sampler: wgpu::Sampler,
+
     // Grid dimensions
     grid_params: GpuGridParams,
     num_particles: u32,
@@ -92,6 +97,7 @@ impl SphSimulation3DGrid {
         sph_params: GpuSphParams3D,
         bounds_params: GpuBoundsParams3D,
         max_particles: u32,
+        sdf_data: Option<&SdfData>,
     ) -> Self {
         let num_particles = particles.len() as u32;
         let max_particles = max_particles.max(num_particles); // Ensure at least enough for initial particles
@@ -259,6 +265,85 @@ impl SphSimulation3DGrid {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+
+        // SDF 3D texture for custom mesh collision
+        let (sdf_texture, sdf_texture_view, sdf_sampler) = if let Some(sdf) = sdf_data {
+            let res = sdf.resolution;
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("SDF 3D Texture"),
+                size: wgpu::Extent3d { width: res, height: res, depth_or_array_layers: res },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&sdf.data),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * res),
+                    rows_per_image: Some(res),
+                },
+                wgpu::Extent3d { width: res, height: res, depth_or_array_layers: res },
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("SDF Sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            (texture, view, sampler)
+        } else {
+            // Dummy 1x1x1 texture with value 1.0 (= outside, no collision effect)
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("SDF Dummy Texture"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&[1.0f32]),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("SDF Dummy Sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            (texture, view, sampler)
+        };
 
         let grid_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Grid Params Buffer"),
@@ -788,6 +873,22 @@ impl SphSimulation3DGrid {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -814,6 +915,8 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 3, resource: mouse_force_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: rigid_body_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: rigid_body_accum_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&sdf_texture_view) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&sdf_sampler) },
             ],
         });
 
@@ -849,6 +952,8 @@ impl SphSimulation3DGrid {
             rigid_body_accum_buffer,
             rigid_body_accum_staging,
             last_accum: GpuRigidBodyAccum::default(),
+            _sdf_texture: sdf_texture,
+            _sdf_sampler: sdf_sampler,
             grid_params,
             num_particles,
             max_particles,

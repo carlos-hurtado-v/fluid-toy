@@ -49,8 +49,17 @@ struct MouseForce {
     radius: f32,
     strength: f32,
     is_active: u32,
-    _padding: vec2<f32>,
+    mode: u32,
+    _pad: f32,
+    direction: vec3<f32>,
+    _pad2: f32,
 }
+
+const FORCE_PUSH: u32 = 0u;
+const FORCE_PULL: u32 = 1u;
+const FORCE_VORTEX: u32 = 2u;
+const FORCE_EXPLODE: u32 = 3u;
+const FORCE_DRAIN: u32 = 4u;
 
 const SHAPE_CUBE: u32 = 0u;
 const SHAPE_SPHERE: u32 = 1u;
@@ -89,6 +98,8 @@ struct RigidBodyAccum {
 @group(0) @binding(3) var<uniform> mouse_force: MouseForce;
 @group(0) @binding(4) var<uniform> rigid_body: RigidBody;
 @group(0) @binding(5) var<storage, read_write> body_accum: RigidBodyAccum;
+@group(0) @binding(6) var sdf_texture: texture_3d<f32>;
+@group(0) @binding(7) var sdf_sampler: sampler;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -175,11 +186,38 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let to_mouse = mouse_force.position - pos;
         let dist = length(to_mouse);
         if (dist < mouse_force.radius && dist > 0.001) {
-            // Smooth falloff: stronger near center, weaker at edge
             let falloff = 1.0 - (dist / mouse_force.radius);
             let force_dir = normalize(to_mouse);
-            // Negative strength = repel (push away), positive = attract
-            accel += force_dir * mouse_force.strength * falloff * -1.0;
+            let s = mouse_force.strength * falloff;
+
+            switch mouse_force.mode {
+                case FORCE_PUSH, default: {
+                    // Repel from cursor
+                    accel -= force_dir * s;
+                }
+                case FORCE_PULL: {
+                    // Attract toward cursor
+                    accel += force_dir * s;
+                }
+                case FORCE_VORTEX: {
+                    // Tangential swirl around cursor ray direction
+                    let axis = normalize(mouse_force.direction);
+                    let tangent = cross(force_dir, axis);
+                    let tlen = length(tangent);
+                    if (tlen > 0.001) {
+                        accel += (tangent / tlen) * s;
+                    }
+                }
+                case FORCE_EXPLODE: {
+                    // One-shot burst outward (same direction as push, CPU handles one-shot)
+                    accel -= force_dir * s * 3.0;
+                }
+                case FORCE_DRAIN: {
+                    // Pull inward + downward (funnel)
+                    let drain_dir = normalize(force_dir + vec3<f32>(0.0, -1.0, 0.0));
+                    accel += drain_dir * s;
+                }
+            }
         }
     }
 
@@ -248,13 +286,26 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 }
             }
             case SHAPE_CUSTOM: {
-                // Bounding sphere approximation for custom mesh
-                let dist = length(rb_local);
-                sdf = dist - he;
-                if (dist > 0.001) {
-                    local_normal = rb_local / dist;
+                // Voxelized SDF from 3D texture
+                let normalized = rb_local / he;
+                let uvw = normalized * 0.5 + 0.5; // [-1,1] → [0,1]
+                let raw_sdf = textureSampleLevel(sdf_texture, sdf_sampler, uvw, 0.0).r;
+                sdf = raw_sdf * he; // Scale to world space
+
+                // Normal via central differences
+                let eps = 1.0 / 32.0; // One voxel step in texture space
+                let dx = textureSampleLevel(sdf_texture, sdf_sampler, uvw + vec3<f32>(eps, 0.0, 0.0), 0.0).r
+                       - textureSampleLevel(sdf_texture, sdf_sampler, uvw - vec3<f32>(eps, 0.0, 0.0), 0.0).r;
+                let dy = textureSampleLevel(sdf_texture, sdf_sampler, uvw + vec3<f32>(0.0, eps, 0.0), 0.0).r
+                       - textureSampleLevel(sdf_texture, sdf_sampler, uvw - vec3<f32>(0.0, eps, 0.0), 0.0).r;
+                let dz = textureSampleLevel(sdf_texture, sdf_sampler, uvw + vec3<f32>(0.0, 0.0, eps), 0.0).r
+                       - textureSampleLevel(sdf_texture, sdf_sampler, uvw - vec3<f32>(0.0, 0.0, eps), 0.0).r;
+                let grad = vec3<f32>(dx, dy, dz);
+                let grad_len = length(grad);
+                if (grad_len > 1e-6) {
+                    local_normal = grad / grad_len;
                 } else {
-                    local_normal = vec3<f32>(0.0, 1.0, 0.0);
+                    local_normal = normalize(rb_local + vec3<f32>(0.0, 1e-6, 0.0));
                 }
             }
             default: {

@@ -1,6 +1,6 @@
 //! GUI module - egui integration for parameter control
 
-use crate::state::{AppState, BackgroundMode, FluidRenderMode, HdrEnvironment, RigidBodyShape, SimulationConfig};
+use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, HdrEnvironment, RigidBodyShape, SimulationConfig};
 
 /// Renders the control panel and returns any triggered action
 pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAction {
@@ -219,6 +219,29 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.add(
                     egui::Slider::new(&mut state.sph.wall_stiffness, 50.0..=500.0)
                         .text("Wall Stiffness")
+                );
+            });
+
+            ui.add_space(8.0);
+
+            // Mouse Force controls
+            ui.collapsing("Mouse Force", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Mode:");
+                    ui.selectable_value(&mut state.mouse_force.mode, ForceMode::Push, "Push");
+                    ui.selectable_value(&mut state.mouse_force.mode, ForceMode::Pull, "Pull");
+                    ui.selectable_value(&mut state.mouse_force.mode, ForceMode::Vortex, "Vortex");
+                    ui.selectable_value(&mut state.mouse_force.mode, ForceMode::Explode, "Explode");
+                    ui.selectable_value(&mut state.mouse_force.mode, ForceMode::Drain, "Drain");
+                });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Slider::new(&mut state.mouse_force.radius, 0.1..=2.0)
+                        .text("Radius")
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.mouse_force.strength, 1.0..=100.0)
+                        .text("Strength")
                 );
             });
 

@@ -60,7 +60,36 @@ pub struct AppState {
     pub camera: CameraConfig,
     pub rigid_body: RigidBodyConfig,
     pub spray: SprayConfig,
+    pub mouse_force: MouseForceConfig,
     pub runtime: RuntimeState,
+}
+
+/// Mouse force interaction mode (repr matches GPU constants)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceMode {
+    Push = 0,
+    Pull = 1,
+    Vortex = 2,
+    Explode = 3,
+    Drain = 4,
+}
+
+/// Mouse force interaction configuration
+#[derive(Debug, Clone)]
+pub struct MouseForceConfig {
+    pub mode: ForceMode,
+    pub radius: f32,
+    pub strength: f32,
+}
+
+impl Default for MouseForceConfig {
+    fn default() -> Self {
+        Self {
+            mode: ForceMode::Push,
+            radius: 0.5,
+            strength: 30.0,
+        }
+    }
 }
 
 /// Rigid body shape types (repr matches GPU constants)
@@ -360,6 +389,7 @@ impl Default for AppState {
             camera: CameraConfig::default(),
             rigid_body: RigidBodyConfig::default(),
             spray: SprayConfig::default(),
+            mouse_force: MouseForceConfig::default(),
             runtime: RuntimeState::default(),
         }
     }
@@ -526,9 +556,9 @@ impl LightingConfig {
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            delta_time: 0.006,
+            delta_time: 0.0080,
             gravity: 9.8,
-            damping: 0.6,        // Energy retained on wall bounce
+            damping: 0.55,        // Energy retained on wall bounce
             paused: false,
             max_particles: 50_000,
             initial_cube_size: 20, // 20×20×20 = 8000 particles
@@ -660,11 +690,11 @@ impl Default for RenderConfig {
             particle_color: [0.2, 0.4, 0.9],
             color_by_velocity: true,
             render_mode: FluidRenderMode::MarchingCubes,
-            mc_iso_value: 500.0,
-            refraction_strength: 0.15,
+            mc_iso_value: 750.0,
+            refraction_strength: 0.085,
             deep_water_color: [0.01, 0.04, 0.1],
-            mc_blur_radius: 2,
-            water_roughness: 0.03,
+            mc_blur_radius: 3,
+            water_roughness: 0.15,
         }
     }
 }
@@ -691,12 +721,12 @@ impl Default for SphConfig {
         Self {
             kernel_radius: 0.08,
             rest_density: 8000.0,
-            stiffness: 40.0,
-            near_stiffness: 0.4,
-            viscosity: 20.0,           // Low enough for waves to persist
+            stiffness: 35.0,
+            near_stiffness: 0.45,
+            viscosity: 15.0,           // Low enough for waves to persist
             mass: 1.0,
-            surface_tension: 5.0,
-            wall_stiffness: 200.0,
+            surface_tension: 6.5,
+            wall_stiffness: 250.0,
         }
     }
 }
@@ -805,25 +835,31 @@ pub struct GpuBoundsParams3D {
     pub rotation_row2: [f32; 4],  // Third row + padding
 }
 
-/// GPU-compatible mouse force parameters (matches WGSL struct layout)
+/// GPU-compatible mouse force parameters (matches WGSL struct layout, 48 bytes)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuMouseForce {
-    pub position: [f32; 3],   // 3D position of force
-    pub radius: f32,          // Radius of effect
-    pub strength: f32,        // Force strength (negative = attract, positive = repel)
-    pub is_active: u32,       // 1 if active, 0 if not
-    pub _padding: [f32; 2],   // Padding for 16-byte alignment
+    pub position: [f32; 3],   // 12 bytes: 3D position of force
+    pub radius: f32,          //  4 bytes → 16
+    pub strength: f32,        //  4 bytes
+    pub is_active: u32,       //  4 bytes
+    pub mode: u32,            //  4 bytes: ForceMode enum value
+    pub _pad: f32,            //  4 bytes → 32
+    pub direction: [f32; 3],  // 12 bytes: camera ray dir (vortex axis)
+    pub _pad2: f32,           //  4 bytes → 48
 }
 
 impl Default for GpuMouseForce {
     fn default() -> Self {
         Self {
             position: [0.0, 0.0, 0.0],
-            radius: 0.3,
-            strength: 15.0,
+            radius: 0.5,
+            strength: 30.0,
             is_active: 0,
-            _padding: [0.0; 2],
+            mode: 0,
+            _pad: 0.0,
+            direction: [0.0, 0.0, -1.0],
+            _pad2: 0.0,
         }
     }
 }

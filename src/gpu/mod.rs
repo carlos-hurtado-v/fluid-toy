@@ -34,7 +34,7 @@ impl GpuContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Primary Device"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::FLOAT32_FILTERABLE,
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,

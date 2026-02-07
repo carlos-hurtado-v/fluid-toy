@@ -17,7 +17,8 @@ use crate::gui::{self, GuiAction};
 use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
-use crate::state::{AppState, BackgroundMode, FluidRenderMode, GpuMouseForce, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, quat_mul, quat_normalize};
+use crate::render::mesh_loader::{self, SdfData};
+use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, quat_mul, quat_normalize};
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -42,6 +43,7 @@ pub struct App {
     env_bg_bind_group_layout: Option<wgpu::BindGroupLayout>,
     env_params_buffer: Option<wgpu::Buffer>,
     sph_simulation: Option<SphSimulation3DGrid>,
+    sdf_data: Option<SdfData>,
     camera: Camera,
     state: AppState,
     // Frame timing
@@ -51,6 +53,7 @@ pub struct App {
     last_mouse_pos: Option<(f64, f64)>,
     // Mouse state for force interaction (right button)
     right_mouse_pressed: bool,
+    explode_fired: bool, // One-shot tracking for Explode mode
     current_mouse_pos: (f64, f64),
     // Spawn state (middle button - continuous while held)
     middle_mouse_pressed: bool,
@@ -82,12 +85,14 @@ impl App {
             env_bg_bind_group_layout: None,
             env_params_buffer: None,
             sph_simulation: None,
+            sdf_data: None,
             camera: Camera::default(),
             state: AppState::default(),
             last_frame_time: Instant::now(),
             mouse_pressed: false,
             last_mouse_pos: None,
             right_mouse_pressed: false,
+            explode_fired: false,
             current_mouse_pos: (0.0, 0.0),
             middle_mouse_pressed: false,
             egui_ctx: egui::Context::default(),
@@ -125,6 +130,21 @@ impl App {
         let particles = create_particle_block(spacing, self.state.simulation.initial_cube_size);
         self.state.runtime.particle_count = particles.len() as u32;
 
+        // Load duck mesh SDF for custom rigid body collision
+        let sdf_data = match mesh_loader::load_embedded_duck() {
+            Ok(loaded_mesh) => {
+                let sdf = loaded_mesh.sdf;
+                if sdf.is_some() {
+                    log::info!("Duck SDF loaded for rigid body collision");
+                }
+                sdf
+            }
+            Err(e) => {
+                log::error!("Failed to load duck.glb for SDF: {}", e);
+                None
+            }
+        };
+
         // Create 3D SPH simulation (O(n²) version - works correctly)
         let sph_params = self.state.sph.to_gpu_params_3d(
             self.state.runtime.particle_count,
@@ -142,6 +162,7 @@ impl App {
             sph_params,
             bounds_params,
             self.state.simulation.max_particles,
+            sdf_data.as_ref(),
         );
 
         // Load environment map (shared by SS + MC renderers)
@@ -381,6 +402,7 @@ impl App {
         self.env_bg_bind_group_layout = Some(env_bg_bind_group_layout);
         self.env_params_buffer = Some(env_params_buffer);
         self.sph_simulation = Some(sph_simulation);
+        self.sdf_data = sdf_data;
         self.egui_winit = Some(egui_winit);
         self.egui_renderer = Some(egui_renderer);
     }
@@ -412,6 +434,7 @@ impl App {
                 sph_params,
                 bounds_params,
                 self.state.simulation.max_particles,
+                self.sdf_data.as_ref(),
             ));
 
             let camera_params = self.camera.to_gpu_params();
@@ -517,6 +540,9 @@ impl ApplicationHandler for App {
                     }
                     MouseButton::Right => {
                         self.right_mouse_pressed = state == ElementState::Pressed;
+                        if !self.right_mouse_pressed {
+                            self.explode_fired = false;
+                        }
                     }
                     MouseButton::Middle => {
                         // Spawn particles while middle button held
@@ -667,12 +693,30 @@ impl App {
                 .or_else(|| self.camera.ray_plane_intersection(ray_origin, ray_dir, 0.0))
                 .unwrap_or([0.0, 0.0, 0.0]);
 
+            let cfg = &self.state.mouse_force;
+            let mode = cfg.mode;
+
+            // Explode mode: one-shot — only active on first frame of click
+            let is_active = if mode == ForceMode::Explode {
+                if self.explode_fired {
+                    0
+                } else {
+                    self.explode_fired = true;
+                    1
+                }
+            } else {
+                1
+            };
+
             GpuMouseForce {
                 position: hit,
-                radius: 0.5,
-                strength: 30.0,
-                is_active: 1,
-                _padding: [0.0; 2],
+                radius: cfg.radius,
+                strength: cfg.strength,
+                is_active,
+                mode: mode as u32,
+                _pad: 0.0,
+                direction: ray_dir,
+                _pad2: 0.0,
             }
         } else {
             GpuMouseForce::default()
