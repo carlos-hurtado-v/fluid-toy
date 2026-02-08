@@ -26,7 +26,7 @@ struct SphParams {
     dt: f32,
     num_particles: u32,
     surface_tension: f32,
-    _pad_st0: f32,
+    pcisph_delta: f32,
     _pad_st1: f32,
     _pad_st2: f32,
 }
@@ -113,15 +113,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var pos = particles[i].position;
     var vel = particles[i].velocity;
 
-    // Force field contains acceleration directly (Monaghan symmetric formulation)
-    var accel = particles[i].force;
-
-    // Clamp SPH acceleration to prevent explosions from extreme pressure
-    let max_accel = 200.0;
-    let accel_mag = length(accel);
-    if (accel_mag > max_accel) {
-        accel = accel * (max_accel / accel_mag);
-    }
+    // PCISPH already corrected velocity — force field stores total accel for spray readback.
+    // Integrate only applies wall/mouse/rigid body corrections on top.
+    var accel = vec3<f32>(0.0, 0.0, 0.0);
 
     // === SOFT WALL PENALTY FORCES ===
     // Repulsive force within one kernel radius of each wall.

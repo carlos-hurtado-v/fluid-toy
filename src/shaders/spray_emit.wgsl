@@ -53,7 +53,7 @@ struct SphParams {
     dt: f32,
     num_particles: u32,
     surface_tension: f32,
-    _pad0: f32,
+    pcisph_delta: f32,
     _pad1: f32,
     _pad2: f32,
 };

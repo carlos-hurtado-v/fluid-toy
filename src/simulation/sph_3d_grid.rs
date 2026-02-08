@@ -81,6 +81,19 @@ pub struct SphSimulation3DGrid {
     _sdf_texture: wgpu::Texture,
     _sdf_sampler: wgpu::Sampler,
 
+    // PCISPH buffers and pipelines
+    pcisph_predict_pipeline: wgpu::ComputePipeline,
+    pcisph_solve_pipeline: wgpu::ComputePipeline,
+    pcisph_finalize_pipeline: wgpu::ComputePipeline,
+    _sorted_predicted_a_buffer: wgpu::Buffer,
+    _sorted_predicted_b_buffer: wgpu::Buffer,
+    pcisph_predict_bind_group: wgpu::BindGroup,
+    pcisph_solve_bind_group_a: wgpu::BindGroup, // read A, write B
+    pcisph_solve_bind_group_b: wgpu::BindGroup, // read B, write A
+    pcisph_finalize_bind_group_a: wgpu::BindGroup, // read A
+    pcisph_finalize_bind_group_b: wgpu::BindGroup, // read B
+    pcisph_iterations: u32,
+
     // Grid dimensions
     grid_params: GpuGridParams,
     num_particles: u32,
@@ -928,6 +941,170 @@ impl SphSimulation3DGrid {
             ],
         });
 
+        // === PCISPH Buffers and Pipelines ===
+
+        // PredictedState: 32 bytes per particle (8 x f32)
+        let predicted_buf_size = (max_particles as u64) * 32;
+        let sorted_predicted_a_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sorted Predicted A"),
+            size: predicted_buf_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let sorted_predicted_b_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sorted Predicted B"),
+            size: predicted_buf_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        // PCISPH Predict shader
+        let pcisph_predict_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("PCISPH Predict"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/pcisph_predict.wgsl").into()),
+        });
+        let pcisph_predict_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("PCISPH Predict Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let pcisph_predict_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("PCISPH Predict Pipeline"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&pcisph_predict_layout],
+                push_constant_ranges: &[],
+            })),
+            module: &pcisph_predict_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let pcisph_predict_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PCISPH Predict Bind Group"),
+            layout: &pcisph_predict_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sph_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sorted_predicted_a_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: particle_cell_indices_buffer.as_entire_binding() },
+            ],
+        });
+
+        // PCISPH Solve shader
+        let pcisph_solve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("PCISPH Solve"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/pcisph_solve.wgsl").into()),
+        });
+        let pcisph_solve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("PCISPH Solve Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 6, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let pcisph_solve_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("PCISPH Solve Pipeline"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&pcisph_solve_layout],
+                push_constant_ranges: &[],
+            })),
+            module: &pcisph_solve_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // Bind group A: read from sorted_predicted_a, write to sorted_predicted_b
+        let pcisph_solve_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PCISPH Solve A"),
+            layout: &pcisph_solve_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sph_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sorted_predicted_a_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: sorted_predicted_b_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cell_starts_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cell_counts_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: grid_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: particle_cell_indices_buffer.as_entire_binding() },
+            ],
+        });
+        // Bind group B: read from sorted_predicted_b, write to sorted_predicted_a
+        let pcisph_solve_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PCISPH Solve B"),
+            layout: &pcisph_solve_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sph_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sorted_predicted_b_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: sorted_predicted_a_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cell_starts_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: cell_counts_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: grid_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: particle_cell_indices_buffer.as_entire_binding() },
+            ],
+        });
+
+        // PCISPH Finalize shader
+        let pcisph_finalize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("PCISPH Finalize"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/pcisph_finalize.wgsl").into()),
+        });
+        let pcisph_finalize_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("PCISPH Finalize Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let pcisph_finalize_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("PCISPH Finalize Pipeline"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&pcisph_finalize_layout],
+                push_constant_ranges: &[],
+            })),
+            module: &pcisph_finalize_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // Finalize bind group A: read from sorted_predicted_a
+        let pcisph_finalize_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PCISPH Finalize A"),
+            layout: &pcisph_finalize_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sph_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sorted_predicted_a_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: particle_cell_indices_buffer.as_entire_binding() },
+            ],
+        });
+        // Finalize bind group B: read from sorted_predicted_b
+        let pcisph_finalize_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PCISPH Finalize B"),
+            layout: &pcisph_finalize_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sph_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sorted_predicted_b_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: particle_cell_indices_buffer.as_entire_binding() },
+            ],
+        });
+
         Self {
             grid_clear_pipeline,
             grid_build_pipeline,
@@ -961,6 +1138,17 @@ impl SphSimulation3DGrid {
             last_accum: GpuRigidBodyAccum::default(),
             _sdf_texture: sdf_texture,
             _sdf_sampler: sdf_sampler,
+            pcisph_predict_pipeline,
+            pcisph_solve_pipeline,
+            pcisph_finalize_pipeline,
+            _sorted_predicted_a_buffer: sorted_predicted_a_buffer,
+            _sorted_predicted_b_buffer: sorted_predicted_b_buffer,
+            pcisph_predict_bind_group,
+            pcisph_solve_bind_group_a,
+            pcisph_solve_bind_group_b,
+            pcisph_finalize_bind_group_a,
+            pcisph_finalize_bind_group_b,
+            pcisph_iterations: 4,
             grid_params,
             num_particles,
             max_particles,
@@ -1075,7 +1263,53 @@ impl SphSimulation3DGrid {
             pass.dispatch_workgroups(particle_workgroups, 1, 1);
         }
 
-        // 7. Integration (+ rigid body penalty forces)
+        // 7. PCISPH Predict (compute predicted state from non-pressure forces)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("PCISPH Predict Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pcisph_predict_pipeline);
+            pass.set_bind_group(0, &self.pcisph_predict_bind_group, &[]);
+            pass.dispatch_workgroups(particle_workgroups, 1, 1);
+        }
+
+        // 8. PCISPH Solve iterations (ping-pong between predicted buffers)
+        for iter in 0..self.pcisph_iterations {
+            let bind_group = if iter % 2 == 0 {
+                &self.pcisph_solve_bind_group_a // read A, write B
+            } else {
+                &self.pcisph_solve_bind_group_b // read B, write A
+            };
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("PCISPH Solve Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pcisph_solve_pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(particle_workgroups, 1, 1);
+        }
+
+        // 9. PCISPH Finalize (write corrected velocity, zero force field)
+        {
+            // After N iterations: if N is even, last write went to A (via solve_b reading B, writing A)
+            // Wait — predict writes to A. Solve iter 0 reads A, writes B. Iter 1 reads B, writes A.
+            // So for N iters: if N is even, final result is in A. If N is odd, final result is in B.
+            let finalize_bg = if self.pcisph_iterations % 2 == 0 {
+                &self.pcisph_finalize_bind_group_a
+            } else {
+                &self.pcisph_finalize_bind_group_b
+            };
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("PCISPH Finalize Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pcisph_finalize_pipeline);
+            pass.set_bind_group(0, finalize_bg, &[]);
+            pass.dispatch_workgroups(particle_workgroups, 1, 1);
+        }
+
+        // 10. Integration (+ rigid body penalty forces)
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Integrate Pass"),
@@ -1121,6 +1355,10 @@ impl SphSimulation3DGrid {
 
     pub fn update_rigid_body(&self, queue: &wgpu::Queue, params: &GpuRigidBody) {
         queue.write_buffer(&self.rigid_body_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn set_pcisph_iterations(&mut self, iterations: u32) {
+        self.pcisph_iterations = iterations.max(1);
     }
 
     pub fn clear_rigid_body_accum(&self, queue: &wgpu::Queue) {

@@ -225,6 +225,8 @@ pub struct SimulationConfig {
     pub initial_cube_size: u32,
     /// Number of simulation substeps per frame (each runs at full dt)
     pub substeps: u32,
+    /// Number of PCISPH pressure solver iterations per substep
+    pub pcisph_iterations: u32,
 }
 
 /// Container configuration - defines the fluid container
@@ -565,6 +567,7 @@ impl Default for SimulationConfig {
             max_particles: 50_000,
             initial_cube_size: 20, // 20×20×20 = 8000 particles
             substeps: 2,
+            pcisph_iterations: 4,
         }
     }
 }
@@ -818,7 +821,8 @@ pub struct GpuSphParams3D {
     pub dt: f32,
     pub num_particles: u32,
     pub surface_tension: f32,
-    pub _padding_st: [f32; 3],
+    pub pcisph_delta: f32,
+    pub _padding_st: [f32; 2],
 }
 
 /// GPU-compatible 3D boundary parameters (matches WGSL struct layout)
@@ -890,6 +894,62 @@ impl SimulationConfig {
     }
 }
 
+/// Precompute PCISPH pressure correction factor (δ) from kernel properties.
+/// Uses a regular cubic lattice prototype to numerically estimate the gradient sums.
+fn compute_pcisph_delta(h: f32, mass: f32, rest_density: f32, dt: f32) -> f32 {
+    let spacing = h * 0.6; // matches particle init spacing
+    let cells = (h / spacing).ceil() as i32 + 1;
+    let mut sum_grad = [0.0f32; 3];
+    let mut sum_grad_sq = 0.0f32;
+    let pi = std::f32::consts::PI;
+    let h6 = h.powi(6);
+
+    for dz in -cells..=cells {
+        for dy in -cells..=cells {
+            for dx in -cells..=cells {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                let r_vec = [
+                    dx as f32 * spacing,
+                    dy as f32 * spacing,
+                    dz as f32 * spacing,
+                ];
+                let r_sq: f32 = r_vec.iter().map(|v| v * v).sum();
+                if r_sq < h * h && r_sq > 1e-12 {
+                    let r = r_sq.sqrt();
+                    // Spiky gradient magnitude: 45/(π h⁶) * (h-r)²
+                    let grad_mag = 45.0 / (pi * h6) * (h - r) * (h - r);
+                    let grad = [
+                        grad_mag * r_vec[0] / r,
+                        grad_mag * r_vec[1] / r,
+                        grad_mag * r_vec[2] / r,
+                    ];
+                    sum_grad[0] += grad[0];
+                    sum_grad[1] += grad[1];
+                    sum_grad[2] += grad[2];
+                    sum_grad_sq += grad[0] * grad[0] + grad[1] * grad[1] + grad[2] * grad[2];
+                }
+            }
+        }
+    }
+
+    let sum_grad_dot: f32 = sum_grad.iter().map(|v| v * v).sum();
+    let beta = dt * dt * mass * mass / (rest_density * rest_density);
+    let denom = beta * (sum_grad_dot + sum_grad_sq);
+    // Under-relaxation: theoretical delta assumes regular lattice + linear response,
+    // which overshoots for real particle distributions. 0.2 gives smooth convergence
+    // over 4-6 iterations without compounding over-correction.
+    let omega = 0.2;
+    let delta = if denom.abs() > 1e-10 {
+        omega / denom
+    } else {
+        0.0
+    };
+    log::debug!("PCISPH delta={delta:.6} (omega={omega}, h={h}, m={mass}, rho0={rest_density}, dt={dt}, sum_grad_sq={sum_grad_sq:.2})");
+    delta
+}
+
 impl SphConfig {
     /// Convert to 3D GPU-compatible uniform struct
     pub fn to_gpu_params_3d(&self, num_particles: u32, dt: f32) -> GpuSphParams3D {
@@ -908,7 +968,8 @@ impl SphConfig {
             dt,
             num_particles,
             surface_tension: self.surface_tension,
-            _padding_st: [0.0; 3],
+            pcisph_delta: compute_pcisph_delta(h, self.mass, self.rest_density, dt),
+            _padding_st: [0.0; 2],
         }
     }
 }

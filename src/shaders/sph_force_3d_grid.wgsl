@@ -25,7 +25,7 @@ struct SphParams {
     dt: f32,
     num_particles: u32,
     surface_tension: f32,
-    _pad_st0: f32,
+    pcisph_delta: f32,
     _pad_st1: f32,
     _pad_st2: f32,
 }
@@ -115,8 +115,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let near_density_i = max(particles[i].near_density, 1.0);
     let n_i = vec3<f32>(particles[i].normal_x, particles[i].normal_y, particles[i].normal_z);
 
-    // Clamp pressure to non-negative to avoid tensile instability at the surface
-    let pressure_i = max(0.0, params.stiffness * (density_i - params.rest_density));
+    // Regular pressure handled by PCISPH iterative solver (not computed here)
     let near_pressure_i = params.near_stiffness * near_density_i;
 
     // Accumulate acceleration (not force) using Monaghan symmetric formulation
@@ -169,13 +168,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         let density_j = max(sorted_particles[j].density, 1.0);
                         let near_density_j = max(sorted_particles[j].near_density, 1.0);
 
-                        let pressure_j = max(0.0, params.stiffness * (density_j - params.rest_density));
                         let near_pressure_j = params.near_stiffness * near_density_j;
 
-                        // Monaghan symmetric pressure: conserves momentum exactly
-                        a_pressure += -params.mass * (pressure_i / (density_i * density_i) + pressure_j / (density_j * density_j)) * dir * density_kernel_gradient(r);
-
-                        // Near-pressure: averaged form (numerical stability tool, not physical force)
+                        // Near-pressure: averaged form (clustering prevention, not physical force)
                         a_pressure += -params.mass * (near_pressure_i + near_pressure_j) / (2.0 * density_i * near_density_j) * dir * near_density_kernel_gradient(r);
 
                         // Extra separation acceleration when extremely close (prevents collapse)

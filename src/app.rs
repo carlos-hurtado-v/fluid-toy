@@ -729,6 +729,7 @@ impl App {
                 self.state.simulation.delta_time,
             );
             sph_sim.update_sph_params(&gpu.queue, &sph_params);
+            sph_sim.set_pcisph_iterations(self.state.simulation.pcisph_iterations);
 
             let bounds_params = self.state.container.to_gpu_bounds_3d(
                 self.state.sph.wall_stiffness,

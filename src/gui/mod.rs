@@ -45,6 +45,13 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 );
                 state.simulation.substeps = substeps as u32;
 
+                let mut pcisph_iters = state.simulation.pcisph_iterations as i32;
+                ui.add(
+                    egui::Slider::new(&mut pcisph_iters, 2..=8)
+                        .text("Pressure Iters (PCISPH)")
+                );
+                state.simulation.pcisph_iterations = pcisph_iters as u32;
+
                 ui.add_space(8.0);
                 ui.separator();
                 ui.label("Particle Settings (requires reset):");
