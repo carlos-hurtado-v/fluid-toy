@@ -881,7 +881,7 @@ impl App {
 
         // Run SPH simulation if not paused (multiple sub-steps for stability)
         // Note: Grid simulation manages its own command encoding/submission
-        let num_substeps = 2u32;
+        let num_substeps = self.state.simulation.substeps;
         if !self.state.simulation.paused {
             if let Some(sph_sim) = &mut self.sph_simulation {
                 // Clear accumulator once, then accumulate over all sub-steps

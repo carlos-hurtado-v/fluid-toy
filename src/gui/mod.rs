@@ -38,6 +38,13 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         .text("Time Step")
                 );
 
+                let mut substeps = state.simulation.substeps as i32;
+                ui.add(
+                    egui::Slider::new(&mut substeps, 1..=8)
+                        .text("Substeps")
+                );
+                state.simulation.substeps = substeps as u32;
+
                 ui.add_space(8.0);
                 ui.separator();
                 ui.label("Particle Settings (requires reset):");
@@ -204,16 +211,15 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         .text("Stiffness")
                 );
                 ui.add(
-                    egui::Slider::new(&mut state.sph.viscosity, 1.0..=500.0)
+                    egui::Slider::new(&mut state.sph.viscosity, 0.01..=5.0)
                         .text("Viscosity")
-                        .logarithmic(true)
                 );
                 ui.add(
                     egui::Slider::new(&mut state.sph.mass, 0.1..=5.0)
                         .text("Particle Mass")
                 );
                 ui.add(
-                    egui::Slider::new(&mut state.sph.surface_tension, 0.0..=30.0)
+                    egui::Slider::new(&mut state.sph.surface_tension, 0.0..=0.2)
                         .text("Surface Tension")
                 );
                 ui.add(

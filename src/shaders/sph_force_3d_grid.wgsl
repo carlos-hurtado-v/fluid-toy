@@ -6,6 +6,9 @@ struct SphParticle3D {
     force: vec3<f32>,
     density: f32,
     near_density: f32,
+    normal_x: f32,
+    normal_y: f32,
+    normal_z: f32,
 }
 
 struct SphParams {
@@ -68,9 +71,18 @@ fn near_density_kernel_gradient(r: f32) -> f32 {
     return scale * diff * diff;
 }
 
-fn viscosity_kernel_laplacian(r: f32) -> f32 {
-    let scale = 45.0 / (PI * params.kernel_radius_pow6);
-    return scale * (params.kernel_radius - r);
+// Akinci 2013 cohesion kernel: attractive at medium range, repulsive when close
+fn akinci_cohesion_kernel(r: f32) -> f32 {
+    let h = params.kernel_radius;
+    let scale = 32.0 / (PI * params.kernel_radius_pow9);
+    let diff = h - r;
+    let r3 = r * r * r;
+    if (r >= h * 0.5) {
+        return scale * diff * diff * diff * r3;
+    } else {
+        let h6 = params.kernel_radius_pow6;
+        return scale * (2.0 * diff * diff * diff * r3 - h6 / 64.0);
+    }
 }
 
 fn position_to_cell(pos: vec3<f32>) -> vec3<i32> {
@@ -101,6 +113,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let density_i = max(particles[i].density, 1.0);
     let near_density_i = max(particles[i].near_density, 1.0);
+    let n_i = vec3<f32>(particles[i].normal_x, particles[i].normal_y, particles[i].normal_z);
 
     // Clamp pressure to non-negative to avoid tensile instability at the surface
     let pressure_i = max(0.0, params.stiffness * (density_i - params.rest_density));
@@ -171,24 +184,32 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                             a_pressure += -separation_accel * dir;
                         }
 
-                        // Symmetric viscosity: m * (v_j - v_i) * lap_W / (rho_i * rho_j)
+                        // Monaghan artificial viscosity: only damps approaching particles
+                        // Conserves angular momentum (force is radial, only acts on compressive motion)
                         let vel_j = sorted_particles[j].velocity;
-                        let relative_vel = vel_j - vel_i;
-                        a_viscosity += params.mass * relative_vel * viscosity_kernel_laplacian(r) / (density_i * density_j);
+                        let v_ij = vel_i - vel_j;
+                        let x_ij = pos_i - pos_j;
+                        let v_dot_x = dot(v_ij, x_ij);
+                        if (v_dot_x < 0.0) {
+                            let mu = params.kernel_radius * v_dot_x / (r_sq + 0.01 * params.kernel_radius_sq);
+                            let avg_density = (density_i + density_j) * 0.5;
+                            let pi_visc = -params.viscosity * mu / avg_density;
+                            a_viscosity += -params.mass * pi_visc * density_kernel_gradient(r) * dir;
+                        }
 
-                        // Surface tension: pairwise cohesion
-                        // Attractive force toward each neighbor, weighted by (1-r/h)²
-                        // In bulk: symmetric neighbors cancel out
-                        // At surface/detached: net inward force
-                        let q = 1.0 - r / params.kernel_radius;
-                        a_cohesion += q * q * dir;
+                        // Akinci 2013 surface tension: cohesion + curvature correction
+                        let cohesion = akinci_cohesion_kernel(r);
+                        a_cohesion += -params.mass * cohesion * dir;
+                        // Curvature term: (n_i - n_j) drives surface toward minimal area
+                        let n_j = vec3<f32>(sorted_particles[j].normal_x, sorted_particles[j].normal_y, sorted_particles[j].normal_z);
+                        a_cohesion += params.mass * (n_i - n_j);
                     }
                 }
             }
         }
     }
 
-    a_viscosity *= params.viscosity;
+    // Viscosity coefficient is already applied inside the Monaghan formulation
     a_cohesion *= params.surface_tension;
     let a_gravity = gravity.direction;
 

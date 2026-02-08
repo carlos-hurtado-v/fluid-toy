@@ -7,7 +7,9 @@ struct SphParticle3D {
     force: vec3<f32>,
     density: f32,
     near_density: f32,
-    // WGSL automatically pads struct to 64 bytes for arrays
+    normal_x: f32,
+    normal_y: f32,
+    normal_z: f32,
 }
 
 struct SphParams {

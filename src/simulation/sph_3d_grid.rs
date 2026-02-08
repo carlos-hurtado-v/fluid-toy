@@ -61,7 +61,6 @@ pub struct SphSimulation3DGrid {
     mouse_force_buffer: wgpu::Buffer,
     gravity_buffer: wgpu::Buffer,
     grid_params_buffer: wgpu::Buffer,
-    prefix_sum_params_buffer: wgpu::Buffer,
 
     // Bind groups
     grid_clear_bind_group: wgpu::BindGroup,
@@ -351,16 +350,21 @@ impl SphSimulation3DGrid {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let prefix_sum_params = PrefixSumParams {
-            count: total_cells,
-            offset: 1,
-            _padding: [0; 2],
-        };
-        let prefix_sum_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Prefix Sum Params Buffer"),
-            contents: bytemuck::bytes_of(&prefix_sum_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        // Pre-create one uniform buffer per prefix sum pass (avoids per-pass queue.submit)
+        let prefix_sum_params_buffers: Vec<wgpu::Buffer> = (0..num_prefix_sum_passes)
+            .map(|pass_idx| {
+                let params = PrefixSumParams {
+                    count: total_cells,
+                    offset: 1u32 << pass_idx,
+                    _padding: [0; 2],
+                };
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("Prefix Sum Params {}", pass_idx)),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                })
+            })
+            .collect();
 
         // Create bind group layouts and pipelines
         // Grid Clear
@@ -551,31 +555,35 @@ impl SphSimulation3DGrid {
             cache: None,
         });
 
-        // Create prefix sum bind groups for ping-pong (using cell_starts and cell_counts_temp)
-        let prefix_sum_bind_groups = vec![
-            (
-                // cell_starts -> cell_counts_temp
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Prefix Sum starts->temp"),
-                    layout: &prefix_sum_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: cell_starts_buffer.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: cell_counts_temp_buffer.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: prefix_sum_params_buffer.as_entire_binding() },
-                    ],
-                }),
-                // cell_counts_temp -> cell_starts
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Prefix Sum temp->starts"),
-                    layout: &prefix_sum_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: cell_counts_temp_buffer.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: cell_starts_buffer.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: prefix_sum_params_buffer.as_entire_binding() },
-                    ],
-                }),
-            ),
-        ];
+        // Create prefix sum bind groups: one ping-pong pair per pass
+        let prefix_sum_bind_groups: Vec<(wgpu::BindGroup, wgpu::BindGroup)> = prefix_sum_params_buffers
+            .iter()
+            .enumerate()
+            .map(|(i, params_buf)| {
+                (
+                    // cell_starts -> cell_counts_temp
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("Prefix Sum starts->temp {}", i)),
+                        layout: &prefix_sum_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: cell_starts_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: cell_counts_temp_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+                        ],
+                    }),
+                    // cell_counts_temp -> cell_starts
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("Prefix Sum temp->starts {}", i)),
+                        layout: &prefix_sum_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: cell_counts_temp_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: cell_starts_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+                        ],
+                    }),
+                )
+            })
+            .collect();
 
         // Grid Reorder
         let grid_reorder_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -940,7 +948,6 @@ impl SphSimulation3DGrid {
             mouse_force_buffer,
             gravity_buffer,
             grid_params_buffer,
-            prefix_sum_params_buffer,
             grid_clear_bind_group,
             grid_build_bind_group,
             prefix_sum_bind_groups,
@@ -961,69 +968,52 @@ impl SphSimulation3DGrid {
         }
     }
 
-    /// Run one simulation step. This submits multiple command buffers for synchronization.
+    /// Run one simulation step (single encoder, single submit).
     pub fn step(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let particle_workgroups = self.num_particles.div_ceil(WORKGROUP_SIZE);
         let cell_workgroups = self.grid_params.total_cells.div_ceil(WORKGROUP_SIZE);
 
-        // Phase 1: Clear and build grid
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("SPH Step Encoder"),
+        });
+
+        // 1. Clear grid
         {
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Grid Build Encoder"),
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Grid Clear Pass"),
+                timestamp_writes: None,
             });
-
-            // 1. Clear grid
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Grid Clear Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.grid_clear_pipeline);
-                pass.set_bind_group(0, &self.grid_clear_bind_group, &[]);
-                pass.dispatch_workgroups(cell_workgroups, 1, 1);
-            }
-
-            // Also clear cell_offsets for reorder
-            encoder.clear_buffer(&self.cell_offsets_buffer, 0, None);
-
-            // 2. Build grid (count particles per cell)
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Grid Build Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.grid_build_pipeline);
-                pass.set_bind_group(0, &self.grid_build_bind_group, &[]);
-                pass.dispatch_workgroups(particle_workgroups, 1, 1);
-            }
-
-            // Copy cell_counts to cell_starts as base for prefix sum
-            encoder.copy_buffer_to_buffer(
-                &self.cell_counts_buffer,
-                0,
-                &self.cell_starts_buffer,
-                0,
-                (4 * self.grid_params.total_cells) as u64,
-            );
-
-            queue.submit(std::iter::once(encoder.finish()));
+            pass.set_pipeline(&self.grid_clear_pipeline);
+            pass.set_bind_group(0, &self.grid_clear_bind_group, &[]);
+            pass.dispatch_workgroups(cell_workgroups, 1, 1);
         }
 
-        // Phase 2: Prefix sum (each pass needs separate submit for uniform buffer sync)
-        let mut offset = 1u32;
-        let mut read_from_starts = true;
-        for _pass_idx in 0..self.num_prefix_sum_passes {
-            let params = PrefixSumParams {
-                count: self.grid_params.total_cells,
-                offset,
-                _padding: [0; 2],
-            };
-            queue.write_buffer(&self.prefix_sum_params_buffer, 0, bytemuck::bytes_of(&params));
+        // Also clear cell_offsets for reorder
+        encoder.clear_buffer(&self.cell_offsets_buffer, 0, None);
 
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Prefix Sum Encoder"),
+        // 2. Build grid (count particles per cell)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Grid Build Pass"),
+                timestamp_writes: None,
             });
+            pass.set_pipeline(&self.grid_build_pipeline);
+            pass.set_bind_group(0, &self.grid_build_bind_group, &[]);
+            pass.dispatch_workgroups(particle_workgroups, 1, 1);
+        }
 
+        // Copy cell_counts to cell_starts as base for prefix sum
+        encoder.copy_buffer_to_buffer(
+            &self.cell_counts_buffer,
+            0,
+            &self.cell_starts_buffer,
+            0,
+            (4 * self.grid_params.total_cells) as u64,
+        );
+
+        // 3. Prefix sum (all passes in single encoder, separate compute passes for barriers)
+        let mut read_from_starts = true;
+        for pass_idx in 0..self.num_prefix_sum_passes as usize {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Prefix Sum Pass"),
@@ -1031,25 +1021,18 @@ impl SphSimulation3DGrid {
                 });
                 pass.set_pipeline(&self.prefix_sum_pipeline);
                 let bind_group = if read_from_starts {
-                    &self.prefix_sum_bind_groups[0].0 // starts -> temp
+                    &self.prefix_sum_bind_groups[pass_idx].0 // starts -> temp
                 } else {
-                    &self.prefix_sum_bind_groups[0].1 // temp -> starts
+                    &self.prefix_sum_bind_groups[pass_idx].1 // temp -> starts
                 };
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.dispatch_workgroups(cell_workgroups, 1, 1);
             }
-
-            queue.submit(std::iter::once(encoder.finish()));
-
-            offset *= 2;
             read_from_starts = !read_from_starts;
         }
 
         // Copy final result to cell_starts if it ended up in temp
         if !read_from_starts {
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Prefix Sum Final Copy"),
-            });
             encoder.copy_buffer_to_buffer(
                 &self.cell_counts_temp_buffer,
                 0,
@@ -1057,70 +1040,62 @@ impl SphSimulation3DGrid {
                 0,
                 (4 * self.grid_params.total_cells) as u64,
             );
-            queue.submit(std::iter::once(encoder.finish()));
         }
 
-        // Phase 3: Reorder, density, reorder, force, integrate
+        // 4. Reorder particles
         {
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("SPH Compute Encoder"),
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Grid Reorder Pass"),
+                timestamp_writes: None,
             });
-
-            // 4. Reorder particles
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Grid Reorder Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.grid_reorder_pipeline);
-                pass.set_bind_group(0, &self.grid_reorder_bind_group, &[]);
-                pass.dispatch_workgroups(particle_workgroups, 1, 1);
-            }
-
-            // 5. Density computation
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Density Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.density_pipeline);
-                pass.set_bind_group(0, &self.density_bind_group, &[]);
-                pass.dispatch_workgroups(particle_workgroups, 1, 1);
-            }
-
-            // 6. Force computation
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Force Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.force_pipeline);
-                pass.set_bind_group(0, &self.force_bind_group, &[]);
-                pass.dispatch_workgroups(particle_workgroups, 1, 1);
-            }
-
-            // 7. Integration (+ rigid body penalty forces)
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Integrate Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.integrate_pipeline);
-                pass.set_bind_group(0, &self.integrate_bind_group, &[]);
-                pass.dispatch_workgroups(particle_workgroups, 1, 1);
-            }
-
-            // Copy accumulator to staging for CPU readback
-            encoder.copy_buffer_to_buffer(
-                &self.rigid_body_accum_buffer,
-                0,
-                &self.rigid_body_accum_staging,
-                0,
-                std::mem::size_of::<GpuRigidBodyAccum>() as u64,
-            );
-
-            queue.submit(std::iter::once(encoder.finish()));
+            pass.set_pipeline(&self.grid_reorder_pipeline);
+            pass.set_bind_group(0, &self.grid_reorder_bind_group, &[]);
+            pass.dispatch_workgroups(particle_workgroups, 1, 1);
         }
+
+        // 5. Density computation
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Density Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.density_pipeline);
+            pass.set_bind_group(0, &self.density_bind_group, &[]);
+            pass.dispatch_workgroups(particle_workgroups, 1, 1);
+        }
+
+        // 6. Force computation
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Force Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.force_pipeline);
+            pass.set_bind_group(0, &self.force_bind_group, &[]);
+            pass.dispatch_workgroups(particle_workgroups, 1, 1);
+        }
+
+        // 7. Integration (+ rigid body penalty forces)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Integrate Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.integrate_pipeline);
+            pass.set_bind_group(0, &self.integrate_bind_group, &[]);
+            pass.dispatch_workgroups(particle_workgroups, 1, 1);
+        }
+
+        // Copy accumulator to staging for CPU readback
+        encoder.copy_buffer_to_buffer(
+            &self.rigid_body_accum_buffer,
+            0,
+            &self.rigid_body_accum_staging,
+            0,
+            std::mem::size_of::<GpuRigidBodyAccum>() as u64,
+        );
+
+        queue.submit(std::iter::once(encoder.finish()));
     }
 
     pub fn update_sph_params(&mut self, queue: &wgpu::Queue, params: &GpuSphParams3D) {

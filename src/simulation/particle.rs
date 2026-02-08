@@ -13,7 +13,7 @@ pub struct SphParticle3D {
     pub force: [f32; 3],        // 12 bytes @ 32
     pub density: f32,           // 4 bytes @ 44
     pub near_density: f32,      // 4 bytes @ 48
-    pub _padding: [f32; 3],     // 12 bytes @ 52 (pad to 64)
+    pub normal: [f32; 3],       // 12 bytes @ 52 (surface normal for Akinci ST)
 }
 
 impl SphParticle3D {
@@ -26,7 +26,7 @@ impl SphParticle3D {
             force: [0.0, 0.0, 0.0],
             density: 0.0,
             near_density: 0.0,
-            _padding: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 0.0],
         }
     }
 }

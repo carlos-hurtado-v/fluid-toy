@@ -6,6 +6,9 @@ struct SphParticle3D {
     force: vec3<f32>,
     density: f32,
     near_density: f32,
+    normal_x: f32,
+    normal_y: f32,
+    normal_z: f32,
 }
 
 struct SphParams {
@@ -90,6 +93,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     var density = 0.0;
     var near_density = 0.0;
+    var normal = vec3<f32>(0.0, 0.0, 0.0);
 
     // Iterate over 3x3x3 neighboring cells
     for (var dz = -1i; dz <= 1i; dz++) {
@@ -118,6 +122,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         let r = sqrt(r_sq);
                         density += params.mass * density_kernel(r_sq);
                         near_density += params.mass * near_density_kernel(r);
+
+                        // Surface normal: unweighted poly6 gradient (proportional to ∇W)
+                        // Points outward from surface (away from fluid bulk)
+                        if (r_sq > 1e-12) {
+                            let diff = params.kernel_radius_sq - r_sq;
+                            normal += r_vec * diff * diff;
+                        }
                     }
                 }
             }
@@ -126,10 +137,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     particles[i].density = density;
     particles[i].near_density = near_density;
+    particles[i].normal_x = normal.x;
+    particles[i].normal_y = normal.y;
+    particles[i].normal_z = normal.z;
 
-    // Also update sorted buffer so force shader can read neighbor densities
+    // Also update sorted buffer so force shader can read neighbor data
     // without needing a second reorder pass
     let si = sorted_index[i];
     sorted_particles[si].density = density;
     sorted_particles[si].near_density = near_density;
+    sorted_particles[si].normal_x = normal.x;
+    sorted_particles[si].normal_y = normal.y;
+    sorted_particles[si].normal_z = normal.z;
 }

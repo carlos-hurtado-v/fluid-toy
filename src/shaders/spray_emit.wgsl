@@ -8,6 +8,9 @@ struct SphParticle {
     force: vec3<f32>,       // acceleration (force shader outputs accel)
     density: f32,
     near_density: f32,
+    normal_x: f32,
+    normal_y: f32,
+    normal_z: f32,
 };
 
 struct SprayParticle {

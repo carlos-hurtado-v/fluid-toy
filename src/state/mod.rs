@@ -223,6 +223,8 @@ pub struct SimulationConfig {
     pub max_particles: u32,
     /// Initial particle cube dimension (N×N×N particles on reset)
     pub initial_cube_size: u32,
+    /// Number of simulation substeps per frame (each runs at full dt)
+    pub substeps: u32,
 }
 
 /// Container configuration - defines the fluid container
@@ -562,6 +564,7 @@ impl Default for SimulationConfig {
             paused: false,
             max_particles: 50_000,
             initial_cube_size: 20, // 20×20×20 = 8000 particles
+            substeps: 2,
         }
     }
 }
@@ -723,9 +726,9 @@ impl Default for SphConfig {
             rest_density: 8000.0,
             stiffness: 35.0,
             near_stiffness: 0.45,
-            viscosity: 15.0,           // Low enough for waves to persist
+            viscosity: 0.5,            // Monaghan artificial viscosity coefficient
             mass: 1.0,
-            surface_tension: 6.5,
+            surface_tension: 0.05,    // Akinci 2013 surface tension coefficient
             wall_stiffness: 250.0,
         }
     }
