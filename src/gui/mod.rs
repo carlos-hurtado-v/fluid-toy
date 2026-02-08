@@ -214,8 +214,8 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         .logarithmic(true)
                 );
                 ui.add(
-                    egui::Slider::new(&mut state.sph.stiffness, 1.0..=200.0)
-                        .text("Stiffness")
+                    egui::Slider::new(&mut state.sph.near_stiffness, 0.05..=2.0)
+                        .text("Near Stiffness")
                 );
                 ui.add(
                     egui::Slider::new(&mut state.sph.viscosity, 0.01..=5.0)
@@ -333,9 +333,8 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     );
                     state.rendering.mc_blur_radius = blur_val as u32;
                     ui.add(
-                        egui::Slider::new(&mut state.rendering.mc_iso_value, 10.0..=2000.0)
-                            .text("Iso Value")
-                            .logarithmic(true)
+                        egui::Slider::new(&mut state.rendering.mc_threshold, 0.5..=10.0)
+                            .text("Surface Threshold")
                     );
                     ui.add(
                         egui::Slider::new(&mut state.rendering.water_roughness, 0.01..=0.5)

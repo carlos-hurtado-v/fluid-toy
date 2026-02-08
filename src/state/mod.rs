@@ -282,8 +282,9 @@ pub struct RenderConfig {
     pub color_by_velocity: bool,
     /// Rendering mode (particles or marching cubes)
     pub render_mode: FluidRenderMode,
-    /// Marching cubes iso-value threshold (lower = shows smaller droplets but blobbier surface)
-    pub mc_iso_value: f32,
+    /// Marching cubes surface threshold (normalized, auto-scales with kernel_radius)
+    /// Higher = tighter surface around dense fluid, lower = captures smaller droplets
+    pub mc_threshold: f32,
     /// Refraction strength - how much the background distorts through water
     pub refraction_strength: f32,
     /// Deep water color - what you see looking into deep water
@@ -696,7 +697,7 @@ impl Default for RenderConfig {
             particle_color: [0.2, 0.4, 0.9],
             color_by_velocity: true,
             render_mode: FluidRenderMode::MarchingCubes,
-            mc_iso_value: 750.0,
+            mc_threshold: 3.8,
             refraction_strength: 0.085,
             deep_water_color: [0.01, 0.04, 0.1],
             mc_blur_radius: 3,
@@ -708,6 +709,17 @@ impl Default for RenderConfig {
 impl RenderConfig {
     pub fn reset_defaults(&mut self) {
         *self = Self::default();
+    }
+
+    /// Compute the actual iso_value for marching cubes from the normalized threshold.
+    /// The threshold is multiplied by the Poly6 kernel peak at r=0 for the MC kernel radius
+    /// (kernel_radius * 2.5), making it stable across kernel_radius changes.
+    pub fn compute_iso_value(&self, kernel_radius: f32) -> f32 {
+        let h_mc = kernel_radius * 2.5;
+        let pi = std::f32::consts::PI;
+        // Poly6 peak at r=0: 315 / (64 * pi * h^3)
+        let poly6_peak = 315.0 / (64.0 * pi * h_mc * h_mc * h_mc);
+        self.mc_threshold * poly6_peak
     }
 
     /// Calculate the visual margin for boundary compensation
