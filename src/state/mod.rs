@@ -725,10 +725,10 @@ impl Default for SphConfig {
             kernel_radius: 0.08,
             rest_density: 8000.0,
             stiffness: 35.0,
-            near_stiffness: 0.45,
-            viscosity: 0.5,            // Monaghan artificial viscosity coefficient
+            near_stiffness: 0.40,
+            viscosity: 2.25,            // Monaghan artificial viscosity coefficient
             mass: 1.0,
-            surface_tension: 0.05,    // Akinci 2013 surface tension coefficient
+            surface_tension: 0.10,    // Akinci 2013 surface tension coefficient
             wall_stiffness: 250.0,
         }
     }
