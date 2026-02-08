@@ -9,7 +9,7 @@ use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
 use super::RigidBodyRenderer;
 use super::SprayRenderer;
 use crate::render::GpuCameraParams;
-use crate::state::{GpuEnvironmentParams, GpuLightParams};
+use crate::state::{GpuEnvironmentParams, GpuLightParams, GpuShCoefficients};
 
 /// Grid resolution for marching cubes (cells per dimension)
 const GRID_SIZE: u32 = 100;
@@ -235,6 +235,7 @@ pub struct MarchingCubesRenderer {
     water_params_buffer: wgpu::Buffer,
     light_params_buffer: wgpu::Buffer,
     env_params_buffer: wgpu::Buffer,
+    sh_coefficients_buffer: wgpu::Buffer,
     indirect_buffer: wgpu::Buffer,  // For indirect draw calls
 
     // Pipelines
@@ -479,6 +480,14 @@ impl MarchingCubesRenderer {
         let env_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MC Env Params"),
             contents: bytemuck::bytes_of(&env_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // SH coefficients buffer (144 bytes)
+        let sh_coefficients = GpuShCoefficients::default();
+        let sh_coefficients_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MC SH Coefficients"),
+            contents: bytemuck::bytes_of(&sh_coefficients),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -914,6 +923,17 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // SH irradiance coefficients
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1090,6 +1110,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: light_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: sh_coefficients_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1293,6 +1317,7 @@ impl MarchingCubesRenderer {
             water_params_buffer,
             light_params_buffer,
             env_params_buffer,
+            sh_coefficients_buffer,
             indirect_buffer,
             density_pipeline,
             generate_pipeline,
@@ -1349,6 +1374,10 @@ impl MarchingCubesRenderer {
 
     pub fn update_light_params(&self, queue: &wgpu::Queue, params: &GpuLightParams) {
         queue.write_buffer(&self.light_params_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn update_sh_coefficients(&self, queue: &wgpu::Queue, coeffs: &GpuShCoefficients) {
+        queue.write_buffer(&self.sh_coefficients_buffer, 0, bytemuck::bytes_of(coeffs));
     }
 
     pub fn update_params(&self, queue: &wgpu::Queue, kernel_radius: f32, iso_value: f32, num_particles: u32, blur_radius: u32) {
@@ -1725,6 +1754,10 @@ impl MarchingCubesRenderer {
                     binding: 8,
                     resource: self.light_params_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.sh_coefficients_buffer.as_entire_binding(),
+                },
             ],
         });
     }
@@ -1796,6 +1829,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: self.light_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.sh_coefficients_buffer.as_entire_binding(),
                 },
             ],
         });

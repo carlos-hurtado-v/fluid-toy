@@ -2,13 +2,14 @@
 
 use crate::render::camera::GpuCameraParams;
 use crate::simulation::SphParticle3D;
-use crate::state::GpuRenderParams;
+use crate::state::{GpuLightParams, GpuRenderParams};
 use wgpu::util::DeviceExt;
 
 pub struct ParticleRenderer3D {
     render_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
+    light_params_buffer: wgpu::Buffer,
     _bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     depth_texture: wgpu::Texture,
@@ -44,7 +45,24 @@ impl ParticleRenderer3D {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Bind group layout for camera + render params
+        // Create light params buffer with defaults
+        let light_params = GpuLightParams {
+            sun_direction: [0.4, 0.8, 0.3],
+            sun_enabled: 1,
+            sun_color: [0.98, 0.82, 0.6],
+            sun_intensity: 2.0,
+            _pad_unused: 0.0,
+            _pad0: [0.0; 3],
+            _padding: [0.0; 3],
+            _pad1: 0.0,
+        };
+        let light_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("3D Particle Light Params"),
+            contents: bytemuck::bytes_of(&light_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Bind group layout for camera + render params + light params
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("3D Render Bind Group Layout"),
             entries: &[
@@ -72,6 +90,18 @@ impl ParticleRenderer3D {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<GpuLightParams>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -86,6 +116,10 @@ impl ParticleRenderer3D {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: light_params_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -161,6 +195,7 @@ impl ParticleRenderer3D {
             render_pipeline,
             camera_buffer,
             params_buffer,
+            light_params_buffer,
             _bind_group_layout: bind_group_layout,
             bind_group,
             depth_texture,
@@ -177,6 +212,11 @@ impl ParticleRenderer3D {
     /// Update render parameters
     pub fn update_params(&self, queue: &wgpu::Queue, params: &GpuRenderParams) {
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    /// Update light parameters
+    pub fn update_light_params(&self, queue: &wgpu::Queue, params: &GpuLightParams) {
+        queue.write_buffer(&self.light_params_buffer, 0, bytemuck::bytes_of(params));
     }
 
     /// Expose depth view for other renderers (e.g. rigid body) to depth-test against

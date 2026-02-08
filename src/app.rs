@@ -18,7 +18,8 @@ use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleR
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
 use crate::render::mesh_loader::{self, SdfData};
-use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, quat_mul, quat_normalize};
+use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuShCoefficients, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, quat_mul, quat_normalize};
+use crate::render::environment::ShCoefficients;
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -37,6 +38,7 @@ pub struct App {
     env_view: Option<wgpu::TextureView>,
     env_sampler: Option<wgpu::Sampler>,
     current_hdr: HdrEnvironment,
+    sh_coefficients: Option<ShCoefficients>,
     // Environment background rendering (for Particles mode)
     env_bg_pipeline: Option<wgpu::RenderPipeline>,
     env_bg_bind_group: Option<wgpu::BindGroup>,
@@ -80,6 +82,7 @@ impl App {
             env_view: None,
             env_sampler: None,
             current_hdr: HdrEnvironment::Farmland,
+            sh_coefficients: None,
             env_bg_pipeline: None,
             env_bg_bind_group: None,
             env_bg_bind_group_layout: None,
@@ -166,7 +169,7 @@ impl App {
         );
 
         // Load environment map (shared by SS + MC renderers)
-        let (env_texture, env_view, env_sampler) = load_embedded_environment_map(
+        let (env_texture, env_view, env_sampler, sh_coefficients) = load_embedded_environment_map(
             &gpu.device,
             &gpu.queue,
             self.state.environment.hdr_selection,
@@ -384,6 +387,10 @@ impl App {
             egui_wgpu::RendererOptions::default(),
         );
 
+        // Upload SH coefficients to MC renderer before moving locals
+        let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
+        mc_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
+
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
         self.mc_renderer = Some(mc_renderer);
@@ -396,6 +403,7 @@ impl App {
         self.env_texture = Some(env_texture);
         self.env_view = Some(env_view);
         self.env_sampler = Some(env_sampler);
+        self.sh_coefficients = Some(sh_coefficients);
         self.current_hdr = self.state.environment.hdr_selection;
         self.env_bg_pipeline = Some(env_bg_pipeline);
         self.env_bg_bind_group = Some(env_bg_bind_group);
@@ -636,16 +644,20 @@ impl App {
         let gpu = self.gpu.as_ref().unwrap();
         let selection = self.state.environment.hdr_selection;
 
-        let (env_texture, env_view, env_sampler) = load_embedded_environment_map(
+        let (env_texture, env_view, env_sampler, sh_coefficients) = load_embedded_environment_map(
             &gpu.device,
             &gpu.queue,
             selection,
         ).expect("Failed to load environment map");
 
-        // Rebuild MC renderer bind groups
+        // Rebuild MC renderer bind groups and update SH coefficients
         if let Some(mc_renderer) = &mut self.mc_renderer {
             mc_renderer.rebuild_env_bind_groups(&gpu.device, &env_view, &env_sampler);
+            let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
+            mc_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
         }
+
+        self.sh_coefficients = Some(sh_coefficients);
 
         // Rebuild env background bind group (for Particles mode)
         if let (Some(layout), Some(renderer), Some(buf)) = (
@@ -781,6 +793,7 @@ impl App {
 
             let render_params = self.state.rendering.to_gpu_params();
             renderer.update_params(&gpu.queue, &render_params);
+            renderer.update_light_params(&gpu.queue, &self.state.lighting.to_gpu_params());
         }
     }
 

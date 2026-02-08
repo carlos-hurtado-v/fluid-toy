@@ -533,7 +533,7 @@ impl Default for LightingConfig {
         // Default sun position: upper-right-front, warm sunlight color
         Self {
             sun_enabled: true,
-            sun_direction: [0.0, 0.15, 0.3],  // Will be normalized in shader
+            sun_direction: [0.4, 0.8, 0.3],  // ~55° elevation, visible specular highlights
             sun_color: [0.98, 0.82, 0.6],    // Warm white sunlight
             sun_intensity: 2.0,
         }
@@ -1159,6 +1159,20 @@ pub struct GpuSprayRenderParams {
     pub particle_size: f32,
     pub max_particles: u32,
     pub _pad: [f32; 2],
+}
+
+/// GPU spherical harmonics coefficients (144 bytes, uniform buffer)
+/// 9 coefficients × vec4<f32> (RGB + pad per coefficient)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuShCoefficients {
+    pub coeffs: [[f32; 4]; 9],
+}
+
+impl Default for GpuShCoefficients {
+    fn default() -> Self {
+        Self { coeffs: [[0.0; 4]; 9] }
+    }
 }
 
 /// GPU environment parameters (32 bytes, uniform buffer)

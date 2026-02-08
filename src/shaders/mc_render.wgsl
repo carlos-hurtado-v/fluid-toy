@@ -54,6 +54,7 @@ struct Vertex {
 @group(0) @binding(6) var depth_sampler: sampler;
 @group(0) @binding(7) var background_tex: texture_2d<f32>;
 @group(0) @binding(8) var<uniform> light: LightParams;
+@group(0) @binding(9) var<uniform> sh_coeffs: array<vec4<f32>, 9>;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -115,6 +116,24 @@ fn sample_environment(dir: vec3<f32>) -> vec3<f32> {
     return textureSample(env_tex, env_sampler, vec2<f32>(u, v)).rgb;
 }
 
+// Evaluate order-2 spherical harmonics irradiance
+// Coefficients are pre-convolved with cosine lobe on CPU
+fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
+    // Band 0 (constant)
+    var irradiance = sh_coeffs[0].rgb * 0.282095;
+    // Band 1 (linear)
+    irradiance += sh_coeffs[1].rgb * 0.488603 * n.y;
+    irradiance += sh_coeffs[2].rgb * 0.488603 * n.z;
+    irradiance += sh_coeffs[3].rgb * 0.488603 * n.x;
+    // Band 2 (quadratic)
+    irradiance += sh_coeffs[4].rgb * 1.092548 * n.x * n.y;
+    irradiance += sh_coeffs[5].rgb * 1.092548 * n.y * n.z;
+    irradiance += sh_coeffs[6].rgb * 0.315392 * (3.0 * n.z * n.z - 1.0);
+    irradiance += sh_coeffs[7].rgb * 1.092548 * n.x * n.z;
+    irradiance += sh_coeffs[8].rgb * 0.546274 * (n.x * n.x - n.y * n.y);
+    return max(irradiance, vec3<f32>(0.0));
+}
+
 // Linearize depth from depth buffer (reverse-Z or standard)
 fn linearize_depth(d: f32, near: f32, far: f32) -> f32 {
     return near * far / (far - d * (far - near));
@@ -161,10 +180,6 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     } else {
         reflection_color = sample_environment(reflect_dir) * water.env_intensity;
     }
-
-    // Apply partial absorption to reflections (light enters, scatters internally, exits)
-    let reflection_absorption = exp(-absorption_coeffs * density * thickness * 0.3);
-    reflection_color *= mix(vec3<f32>(1.0), reflection_absorption, 0.5);
 
     // === SCREEN-SPACE REFRACTION ===
     // Transform normal to view space for screen-space distortion
@@ -242,8 +257,16 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         sun_subsurface += water.water_color * forward_scatter * light.sun_color * light.sun_intensity * 0.25;
     }
 
-    // Add sun subsurface to interior (before Fresnel blend, it's inside the water)
-    let lit_interior = interior_with_scatter + sun_subsurface;
+    // IBL diffuse irradiance from spherical harmonics
+    // Light enters the water (1-F), travels through the volume (transmittance),
+    // and scatters back (scatter_strength) — same physics as subsurface scattering
+    let ambient_irradiance = evaluate_sh_irradiance(normal) * water.env_intensity;
+    let ambient_subsurface = ambient_irradiance * water.water_color * transmittance * scatter_strength;
+
+    // Add sun subsurface (weighted by 1-fresnel for energy conservation) and ambient irradiance
+    let lit_interior = interior_with_scatter
+        + sun_subsurface * (1.0 - fresnel)
+        + ambient_subsurface * (1.0 - fresnel);
 
     // Combine reflection and refraction based on Fresnel
     // At grazing angles (high fresnel): more reflection

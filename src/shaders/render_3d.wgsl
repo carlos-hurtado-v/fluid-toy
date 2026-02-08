@@ -14,6 +14,15 @@ struct RenderParams {
     particle_color: vec4<f32>,
 }
 
+struct LightParams {
+    sun_direction: vec3<f32>,
+    sun_enabled: u32,
+    sun_color: vec3<f32>,
+    sun_intensity: f32,
+    _pad2: f32,
+    _padding: vec3<f32>,
+}
+
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -24,6 +33,7 @@ struct VertexOutput {
 
 @group(0) @binding(0) var<uniform> camera: CameraParams;
 @group(0) @binding(1) var<uniform> params: RenderParams;
+@group(0) @binding(2) var<uniform> light: LightParams;
 
 @vertex
 fn vs_main(
@@ -88,8 +98,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(color, vec3<f32>(0.3, 0.8, 1.0), t);
     }
 
-    // Simple lighting
-    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.8));
+    // Simple lighting using sun direction from uniform
+    let light_dir = normalize(light.sun_direction);
     let ndotl = max(dot(normal, light_dir), 0.0);
     let ambient = 0.3;
     let diffuse = 0.7;
