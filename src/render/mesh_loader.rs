@@ -33,7 +33,7 @@ pub fn load_embedded_duck() -> Result<LoadedMesh, Box<dyn std::error::Error>> {
 }
 
 /// Parse a GLB file from raw bytes, merging all meshes and primitives
-pub fn load_glb_from_bytes(bytes: &[u8]) -> Result<LoadedMesh, Box<dyn std::error::Error>> {
+fn load_glb_from_bytes(bytes: &[u8]) -> Result<LoadedMesh, Box<dyn std::error::Error>> {
     let (document, buffers, images) = gltf::import_slice(bytes)?;
 
     // First pass: collect all raw positions across all primitives for AABB computation
@@ -200,7 +200,7 @@ pub fn load_glb_from_bytes(bytes: &[u8]) -> Result<LoadedMesh, Box<dyn std::erro
 /// Grid spans [-1, 1]³ matching the normalized mesh coordinate space.
 /// Negative = inside mesh, positive = outside.
 /// Uses ray-casting for robust inside/outside determination.
-pub fn voxelize_sdf(vertices: &[MeshVertex], indices: &[u32], resolution: u32) -> SdfData {
+fn voxelize_sdf(vertices: &[MeshVertex], indices: &[u32], resolution: u32) -> SdfData {
     let res = resolution as usize;
     let mut data = vec![f32::MAX; res * res * res];
 

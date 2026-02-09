@@ -18,7 +18,7 @@ use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleR
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
 use crate::render::mesh_loader::{self, SdfData};
-use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuShCoefficients, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, quat_mul, quat_normalize};
+use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuShCoefficients, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, integrate_rigid_body};
 use crate::render::environment::ShCoefficients;
 
 pub struct App {
@@ -935,127 +935,14 @@ impl App {
         if self.state.rigid_body.enabled && !self.state.rigid_body.held && !self.state.simulation.paused {
             if let Some(sph_sim) = &self.sph_simulation {
                 let accum = sph_sim.rigid_body_accum();
-                let reaction = [
-                    accum.force_x as f32 / 1000.0,
-                    accum.force_y as f32 / 1000.0,
-                    accum.force_z as f32 / 1000.0,
-                ];
-
-                let he = self.state.rigid_body.half_extent;
-                let volume = self.state.rigid_body.shape.volume(he);
-                let body_mass = self.state.rigid_body.density * volume;
-                let gravity = self.state.simulation.gravity_vector();
-                let dt = self.state.simulation.delta_time;
-                let total_dt = num_substeps as f32 * dt;
-
-                if body_mass > 0.0 {
-                    // Reaction-induced velocity change (clamped to prevent explosions with light bodies)
-                    let mut dv = [0.0f32; 3];
-                    for i in 0..3 {
-                        dv[i] = dt * reaction[i] / body_mass;
-                    }
-                    let max_dv = total_dt * 200.0; // Match SPH particle accel clamp
-                    let dv_mag = (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]).sqrt();
-                    if dv_mag > max_dv {
-                        let scale = max_dv / dv_mag;
-                        for i in 0..3 { dv[i] *= scale; }
-                    }
-                    for i in 0..3 {
-                        self.state.rigid_body.velocity[i] += dv[i] + total_dt * gravity[i];
-                        self.state.rigid_body.velocity[i] *= 0.995; // Light damping
-                    }
-                    for i in 0..3 {
-                        self.state.rigid_body.position[i] += total_dt * self.state.rigid_body.velocity[i];
-                    }
-
-                    // Angular dynamics: torque → angular acceleration → angular velocity → quaternion
-                    let torque = [
-                        accum.torque_x as f32 / 1000.0,
-                        accum.torque_y as f32 / 1000.0,
-                        accum.torque_z as f32 / 1000.0,
-                    ];
-                    let inertia = self.state.rigid_body.shape.moment_of_inertia(body_mass, he);
-
-                    if inertia > 0.0 {
-                        let mut dw = [0.0f32; 3];
-                        for i in 0..3 {
-                            dw[i] = dt * torque[i] / inertia;
-                        }
-                        let max_dw = total_dt * 50.0; // Clamp angular accel for light bodies
-                        let dw_mag = (dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]).sqrt();
-                        if dw_mag > max_dw {
-                            let scale = max_dw / dw_mag;
-                            for i in 0..3 { dw[i] *= scale; }
-                        }
-                        for i in 0..3 {
-                            self.state.rigid_body.angular_velocity[i] += dw[i];
-                            self.state.rigid_body.angular_velocity[i] *= 0.98; // Angular damping
-                        }
-
-                        // Quaternion integration: q += 0.5 * dt * [ω, 0] * q
-                        let av = self.state.rigid_body.angular_velocity;
-                        let omega_quat = [av[0], av[1], av[2], 0.0];
-                        let q = self.state.rigid_body.orientation;
-                        let q_dot = quat_mul(omega_quat, q);
-                        self.state.rigid_body.orientation = quat_normalize([
-                            q[0] + 0.5 * total_dt * q_dot[0],
-                            q[1] + 0.5 * total_dt * q_dot[1],
-                            q[2] + 0.5 * total_dt * q_dot[2],
-                            q[3] + 0.5 * total_dt * q_dot[3],
-                        ]);
-                    }
-
-                    // Container collision in tilted local space
-                    // (same rotation matrix as particle boundary handling)
-                    let (sin_x, cos_x) = self.state.container.tilt_x.sin_cos();
-                    let (sin_z, cos_z) = self.state.container.tilt_z.sin_cos();
-                    // Rotation rows (world → container local): Rz * Rx
-                    let r0 = [cos_z, -sin_z * cos_x, sin_z * sin_x];
-                    let r1 = [sin_z,  cos_z * cos_x, -cos_z * sin_x];
-                    let r2 = [0.0,    sin_x,           cos_x];
-
-                    let rb = &mut self.state.rigid_body;
-                    let rhe = rb.half_extent;
-                    let pos = rb.position;
-                    let vel = rb.velocity;
-
-                    // Transform to local space
-                    let mut lp = [
-                        r0[0]*pos[0] + r0[1]*pos[1] + r0[2]*pos[2],
-                        r1[0]*pos[0] + r1[1]*pos[1] + r1[2]*pos[2],
-                        r2[0]*pos[0] + r2[1]*pos[1] + r2[2]*pos[2],
-                    ];
-                    let mut lv = [
-                        r0[0]*vel[0] + r0[1]*vel[1] + r0[2]*vel[2],
-                        r1[0]*vel[0] + r1[1]*vel[1] + r1[2]*vel[2],
-                        r2[0]*vel[0] + r2[1]*vel[1] + r2[2]*vel[2],
-                    ];
-
-                    let hw = self.state.container.half_width();
-                    let hd = self.state.container.half_depth();
-                    let floor_y = self.state.container.floor_y;
-                    let ceil_y = self.state.container.ceiling_y();
-
-                    // Clamp in local space
-                    if lp[0] - rhe < -hw  { lp[0] = -hw + rhe;  lv[0] =  lv[0].abs() * 0.3; }
-                    if lp[0] + rhe >  hw  { lp[0] =  hw - rhe;  lv[0] = -lv[0].abs() * 0.3; }
-                    if lp[1] - rhe < floor_y { lp[1] = floor_y + rhe; lv[1] =  lv[1].abs() * 0.3; }
-                    if lp[1] + rhe > ceil_y  { lp[1] = ceil_y - rhe;  lv[1] = -lv[1].abs() * 0.3; }
-                    if lp[2] - rhe < -hd  { lp[2] = -hd + rhe;  lv[2] =  lv[2].abs() * 0.3; }
-                    if lp[2] + rhe >  hd  { lp[2] =  hd - rhe;  lv[2] = -lv[2].abs() * 0.3; }
-
-                    // Transform back to world space (multiply by R^T)
-                    rb.position = [
-                        r0[0]*lp[0] + r1[0]*lp[1] + r2[0]*lp[2],
-                        r0[1]*lp[0] + r1[1]*lp[1] + r2[1]*lp[2],
-                        r0[2]*lp[0] + r1[2]*lp[1] + r2[2]*lp[2],
-                    ];
-                    rb.velocity = [
-                        r0[0]*lv[0] + r1[0]*lv[1] + r2[0]*lv[2],
-                        r0[1]*lv[0] + r1[1]*lv[1] + r2[1]*lv[2],
-                        r0[2]*lv[0] + r1[2]*lv[1] + r2[2]*lv[2],
-                    ];
-                }
+                integrate_rigid_body(
+                    &mut self.state.rigid_body,
+                    &self.state.container,
+                    self.state.simulation.delta_time,
+                    num_substeps,
+                    self.state.simulation.gravity_vector(),
+                    accum,
+                );
             }
         }
 
