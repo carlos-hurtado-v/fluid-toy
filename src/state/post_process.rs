@@ -1,5 +1,30 @@
 //! Post-processing configuration
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AoDebugMode {
+    Off,
+    RawAo,
+    AppliedFactor,
+}
+
+impl AoDebugMode {
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::RawAo => 1,
+            Self::AppliedFactor => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::RawAo => "Raw AO",
+            Self::AppliedFactor => "Applied AO",
+        }
+    }
+}
+
 /// Post-processing settings
 #[derive(Debug, Clone)]
 pub struct PostProcessConfig {
@@ -43,6 +68,7 @@ pub struct PostProcessConfig {
     pub ao_enabled: bool,
     pub ao_intensity: f32,
     pub ao_radius: f32,
+    pub ao_debug_mode: AoDebugMode,
 }
 
 impl Default for PostProcessConfig {
@@ -83,7 +109,8 @@ impl Default for PostProcessConfig {
             // Ambient Occlusion
             ao_enabled: true,
             ao_intensity: 1.5,
-            ao_radius: 0.15,
+            ao_radius: 0.2,
+            ao_debug_mode: AoDebugMode::Off,
         }
     }
 }
@@ -134,6 +161,7 @@ pub struct GpuPostProcessParams {
 
     // Ambient Occlusion
     pub ao_enabled: u32,
+    pub ao_debug_mode: u32,
     pub ao_intensity: f32,
     pub _padding: f32,
 }
@@ -162,6 +190,7 @@ impl PostProcessConfig {
             streaks_tint_g: self.streaks_tint[1],
             streaks_tint_b: self.streaks_tint[2],
             ao_enabled: if self.ao_enabled { 1 } else { 0 },
+            ao_debug_mode: self.ao_debug_mode.as_u32(),
             ao_intensity: self.ao_intensity,
             _padding: 0.0,
         }

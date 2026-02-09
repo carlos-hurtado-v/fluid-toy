@@ -39,6 +39,7 @@ struct PostProcessParams {
 
     // Ambient Occlusion
     ao_enabled: u32,
+    ao_debug_mode: u32,
     ao_intensity: f32,
     _padding: f32,
 }
@@ -126,6 +127,12 @@ fn apply_chromatic_aberration(uv: vec2<f32>, intensity: f32) -> vec3<f32> {
     return vec3<f32>(r, g, b);
 }
 
+fn sample_ao(uv: vec2<f32>) -> f32 {
+    let ao_size = vec2<i32>(textureDimensions(ao_texture));
+    let ao_coord = clamp(vec2<i32>(uv * vec2<f32>(ao_size)), vec2<i32>(0), ao_size - vec2<i32>(1));
+    return clamp(textureLoad(ao_texture, ao_coord, 0).r, 0.0, 1.0);
+}
+
 // ACES Filmic Tonemapping (Stephen Hill's fit)
 // More accurate than the simple Narkowicz approximation
 // Includes proper sRGB -> ACES -> RRT+ODT -> sRGB transforms
@@ -174,15 +181,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color = textureSample(scene_texture, texture_sampler, input.uv).rgb;
     }
 
+    let ao = sample_ao(input.uv);
+    // max(ao, 1e-4) avoids pow(0, 0) which is undefined in WGSL.
+    let ao_factor = max(pow(max(ao, 1e-4), params.ao_intensity), 0.05);
+
+    // AO debug views bypass all other grading/tonemapping to inspect AO directly.
+    if (params.ao_debug_mode == 1u) {
+        return vec4<f32>(vec3<f32>(ao), 1.0);
+    }
+    if (params.ao_debug_mode == 2u) {
+        return vec4<f32>(vec3<f32>(ao_factor), 1.0);
+    }
+
     // Apply ambient occlusion
     if (params.ao_enabled == 1u) {
-        let ao_size = vec2<f32>(textureDimensions(ao_texture));
-        let ao_coord = vec2<i32>(input.uv * ao_size);
-        let ao = textureLoad(ao_texture, ao_coord, 0).r;
-        // pow() keeps result in [0,1] for any intensity (unlike mix which goes negative >1)
-        // max(ao, 1e-4) avoids pow(0, 0) which is undefined in WGSL
-        // Floor at 0.05 prevents total blackout in tight concavities
-        let ao_factor = max(pow(max(clamp(ao, 0.0, 1.0), 1e-4), params.ao_intensity), 0.05);
+        // Floor at 0.05 prevents total blackout in tight concavities.
         color *= ao_factor;
     }
 

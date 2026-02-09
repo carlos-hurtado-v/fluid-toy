@@ -1,6 +1,6 @@
 //! GUI module - egui integration for parameter control
 
-use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, HdrEnvironment, RigidBodyShape, SimulationConfig};
+use crate::state::{AoDebugMode, AppState, BackgroundMode, FluidRenderMode, ForceMode, HdrEnvironment, RigidBodyShape, SimulationConfig};
 
 /// Renders the control panel and returns any triggered action
 pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAction {
@@ -535,6 +535,13 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                             egui::Slider::new(&mut state.post_process.ao_radius, 0.05..=0.5)
                                 .text("Radius")
                         );
+                        egui::ComboBox::from_label("AO Debug")
+                            .selected_text(state.post_process.ao_debug_mode.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut state.post_process.ao_debug_mode, AoDebugMode::Off, AoDebugMode::Off.label());
+                                ui.selectable_value(&mut state.post_process.ao_debug_mode, AoDebugMode::RawAo, AoDebugMode::RawAo.label());
+                                ui.selectable_value(&mut state.post_process.ao_debug_mode, AoDebugMode::AppliedFactor, AoDebugMode::AppliedFactor.label());
+                            });
                     }
 
                     ui.add_space(8.0);

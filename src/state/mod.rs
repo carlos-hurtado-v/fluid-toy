@@ -6,7 +6,7 @@ pub mod rendering;
 pub mod rigid_body;
 pub mod interaction;
 
-pub use post_process::PostProcessConfig;
+pub use post_process::{AoDebugMode, PostProcessConfig};
 pub use simulation::*;
 pub use rendering::*;
 pub use rigid_body::*;

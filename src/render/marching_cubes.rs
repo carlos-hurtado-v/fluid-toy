@@ -1085,7 +1085,10 @@ impl MarchingCubesRenderer {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Cw,
-                cull_mode: Some(wgpu::Face::Back),  // Cull back faces (render front only)
+                // For GTAO input we need nearest visible depth regardless of winding.
+                // Marching-cubes output can have local winding inconsistencies, so
+                // culling here creates missing depth regions and unstable AO.
+                cull_mode: None,
                 unclipped_depth: false,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,

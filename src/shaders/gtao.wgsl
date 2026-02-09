@@ -1,7 +1,7 @@
 // GTAO (Ground Truth Ambient Occlusion) - Jimenez 2016
 // All compute shaders in one file with multiple entry points.
 // Operates at half resolution for performance.
-// Uses 3 slices per pixel with per-pixel hash noise for smooth results.
+// Uses 4 slices per pixel with per-pixel hash noise for smooth results.
 
 struct GtaoParams {
     radius: f32,
@@ -41,12 +41,10 @@ struct CameraParams {
 @group(0) @binding(3) var<uniform> camera: CameraParams;
 
 fn linearize_depth(d: f32) -> f32 {
-    // Our OpenGL-style projection maps z_ndc to [-1, 1].
-    // wgpu depth buffer stores z_ndc directly (clamped to [0,1]).
-    // For most of the visible range, z_ndc is already in [0,1].
+    // GTAO depth linearization for standard depth [0, 1].
     let near = camera.near;
     let far = camera.far;
-    return (2.0 * near * far) / (far + near - d * (far - near));
+    return (near * far) / max(far - d * (far - near), 0.0001);
 }
 
 @compute @workgroup_size(8, 8)
@@ -56,7 +54,7 @@ fn prefilter_depth(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // Sample 2x2 block from full-res depth, take minimum (conservative)
+    // Sample 2x2 block from full-res depth (average for stability).
     let base = id.xy * 2u;
     let d0 = textureLoad(depth_input, base, 0);
     let d1 = textureLoad(depth_input, base + vec2<u32>(1u, 0u), 0);
@@ -68,7 +66,7 @@ fn prefilter_depth(@builtin(global_invocation_id) id: vec3<u32>) {
     let l2 = linearize_depth(d2);
     let l3 = linearize_depth(d3);
 
-    let linear_z = min(min(l0, l1), min(l2, l3));
+    let linear_z = 0.25 * (l0 + l1 + l2 + l3);
 
     textureStore(linear_depth_output, id.xy, vec4<f32>(linear_z, 0.0, 0.0, 0.0));
 }
@@ -83,17 +81,69 @@ fn prefilter_depth(@builtin(global_invocation_id) id: vec3<u32>) {
 fn reconstruct_view_pos(uv: vec2<f32>, linear_z: f32) -> vec3<f32> {
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0);
     let view_xy = vec2<f32>(
-        ndc.x * camera.inv_projection[0][0],
-        ndc.y * camera.inv_projection[1][1]
+        ndc.x * linear_z / camera.projection[0][0],
+        ndc.y * linear_z / camera.projection[1][1]
     );
-    return vec3<f32>(view_xy * linear_z, -linear_z);
+    return vec3<f32>(view_xy, linear_z);
+}
+
+fn clamp_coord(coord: vec2<i32>) -> vec2<i32> {
+    let half_size = vec2<i32>(params.half_res);
+    return clamp(coord, vec2<i32>(0), half_size - vec2<i32>(1));
 }
 
 fn load_linear_depth(coord: vec2<i32>) -> f32 {
-    return textureLoad(linear_depth_input, coord, 0).r;
+    return textureLoad(linear_depth_input, clamp_coord(coord), 0).r;
+}
+
+fn calculate_edges(center_z: f32, left_z: f32, right_z: f32, top_z: f32, bottom_z: f32) -> vec4<f32> {
+    var edges = vec4<f32>(left_z, right_z, top_z, bottom_z) - center_z;
+    let slope_lr = (edges.y - edges.x) * 0.5;
+    let slope_tb = (edges.w - edges.z) * 0.5;
+    let edges_slope_adjusted = edges + vec4<f32>(slope_lr, -slope_lr, slope_tb, -slope_tb);
+    edges = min(abs(edges), abs(edges_slope_adjusted));
+    return clamp(1.25 - edges / max(center_z * 0.011, 0.0001), vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+fn reconstruct_normal(
+    edges_lrtb: vec4<f32>,
+    center_pos: vec3<f32>,
+    pos_l: vec3<f32>,
+    pos_r: vec3<f32>,
+    pos_u: vec3<f32>,
+    pos_d: vec3<f32>,
+) -> vec3<f32> {
+    let accepted = clamp(
+        vec4<f32>(
+            edges_lrtb.x * edges_lrtb.z,
+            edges_lrtb.z * edges_lrtb.y,
+            edges_lrtb.y * edges_lrtb.w,
+            edges_lrtb.w * edges_lrtb.x
+        ) + vec4<f32>(0.01),
+        vec4<f32>(0.0),
+        vec4<f32>(1.0)
+    );
+
+    let l = normalize(pos_l - center_pos);
+    let r = normalize(pos_r - center_pos);
+    let u = normalize(pos_u - center_pos);
+    let d = normalize(pos_d - center_pos);
+
+    let n =
+        accepted.x * cross(l, u) +
+        accepted.y * cross(u, r) +
+        accepted.z * cross(r, d) +
+        accepted.w * cross(d, l);
+
+    let n_len = length(n);
+    if (n_len < 0.0001) {
+        return vec3<f32>(0.0);
+    }
+    return n / n_len;
 }
 
 const PI: f32 = 3.14159265359;
+const PI_HALF: f32 = 1.57079632679;
 const NUM_SLICES: u32 = 4u;
 
 // Per-pixel spatial hash for noise — avoids visible tiling patterns
@@ -127,6 +177,7 @@ fn gtao_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let center_pos = reconstruct_view_pos(uv, center_depth);
+    let view_vec = normalize(-center_pos);
 
     // Reconstruct normal from depth via cross-product of neighbors
     let depth_l = load_linear_depth(coord + vec2<i32>(-1, 0));
@@ -139,90 +190,119 @@ fn gtao_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let pos_u = reconstruct_view_pos(uv + vec2<f32>(0.0, -params.inv_half_res.y), depth_u);
     let pos_d = reconstruct_view_pos(uv + vec2<f32>(0.0, params.inv_half_res.y), depth_d);
 
-    // Pick the pair with smallest depth difference for robust normals at edges
-    let ddx = select(pos_r - center_pos, center_pos - pos_l,
-        abs(depth_r - center_depth) > abs(depth_l - center_depth));
-    let ddy = select(pos_d - center_pos, center_pos - pos_u,
-        abs(depth_d - center_depth) > abs(depth_u - center_depth));
+    let edges_lrtb = calculate_edges(center_depth, depth_l, depth_r, depth_u, depth_d);
+    var normal = reconstruct_normal(edges_lrtb, center_pos, pos_l, pos_r, pos_u, pos_d);
+    if (length(normal) < 0.0001) {
+        textureStore(ao_output, id.xy, vec4<f32>(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
 
-    let normal = normalize(cross(ddy, ddx));
+    // Keep the normal in the visible hemisphere to avoid horizon inversion.
+    if (dot(normal, view_vec) < 0.0) {
+        normal = -normal;
+    }
 
     // Per-pixel random rotation offset (changes each frame for temporal smoothing)
     let noise = spatial_hash(id.xy, params.frame_index);
 
-    // Project world-space radius to screen pixels at this depth
-    // projection[1][1] = 1/tan(fov/2), gives FOV-correct scaling
-    // Cap at 64px to prevent samples from reaching past object edges
+    // Project world-space radius to screen pixels at this depth.
     let proj_scale = params.half_res.y * 0.5 * camera.projection[1][1];
     let radius_pixels = min(params.radius * proj_scale / center_depth, 64.0);
+    if (radius_pixels < 1.0) {
+        textureStore(ao_output, id.xy, vec4<f32>(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
 
     let falloff_start = params.falloff_start;
     let falloff_range = max(1.0 - falloff_start, 0.001);
+    let num_steps = max(params.num_steps, 1u);
 
-    // Accumulate AO across multiple slice directions
-    var ao_sum: f32 = 0.0;
+    // GTAO visibility integrated across multiple horizon slices.
+    var visibility_sum: f32 = 0.0;
 
     for (var slice = 0u; slice < NUM_SLICES; slice++) {
-        // Evenly-spaced slice angles with per-pixel noise jitter
+        // Slice angle as in Jimenez et al.
         let angle = (f32(slice) + noise) * PI / f32(NUM_SLICES);
-        let slice_dir = vec2<f32>(cos(angle), sin(angle));
+        let cos_phi = cos(angle);
+        let sin_phi = sin(angle);
+        // UV Y increases downward, while view-space Y increases upward.
+        // Keep sampling direction consistent with the view-space direction basis.
+        let slice_dir = vec2<f32>(cos_phi, -sin_phi);
 
-        // Track max horizon cosine in both march directions
-        // h=0 means nothing above tangent plane (fully unoccluded)
-        var h1: f32 = 0.0;
-        var h2: f32 = 0.0;
+        let direction_vec = vec3<f32>(cos_phi, sin_phi, 0.0);
+        let ortho_direction_vec = direction_vec - dot(direction_vec, view_vec) * view_vec;
+        if (length(ortho_direction_vec) < 0.0001) {
+            visibility_sum += 1.0;
+            continue;
+        }
 
-        for (var step = 1u; step <= params.num_steps; step++) {
-            // Quadratic stepping: t² concentrates samples near the center
-            // where nearby occlusion matters most, while still reaching full radius.
-            let t = f32(step) / f32(params.num_steps); // [1/N .. 1]
-            let step_dist = max(t * t * radius_pixels, 1.0); // at least 1 pixel
-            let offset = slice_dir * step_dist;
+        let axis_vec = normalize(cross(ortho_direction_vec, view_vec));
+        let projected_normal_vec = normal - axis_vec * dot(normal, axis_vec);
+        var projected_normal_len = length(projected_normal_vec);
+        if (projected_normal_len < 0.0001) {
+            visibility_sum += 1.0;
+            continue;
+        }
+        // XeGTAO uses a slight bias toward 1 to avoid over-darkening on high slopes.
+        projected_normal_len = mix(projected_normal_len, 1.0, 0.05);
 
-            // +direction
+        let sign_norm = select(-1.0, 1.0, dot(ortho_direction_vec, projected_normal_vec) >= 0.0);
+        let cos_norm = clamp(dot(projected_normal_vec, view_vec) / projected_normal_len, 0.0, 1.0);
+        let n = sign_norm * acos(cos_norm);
+
+        let low_horizon_cos0 = cos(n + PI_HALF);
+        let low_horizon_cos1 = cos(n - PI_HALF);
+        var horizon_cos0 = low_horizon_cos0;
+        var horizon_cos1 = low_horizon_cos1;
+
+        for (var step = 1u; step <= num_steps; step++) {
+            let t = (f32(step) - 0.5 + 0.5 * noise) / f32(num_steps);
+            let s = t * t;
+            let offset = max(s * radius_pixels, 1.0) * slice_dir;
+
             let uv_pos = uv + offset * params.inv_half_res;
             if (uv_pos.x >= 0.0 && uv_pos.x < 1.0 && uv_pos.y >= 0.0 && uv_pos.y < 1.0) {
-                let sc = vec2<i32>(vec2<f32>(id.xy) + offset);
+                let sc = vec2<i32>(uv_pos * params.half_res);
                 let sd = load_linear_depth(sc);
                 let sp = reconstruct_view_pos(uv_pos, sd);
-                let diff = sp - center_pos;
-                let dist = length(diff);
-                if (dist > 0.001) {
-                    let cos_h = dot(diff, normal) / dist;
-                    let dist_frac = dist / params.radius;
-                    let att = saturate(1.0 - max(dist_frac - falloff_start, 0.0) / falloff_range);
-                    let ok = dist_frac < 1.0 && abs(sd - center_depth) < params.thickness;
-                    let w = select(0.0, att, ok);
-                    h1 = max(h1, cos_h * w);
+                let sample_delta = sp - center_pos;
+                let sample_dist = length(sample_delta);
+                if (sample_dist > 0.0001) {
+                    var shc = dot(sample_delta / sample_dist, view_vec);
+                    let dist_frac = sample_dist / max(params.radius, 0.0001);
+                    let dist_weight = clamp(1.0 - max(dist_frac - falloff_start, 0.0) / falloff_range, 0.0, 1.0);
+                    shc = mix(low_horizon_cos0, shc, dist_weight);
+                    horizon_cos0 = max(horizon_cos0, shc);
                 }
             }
 
-            // -direction
             let uv_neg = uv - offset * params.inv_half_res;
             if (uv_neg.x >= 0.0 && uv_neg.x < 1.0 && uv_neg.y >= 0.0 && uv_neg.y < 1.0) {
-                let sc = vec2<i32>(vec2<f32>(id.xy) - offset);
+                let sc = vec2<i32>(uv_neg * params.half_res);
                 let sd = load_linear_depth(sc);
                 let sp = reconstruct_view_pos(uv_neg, sd);
-                let diff = sp - center_pos;
-                let dist = length(diff);
-                if (dist > 0.001) {
-                    let cos_h = dot(diff, normal) / dist;
-                    let dist_frac = dist / params.radius;
-                    let att = saturate(1.0 - max(dist_frac - falloff_start, 0.0) / falloff_range);
-                    let ok = dist_frac < 1.0 && abs(sd - center_depth) < params.thickness;
-                    let w = select(0.0, att, ok);
-                    h2 = max(h2, cos_h * w);
+                let sample_delta = sp - center_pos;
+                let sample_dist = length(sample_delta);
+                if (sample_dist > 0.0001) {
+                    var shc = dot(sample_delta / sample_dist, view_vec);
+                    let dist_frac = sample_dist / max(params.radius, 0.0001);
+                    let dist_weight = clamp(1.0 - max(dist_frac - falloff_start, 0.0) / falloff_range, 0.0, 1.0);
+                    shc = mix(low_horizon_cos1, shc, dist_weight);
+                    horizon_cos1 = max(horizon_cos1, shc);
                 }
             }
         }
 
-        // Simple HBAO visibility: h is the max sin(elevation) above the tangent plane.
-        // Unoccluded (h=0) → vis=1.0. Fully blocked (h=1) → vis=0.0.
-        // Average the two half-directions per slice.
-        ao_sum += 1.0 - 0.5 * (saturate(h1) + saturate(h2));
+        // GTAO arc integration (Jimenez 2016, Eq. 7/8-style formulation).
+        let h0 = -acos(clamp(horizon_cos1, -1.0, 1.0));
+        let h1 =  acos(clamp(horizon_cos0, -1.0, 1.0));
+        let iarc0 = (cos_norm + 2.0 * h0 * sin(n) - cos(2.0 * h0 - n)) * 0.25;
+        let iarc1 = (cos_norm + 2.0 * h1 * sin(n) - cos(2.0 * h1 - n)) * 0.25;
+        let local_visibility = clamp(projected_normal_len * (iarc0 + iarc1), 0.0, 1.0);
+        visibility_sum += local_visibility;
     }
 
-    var ao = ao_sum / f32(NUM_SLICES);
+    var ao = visibility_sum / f32(NUM_SLICES);
     ao = clamp(ao, 0.0, 1.0);
 
     textureStore(ao_output, id.xy, vec4<f32>(ao, 0.0, 0.0, 0.0));
@@ -343,6 +423,9 @@ fn temporal_accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
     let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
 
     var blend_factor = params.temporal_blend;
+    if (params.frame_index < 2u) {
+        blend_factor = 1.0;
+    }
     if (prev_uv.x < 0.0 || prev_uv.x > 1.0 || prev_uv.y < 0.0 || prev_uv.y > 1.0) {
         blend_factor = 1.0;
     }
@@ -364,11 +447,8 @@ fn temporal_accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     history_ao = clamp(history_ao, ao_min, ao_max);
 
-    // Depth-based disocclusion
-    let prev_depth = load_linear_depth(clamped_prev);
-    if (abs(prev_depth - center_depth) > center_depth * 0.1) {
-        blend_factor = 1.0;
-    }
+    // No previous-depth history texture is available in this path, so avoid
+    // invalid disocclusion tests against current-frame depth at reprojected UV.
 
     let result = mix(history_ao, current_ao, blend_factor);
     textureStore(ao_temporal_output, id.xy, vec4<f32>(result, 0.0, 0.0, 0.0));
