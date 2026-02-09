@@ -38,6 +38,11 @@ pub struct PostProcessConfig {
     pub streaks_threshold: f32,
     /// Streak tint color [R, G, B]
     pub streaks_tint: [f32; 3],
+
+    // === Ambient Occlusion (GTAO) ===
+    pub ao_enabled: bool,
+    pub ao_intensity: f32,
+    pub ao_radius: f32,
 }
 
 impl Default for PostProcessConfig {
@@ -74,6 +79,11 @@ impl Default for PostProcessConfig {
             streaks_intensity: 0.15,
             streaks_threshold: 0.75,
             streaks_tint: [0.1, 0.17, 0.25], // Slight cyan/blue tint
+
+            // Ambient Occlusion
+            ao_enabled: true,
+            ao_intensity: 1.5,
+            ao_radius: 0.15,
         }
     }
 }
@@ -122,8 +132,10 @@ pub struct GpuPostProcessParams {
     pub streaks_tint_g: f32,
     pub streaks_tint_b: f32,
 
-    // Padding to 16-byte alignment (21 fields * 4 = 84 bytes, need 96)
-    pub _padding: [f32; 3],
+    // Ambient Occlusion
+    pub ao_enabled: u32,
+    pub ao_intensity: f32,
+    pub _padding: f32,
 }
 
 impl PostProcessConfig {
@@ -149,7 +161,9 @@ impl PostProcessConfig {
             streaks_tint_r: self.streaks_tint[0],
             streaks_tint_g: self.streaks_tint[1],
             streaks_tint_b: self.streaks_tint[2],
-            _padding: [0.0; 3],
+            ao_enabled: if self.ao_enabled { 1 } else { 0 },
+            ao_intensity: self.ao_intensity,
+            _padding: 0.0,
         }
     }
 }

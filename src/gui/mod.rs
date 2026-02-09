@@ -522,6 +522,22 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     }
 
                     ui.add_space(8.0);
+                    ui.separator();
+
+                    // Ambient Occlusion
+                    ui.checkbox(&mut state.post_process.ao_enabled, "Ambient Occlusion (GTAO)");
+                    if state.post_process.ao_enabled {
+                        ui.add(
+                            egui::Slider::new(&mut state.post_process.ao_intensity, 0.0..=3.0)
+                                .text("Intensity")
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut state.post_process.ao_radius, 0.05..=0.5)
+                                .text("Radius")
+                        );
+                    }
+
+                    ui.add_space(8.0);
                     if ui.button("Reset Post Processing").clicked() {
                         state.post_process.reset_defaults();
                     }

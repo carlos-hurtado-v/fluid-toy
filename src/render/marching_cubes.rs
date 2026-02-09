@@ -217,6 +217,12 @@ pub struct MarchingCubesRenderer {
     // Single-sampled depth for background pass (always 1x)
     background_depth_texture: wgpu::Texture,
     background_depth_view: wgpu::TextureView,
+    // Front face depth for GTAO (single-sampled, samplable)
+    front_depth_texture: wgpu::Texture,
+    front_depth_view: wgpu::TextureView,
+    // Front face depth pipeline (cull back faces, depth-only, 1x)
+    front_face_pipeline: wgpu::RenderPipeline,
+
     // Back face depth for thickness calculation
     back_depth_texture: wgpu::Texture,
     back_depth_view: wgpu::TextureView,
@@ -353,6 +359,9 @@ impl MarchingCubesRenderer {
         } else {
             create_depth_texture(device, width, height)
         };
+
+        // Create front-face depth texture for GTAO (samplable, always single-sampled)
+        let (front_depth_texture, front_depth_view) = create_samplable_depth_texture(device, width, height);
 
         // Create back-face depth texture for thickness calculation (samplable, always single-sampled)
         let (back_depth_texture, back_depth_view) = create_samplable_depth_texture(device, width, height);
@@ -1056,6 +1065,43 @@ impl MarchingCubesRenderer {
             cache: None,
         });
 
+        // === Front Face Pipeline (for GTAO depth prepass) ===
+        let front_face_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("MC Front Face Pipeline"),
+            layout: Some(&back_face_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &back_depth_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &back_depth_shader,
+                entry_point: Some("fs_main"),
+                targets: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode: Some(wgpu::Face::Back),  // Cull back faces (render front only)
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let back_face_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MC Back Face BG"),
             layout: &back_face_bind_group_layout,
@@ -1303,6 +1349,9 @@ impl MarchingCubesRenderer {
             depth_view,
             background_depth_texture,
             background_depth_view,
+            front_depth_texture,
+            front_depth_view,
+            front_face_pipeline,
             back_depth_texture,
             back_depth_view,
             back_depth_sampler,
@@ -1366,6 +1415,11 @@ impl MarchingCubesRenderer {
                 },
             ],
         })
+    }
+
+    /// Get the front-face depth view (for GTAO input)
+    pub fn front_depth_view(&self) -> &wgpu::TextureView {
+        &self.front_depth_view
     }
 
     pub fn update_camera(&self, queue: &wgpu::Queue, params: &GpuCameraParams) {
@@ -1558,6 +1612,32 @@ impl MarchingCubesRenderer {
         rigid_body: Option<&RigidBodyRenderer>,
         spray: Option<&SprayRenderer>,
     ) {
+        // Pass 0: Render front faces to front_depth_texture (for GTAO)
+        {
+            let mut front_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MC Front Face Pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.front_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            front_pass.set_pipeline(&self.front_face_pipeline);
+            front_pass.set_bind_group(0, &self.back_face_bind_group, &[]);
+            front_pass.draw_indirect(&self.indirect_buffer, 0);
+
+            // Also render rigid body into front depth
+            if let Some(rb) = rigid_body {
+                rb.render_depth_only(&mut front_pass);
+            }
+        }
+
         // Pass 1: Render back faces to back_depth_texture (for thickness calculation)
         {
             let mut back_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1697,6 +1777,11 @@ impl MarchingCubesRenderer {
         };
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
+
+        // Recreate front depth texture (for GTAO)
+        let (front_depth_texture, front_depth_view) = create_samplable_depth_texture(device, width, height);
+        self.front_depth_texture = front_depth_texture;
+        self.front_depth_view = front_depth_view;
 
         // Recreate back depth texture (always single-sampled for sampling)
         let (back_depth_texture, back_depth_view) = create_samplable_depth_texture(device, width, height);

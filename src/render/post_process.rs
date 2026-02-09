@@ -53,6 +53,9 @@ pub struct PostProcessRenderer {
     streak_blur_h2_bind_group: wgpu::BindGroup,
     // FXAA bind group
     fxaa_bind_group: wgpu::BindGroup,
+    // AO bind group (group 1 on composite pipeline)
+    ao_bind_group: wgpu::BindGroup,
+    ao_bind_group_layout: wgpu::BindGroupLayout,
 
     // Buffers
     params_buffer: wgpu::Buffer,
@@ -73,6 +76,7 @@ pub struct PostProcessRenderer {
 impl PostProcessRenderer {
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         surface_format: wgpu::TextureFormat,
         width: u32,
         height: u32,
@@ -200,10 +204,67 @@ impl PostProcessRenderer {
             ],
         });
 
-        // Pipeline layout
+        // AO bind group layout (group 1: just an AO texture)
+        let ao_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("PostProcess AO BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // Create placeholder AO texture (1x1 white = no occlusion)
+        let ao_placeholder = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("AO Placeholder"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // Initialize to 1.0 (no occlusion)
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &ao_placeholder,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &1.0f32.to_le_bytes(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let ao_placeholder_view = ao_placeholder.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let ao_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PostProcess AO BG"),
+            layout: &ao_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&ao_placeholder_view),
+                },
+            ],
+        });
+
+        // Pipeline layout (group 0 = scene/bloom/streak/params, group 1 = AO)
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PostProcess Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &ao_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -517,6 +578,8 @@ impl PostProcessRenderer {
             streak_blur_h1_bind_group,
             streak_blur_h2_bind_group,
             fxaa_bind_group,
+            ao_bind_group,
+            ao_bind_group_layout,
             params_buffer,
             blur_h_buffer,
             blur_v_buffer,
@@ -599,6 +662,20 @@ impl PostProcessRenderer {
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
     }
 
+    /// Update the AO bind group with the GTAO output texture
+    pub fn update_ao_bind_group(&mut self, device: &wgpu::Device, ao_view: &wgpu::TextureView) {
+        self.ao_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PostProcess AO BG"),
+            layout: &self.ao_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(ao_view),
+                },
+            ],
+        });
+    }
+
     /// Get the scene texture view for rendering the scene to
     pub fn scene_view(&self) -> &wgpu::TextureView {
         &self.scene_view
@@ -634,6 +711,7 @@ impl PostProcessRenderer {
                 });
                 pass.set_pipeline(&self.bloom_threshold_pipeline);
                 pass.set_bind_group(0, &self.bloom_threshold_bind_group, &[]);
+                pass.set_bind_group(1, &self.ao_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
 
@@ -656,6 +734,7 @@ impl PostProcessRenderer {
                 });
                 pass.set_pipeline(&self.bloom_blur_pipeline);
                 pass.set_bind_group(0, &self.bloom_blur_h_bind_group, &[]);
+                pass.set_bind_group(1, &self.ao_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
 
@@ -678,6 +757,7 @@ impl PostProcessRenderer {
                 });
                 pass.set_pipeline(&self.bloom_blur_pipeline);
                 pass.set_bind_group(0, &self.bloom_blur_v_bind_group, &[]);
+                pass.set_bind_group(1, &self.ao_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
         }
@@ -703,6 +783,7 @@ impl PostProcessRenderer {
                 });
                 pass.set_pipeline(&self.bloom_threshold_pipeline);
                 pass.set_bind_group(0, &self.streak_threshold_bind_group, &[]);
+                pass.set_bind_group(1, &self.ao_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
 
@@ -725,6 +806,7 @@ impl PostProcessRenderer {
                 });
                 pass.set_pipeline(&self.streak_blur_pipeline);
                 pass.set_bind_group(0, &self.streak_blur_h1_bind_group, &[]);
+                pass.set_bind_group(1, &self.ao_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
 
@@ -747,6 +829,7 @@ impl PostProcessRenderer {
                 });
                 pass.set_pipeline(&self.streak_blur_pipeline);
                 pass.set_bind_group(0, &self.streak_blur_h2_bind_group, &[]);
+                pass.set_bind_group(1, &self.ao_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
         }
@@ -777,6 +860,7 @@ impl PostProcessRenderer {
             });
             pass.set_pipeline(&self.composite_pipeline);
             pass.set_bind_group(0, &self.composite_bind_group, &[]);
+            pass.set_bind_group(1, &self.ao_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
 

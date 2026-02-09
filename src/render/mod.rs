@@ -2,6 +2,7 @@
 
 pub mod camera;
 pub mod environment;
+pub mod gtao;
 pub mod marching_cubes;
 pub mod mc_tables;
 pub mod particle_renderer_3d;
@@ -12,6 +13,7 @@ pub mod spray_renderer;
 pub mod wireframe;
 
 pub use camera::{Camera, GpuCameraParams};
+pub use gtao::GtaoRenderer;
 pub use marching_cubes::MarchingCubesRenderer;
 pub use particle_renderer_3d::ParticleRenderer3D;
 pub use post_process::PostProcessRenderer;

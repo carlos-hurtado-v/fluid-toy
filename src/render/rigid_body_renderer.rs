@@ -11,6 +11,10 @@ pub struct RigidBodyRenderer {
     pipeline: wgpu::RenderPipeline,
     msaa_pipeline: Option<wgpu::RenderPipeline>,
 
+    // Depth-only pipelines (for GTAO front depth prepass, 1x, no color targets)
+    depth_only_pipeline: wgpu::RenderPipeline,
+    mesh_depth_only_pipeline: Option<wgpu::RenderPipeline>,
+
     // Shared bind group (group 0): camera + body params — used by both pipelines
     bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
@@ -181,8 +185,26 @@ impl RigidBodyRenderer {
             None
         };
 
+        // === Depth-only procedural pipeline (for GTAO front depth prepass) ===
+        let depth_only_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("RigidBody Depth-Only Pipeline"),
+            layout: Some(&procedural_layout),
+            vertex: wgpu::VertexState {
+                module: &procedural_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: None,
+            primitive: primitive_state,
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         // === Mesh pipeline (GLB models) ===
-        let (mesh_pipeline, mesh_msaa_pipeline, mesh_texture_bind_group, mesh_vertex_buffer, mesh_index_buffer, mesh_index_count) =
+        let (mesh_pipeline, mesh_msaa_pipeline, mesh_depth_only_pipeline, mesh_texture_bind_group, mesh_vertex_buffer, mesh_index_buffer, mesh_index_count) =
             match mesh_loader::load_embedded_duck() {
                 Ok(loaded_mesh) => {
                     let result = Self::create_mesh_resources(
@@ -199,6 +221,7 @@ impl RigidBodyRenderer {
                     (
                         Some(result.0),
                         result.1,
+                        result.6,
                         Some(result.2),
                         Some(result.3),
                         Some(result.4),
@@ -207,13 +230,15 @@ impl RigidBodyRenderer {
                 }
                 Err(e) => {
                     log::error!("Failed to load duck.glb: {}", e);
-                    (None, None, None, None, None, 0)
+                    (None, None, None, None, None, None, 0)
                 }
             };
 
         Self {
             pipeline,
             msaa_pipeline,
+            depth_only_pipeline,
+            mesh_depth_only_pipeline,
             bind_group,
             camera_buffer,
             body_buffer,
@@ -246,6 +271,7 @@ impl RigidBodyRenderer {
         wgpu::Buffer,                    // vertex buffer
         wgpu::Buffer,                    // index buffer
         u32,                             // index count
+        Option<wgpu::RenderPipeline>,    // mesh depth-only pipeline
     ) {
         // Vertex + index buffers
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -437,6 +463,54 @@ impl RigidBodyRenderer {
             None
         };
 
+        // Depth-only mesh pipeline (for GTAO front depth prepass)
+        let mesh_depth_only_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RigidBody Mesh Depth-Only Layout"),
+            bind_group_layouts: &[group0_layout],
+            push_constant_ranges: &[],
+        });
+        let mesh_depth_only_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("RigidBody Mesh Depth-Only Pipeline"),
+            layout: Some(&mesh_depth_only_layout),
+            vertex: wgpu::VertexState {
+                module: &mesh_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 24,
+                            shader_location: 2,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 32,
+                            shader_location: 3,
+                        },
+                    ],
+                }],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: None,
+            primitive: primitive_state,
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        }));
+
         (
             mesh_pipeline,
             mesh_msaa_pipeline,
@@ -444,6 +518,7 @@ impl RigidBodyRenderer {
             vertex_buffer,
             index_buffer,
             loaded_mesh.indices.len() as u32,
+            mesh_depth_only_pipeline,
         )
     }
 
@@ -480,6 +555,28 @@ impl RigidBodyRenderer {
         } else {
             let pipeline = self.msaa_pipeline.as_ref().unwrap_or(&self.pipeline);
             render_pass.set_pipeline(pipeline);
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
+            render_pass.draw(0..self.vertex_count, 0..1);
+        }
+    }
+
+    /// Render depth-only (for GTAO front depth prepass, 1x, no color targets)
+    pub fn render_depth_only<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
+        if self.current_shape == RigidBodyShape::Custom {
+            // Mesh depth-only
+            if let (Some(pipeline), Some(vb), Some(ib)) = (
+                &self.mesh_depth_only_pipeline,
+                &self.mesh_vertex_buffer,
+                &self.mesh_index_buffer,
+            ) {
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(0, &self.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vb.slice(..));
+                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..self.mesh_index_count, 0, 0..1);
+            }
+        } else {
+            render_pass.set_pipeline(&self.depth_only_pipeline);
             render_pass.set_bind_group(0, &self.bind_group, &[]);
             render_pass.draw(0..self.vertex_count, 0..1);
         }

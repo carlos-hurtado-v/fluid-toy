@@ -14,7 +14,7 @@ use wgpu::util::DeviceExt;
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, GpuContainerParams, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
+use crate::render::{Camera, GpuContainerParams, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
 use crate::render::mesh_loader::{self, SdfData};
@@ -32,6 +32,8 @@ pub struct App {
     spray_system: Option<SpraySystem>,
     spray_renderer: Option<SprayRenderer>,
     post_process_renderer: Option<PostProcessRenderer>,
+    gtao_renderer: Option<GtaoRenderer>,
+    prev_camera_params: Option<crate::render::GpuCameraParams>,
     // Environment map (used by MC renderer + env background)
     #[allow(dead_code)]
     env_texture: Option<wgpu::Texture>,
@@ -78,6 +80,8 @@ impl App {
             spray_system: None,
             spray_renderer: None,
             post_process_renderer: None,
+            gtao_renderer: None,
+            prev_camera_params: None,
             env_texture: None,
             env_view: None,
             env_sampler: None,
@@ -252,10 +256,18 @@ impl App {
         let post_process_params = self.state.post_process.to_gpu_params();
         let post_process_renderer = PostProcessRenderer::new(
             &gpu.device,
+            &gpu.queue,
             gpu.config.format,
             gpu.config.width,
             gpu.config.height,
             &post_process_params,
+        );
+
+        // Create GTAO renderer
+        let gtao_renderer = GtaoRenderer::new(
+            &gpu.device,
+            gpu.config.width,
+            gpu.config.height,
         );
 
         // Create environment background pipeline (for Particles mode HDR background)
@@ -400,6 +412,8 @@ impl App {
         self.spray_system = Some(spray_system);
         self.spray_renderer = Some(spray_renderer);
         self.post_process_renderer = Some(post_process_renderer);
+        self.gtao_renderer = Some(gtao_renderer);
+        self.prev_camera_params = Some(camera_params);
         self.env_texture = Some(env_texture);
         self.env_view = Some(env_view);
         self.env_sampler = Some(env_sampler);
@@ -535,6 +549,9 @@ impl ApplicationHandler for App {
                     ));
                     if let Some(pp_renderer) = &mut self.post_process_renderer {
                         pp_renderer.resize(&gpu.device, new_size.width, new_size.height);
+                    }
+                    if let Some(gtao) = &mut self.gtao_renderer {
+                        gtao.resize(&gpu.device, new_size.width, new_size.height);
                     }
                 }
             }
@@ -1160,6 +1177,52 @@ impl App {
             }
         }
 
+        // Run GTAO if enabled and post-processing is on
+        if post_process_enabled && self.state.post_process.ao_enabled {
+            if let Some(gtao) = &mut self.gtao_renderer {
+                // Get the depth view from the appropriate renderer
+                let depth_view = match self.state.rendering.render_mode {
+                    FluidRenderMode::MarchingCubes => {
+                        self.mc_renderer.as_ref().map(|mc| mc.front_depth_view())
+                    }
+                    FluidRenderMode::Particles => {
+                        self.renderer.as_ref().map(|r| r.depth_view())
+                    }
+                };
+
+                if let Some(depth_view) = depth_view {
+                    let camera_params = self.camera.to_gpu_params();
+
+                    // Compute previous VP matrix
+                    let prev_cam = self.prev_camera_params.unwrap_or(camera_params);
+                    let prev_vp = crate::render::gtao::GpuPrevViewProjection {
+                        matrix: mat4_mul(prev_cam.projection, prev_cam.view),
+                    };
+
+                    // Rebuild bind groups with current depth view
+                    gtao.rebuild_bind_groups(&gpu.device, depth_view);
+
+                    gtao.render(
+                        &mut encoder,
+                        &gpu.queue,
+                        &camera_params,
+                        self.state.post_process.ao_radius,
+                        &prev_vp,
+                        gpu.config.width,
+                        gpu.config.height,
+                    );
+
+                    // Update post-process AO bind group
+                    if let Some(pp) = &mut self.post_process_renderer {
+                        pp.update_ao_bind_group(&gpu.device, gtao.ao_view());
+                    }
+
+                    // Save current camera for next frame's reprojection
+                    self.prev_camera_params = Some(camera_params);
+                }
+            }
+        }
+
         // Apply post-processing if enabled
         if post_process_enabled {
             if let Some(pp) = &self.post_process_renderer {
@@ -1249,6 +1312,20 @@ impl App {
             GuiAction::None => {}
         }
     }
+}
+
+/// Multiply two 4x4 column-major matrices
+fn mat4_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut result = [[0.0f32; 4]; 4];
+    for col in 0..4 {
+        for row in 0..4 {
+            result[col][row] = a[0][row] * b[col][0]
+                + a[1][row] * b[col][1]
+                + a[2][row] * b[col][2]
+                + a[3][row] * b[col][3];
+        }
+    }
+    result
 }
 
 fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

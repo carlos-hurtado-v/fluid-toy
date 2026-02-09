@@ -37,10 +37,10 @@ struct PostProcessParams {
     streaks_tint_g: f32,
     streaks_tint_b: f32,
 
-    // Padding to 16-byte alignment (21 fields * 4 = 84 bytes, need 96)
-    _padding0: f32,
-    _padding1: f32,
-    _padding2: f32,
+    // Ambient Occlusion
+    ao_enabled: u32,
+    ao_intensity: f32,
+    _padding: f32,
 }
 
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
@@ -48,6 +48,8 @@ struct PostProcessParams {
 @group(0) @binding(2) var streak_texture: texture_2d<f32>;
 @group(0) @binding(3) var texture_sampler: sampler;
 @group(0) @binding(4) var<uniform> params: PostProcessParams;
+
+@group(1) @binding(0) var ao_texture: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -170,6 +172,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color = apply_chromatic_aberration(input.uv, params.chromatic_aberration_intensity);
     } else {
         color = textureSample(scene_texture, texture_sampler, input.uv).rgb;
+    }
+
+    // Apply ambient occlusion
+    if (params.ao_enabled == 1u) {
+        let ao_size = vec2<f32>(textureDimensions(ao_texture));
+        let ao_coord = vec2<i32>(input.uv * ao_size);
+        let ao = textureLoad(ao_texture, ao_coord, 0).r;
+        // pow() keeps result in [0,1] for any intensity (unlike mix which goes negative >1)
+        // max(ao, 1e-4) avoids pow(0, 0) which is undefined in WGSL
+        // Floor at 0.05 prevents total blackout in tight concavities
+        let ao_factor = max(pow(max(clamp(ao, 0.0, 1.0), 1e-4), params.ao_intensity), 0.05);
+        color *= ao_factor;
     }
 
     // Add bloom if enabled
