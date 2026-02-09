@@ -203,48 +203,93 @@ fn load_glb_from_bytes(bytes: &[u8]) -> Result<LoadedMesh, Box<dyn std::error::E
 fn voxelize_sdf(vertices: &[MeshVertex], indices: &[u32], resolution: u32) -> SdfData {
     let res = resolution as usize;
     let mut data = vec![f32::MAX; res * res * res];
+    let voxel_size = 2.0 / resolution as f32;
 
-    // Build triangle list
+    // Build triangle list with precomputed AABBs for early-skip
     let num_tris = indices.len() / 3;
-    let mut tri_verts: Vec<[[f32; 3]; 3]> = Vec::with_capacity(num_tris);
+    struct TriData {
+        verts: [[f32; 3]; 3],
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+    }
+    let mut tris: Vec<TriData> = Vec::with_capacity(num_tris);
     for t in 0..num_tris {
-        let i0 = indices[t * 3] as usize;
-        let i1 = indices[t * 3 + 1] as usize;
-        let i2 = indices[t * 3 + 2] as usize;
-        tri_verts.push([vertices[i0].position, vertices[i1].position, vertices[i2].position]);
+        let v0 = vertices[indices[t * 3] as usize].position;
+        let v1 = vertices[indices[t * 3 + 1] as usize].position;
+        let v2 = vertices[indices[t * 3 + 2] as usize].position;
+        tris.push(TriData {
+            verts: [v0, v1, v2],
+            aabb_min: [
+                v0[0].min(v1[0]).min(v2[0]),
+                v0[1].min(v1[1]).min(v2[1]),
+                v0[2].min(v1[2]).min(v2[2]),
+            ],
+            aabb_max: [
+                v0[0].max(v1[0]).max(v2[0]),
+                v0[1].max(v1[1]).max(v2[1]),
+                v0[2].max(v1[2]).max(v2[2]),
+            ],
+        });
     }
 
-    // For each voxel, find closest triangle distance + ray-cast for sign
     for zi in 0..res {
+        let pz = -1.0 + (zi as f32 + 0.5) * voxel_size;
         for yi in 0..res {
+            let py = -1.0 + (yi as f32 + 0.5) * voxel_size;
+
+            // Precompute ray-triangle intersections for this YZ slice.
+            // All voxels along X share the same ray (origin=(0,py,pz), dir=+X).
+            // Collect intersection X coordinates, sort, then binary-search per voxel.
+            let mut hit_xs: Vec<f32> = Vec::new();
+            for tri in &tris {
+                // Quick YZ AABB reject for the ray
+                if py < tri.aabb_min[1] || py > tri.aabb_max[1] {
+                    continue;
+                }
+                if pz < tri.aabb_min[2] || pz > tri.aabb_max[2] {
+                    continue;
+                }
+                let [v0, v1, v2] = tri.verts;
+                if let Some(x) = ray_triangle_x(py, pz, v0, v1, v2) {
+                    hit_xs.push(x);
+                }
+            }
+            hit_xs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
             for xi in 0..res {
-                // Voxel center in [-1, 1]³
-                let p = [
-                    -1.0 + (xi as f32 + 0.5) * 2.0 / resolution as f32,
-                    -1.0 + (yi as f32 + 0.5) * 2.0 / resolution as f32,
-                    -1.0 + (zi as f32 + 0.5) * 2.0 / resolution as f32,
-                ];
+                let px = -1.0 + (xi as f32 + 0.5) * voxel_size;
+                let p = [px, py, pz];
 
+                // Closest unsigned distance (with AABB early-skip)
                 let mut best_dist_sq = f32::MAX;
-                // Ray-cast in +X direction for inside/outside test
-                let mut intersections = 0u32;
+                for tri in &tris {
+                    // Squared distance from point to triangle AABB — if this alone
+                    // exceeds our current best, the triangle itself can't be closer
+                    let mut aabb_dist_sq = 0.0f32;
+                    for i in 0..3 {
+                        if p[i] < tri.aabb_min[i] {
+                            let d = tri.aabb_min[i] - p[i];
+                            aabb_dist_sq += d * d;
+                        } else if p[i] > tri.aabb_max[i] {
+                            let d = p[i] - tri.aabb_max[i];
+                            aabb_dist_sq += d * d;
+                        }
+                    }
+                    if aabb_dist_sq >= best_dist_sq {
+                        continue;
+                    }
 
-                for t in 0..num_tris {
-                    let [v0, v1, v2] = tri_verts[t];
-
-                    // Unsigned distance to closest point on triangle
+                    let [v0, v1, v2] = tri.verts;
                     let (_, dist_sq) = closest_point_on_triangle(p, v0, v1, v2);
                     if dist_sq < best_dist_sq {
                         best_dist_sq = dist_sq;
                     }
-
-                    // Möller–Trumbore ray intersection (ray from p in +X direction)
-                    if ray_hits_triangle(p, v0, v1, v2) {
-                        intersections += 1;
-                    }
                 }
 
-                let sign = if intersections % 2 == 1 { -1.0 } else { 1.0 };
+                // Inside/outside: count ray intersections to the right of this voxel
+                let ahead = hit_xs.len() - hit_xs.partition_point(|&x| x <= px);
+                let sign = if ahead % 2 == 1 { -1.0 } else { 1.0 };
+
                 let idx = xi + yi * res + zi * res * res;
                 data[idx] = sign * best_dist_sq.sqrt();
             }
@@ -254,33 +299,32 @@ fn voxelize_sdf(vertices: &[MeshVertex], indices: &[u32], resolution: u32) -> Sd
     SdfData { data, resolution }
 }
 
-/// Möller–Trumbore ray-triangle intersection test.
-/// Ray origin = `p`, direction = +X axis `[1, 0, 0]`.
-/// Returns true if the ray hits the triangle at t > 0.
-fn ray_hits_triangle(p: [f32; 3], v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -> bool {
+/// Möller–Trumbore ray-triangle intersection.
+/// Ray: origin = (0, py, pz), direction = +X axis [1, 0, 0].
+/// Returns the X coordinate of the intersection point, if any.
+fn ray_triangle_x(py: f32, pz: f32, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -> Option<f32> {
     let e1 = sub3(v1, v0);
     let e2 = sub3(v2, v0);
     // h = cross(dir, e2) where dir = [1, 0, 0]
     let h = [0.0, -e2[2], e2[1]];
     let a = dot3(e1, h);
     if a.abs() < 1e-10 {
-        return false;
+        return None;
     }
     let f = 1.0 / a;
-    let s = sub3(p, v0);
+    let s = [-v0[0], py - v0[1], pz - v0[2]];
     let u = f * dot3(s, h);
     if u < 0.0 || u > 1.0 {
-        return false;
+        return None;
     }
     let q = cross3(s, e1);
-    // v = f * dot(dir, q) where dir = [1, 0, 0]
     let v = f * q[0];
     if v < 0.0 || u + v > 1.0 {
-        return false;
+        return None;
     }
-    // t = f * dot(e2, q)
+    // t = ray parameter = intersection X coordinate (since origin_x = 0)
     let t = f * dot3(e2, q);
-    t > 1e-10
+    Some(t)
 }
 
 /// Closest point on triangle (v0, v1, v2) to point p. Returns (closest_point, distance_squared).
