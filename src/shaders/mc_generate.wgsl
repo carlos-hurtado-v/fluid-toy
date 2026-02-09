@@ -81,13 +81,13 @@ fn grid_to_world(grid_pos: vec3<f32>) -> vec3<f32> {
     return params.grid_min + grid_pos * params.cell_size;
 }
 
-// Compute normal from density gradient (wider sampling for smoother normals)
+// Compute normal from local density gradient
 fn compute_normal(pos: vec3<i32>) -> vec3<f32> {
-    // Use step of 2 cells to average over a wider area, reducing noise from
-    // individual particle contributions in the density field
-    let dx = sample_density(pos + vec3<i32>(2, 0, 0)) - sample_density(pos - vec3<i32>(2, 0, 0));
-    let dy = sample_density(pos + vec3<i32>(0, 2, 0)) - sample_density(pos - vec3<i32>(0, 2, 0));
-    let dz = sample_density(pos + vec3<i32>(0, 0, 2)) - sample_density(pos - vec3<i32>(0, 0, 2));
+    // A 1-cell central difference preserves local wave detail and avoids
+    // over-smoothed "waxy" shading on dynamic surfaces.
+    let dx = sample_density(pos + vec3<i32>(1, 0, 0)) - sample_density(pos - vec3<i32>(1, 0, 0));
+    let dy = sample_density(pos + vec3<i32>(0, 1, 0)) - sample_density(pos - vec3<i32>(0, 1, 0));
+    let dz = sample_density(pos + vec3<i32>(0, 0, 1)) - sample_density(pos - vec3<i32>(0, 0, 1));
     let grad = vec3<f32>(dx, dy, dz);
     let len = length(grad);
     if (len > 0.0001) {

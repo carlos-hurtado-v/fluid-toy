@@ -142,6 +142,9 @@ pub struct RenderConfig {
     /// Marching cubes surface threshold (normalized, auto-scales with kernel_radius)
     /// Higher = tighter surface around dense fluid, lower = captures smaller droplets
     pub mc_threshold: f32,
+    /// Marching-cubes density kernel scale relative to SPH kernel radius.
+    /// Lower values preserve smaller features and reduce "chunky" meshing.
+    pub mc_density_radius_scale: f32,
     /// Refraction strength - how much the background distorts through water
     pub refraction_strength: f32,
     /// Deep water color - what you see looking into deep water
@@ -156,14 +159,15 @@ impl Default for RenderConfig {
     fn default() -> Self {
         Self {
             particle_radius: 0.02,
-            particle_color: [0.2, 0.4, 0.9],
+            particle_color: [0.08, 0.22, 0.34],
             color_by_velocity: true,
             render_mode: FluidRenderMode::MarchingCubes,
-            mc_threshold: 3.8,
-            refraction_strength: 0.085,
-            deep_water_color: [0.01, 0.04, 0.1],
-            mc_blur_radius: 3,
-            water_roughness: 0.15,
+            mc_threshold: 0.75,
+            mc_density_radius_scale: 2.0,
+            refraction_strength: 0.12,
+            deep_water_color: [0.005, 0.03, 0.08],
+            mc_blur_radius: 1,
+            water_roughness: 0.04,
         }
     }
 }
@@ -174,10 +178,10 @@ impl RenderConfig {
     }
 
     /// Compute the actual iso_value for marching cubes from the normalized threshold.
-    /// The threshold is multiplied by the Poly6 kernel peak at r=0 for the MC kernel radius
-    /// (kernel_radius * 2.5), making it stable across kernel_radius changes.
+    /// The threshold is multiplied by the Poly6 kernel peak at r=0 for the MC kernel radius,
+    /// making it stable across kernel_radius changes and density radius scale changes.
     pub fn compute_iso_value(&self, kernel_radius: f32) -> f32 {
-        let h_mc = kernel_radius * 2.5;
+        let h_mc = kernel_radius * self.mc_density_radius_scale;
         let pi = std::f32::consts::PI;
         // Poly6 peak at r=0: 315 / (64 * pi * h^3)
         let poly6_peak = 315.0 / (64.0 * pi * h_mc * h_mc * h_mc);

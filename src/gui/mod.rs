@@ -34,7 +34,9 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         .text("Bounce")
                 );
                 ui.add(
-                    egui::Slider::new(&mut state.simulation.delta_time, 0.001..=0.05)
+                    egui::Slider::new(&mut state.simulation.delta_time, 0.004..=0.012)
+                        .step_by(0.0001)
+                        .fixed_decimals(4)
                         .text("Time Step")
                 );
 
@@ -226,7 +228,9 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         .text("Particle Mass")
                 );
                 ui.add(
-                    egui::Slider::new(&mut state.sph.surface_tension, 0.0..=0.2)
+                    egui::Slider::new(&mut state.sph.surface_tension, 0.0..=0.08)
+                        .step_by(0.001)
+                        .fixed_decimals(3)
                         .text("Surface Tension")
                 );
                 ui.add(
@@ -333,7 +337,13 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     );
                     state.rendering.mc_blur_radius = blur_val as u32;
                     ui.add(
-                        egui::Slider::new(&mut state.rendering.mc_threshold, 0.5..=10.0)
+                        egui::Slider::new(&mut state.rendering.mc_density_radius_scale, 1.2..=3.0)
+                            .text("Density Radius Scale")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.mc_threshold, 0.4..=1.0)
+                            .step_by(0.01)
+                            .fixed_decimals(2)
                             .text("Surface Threshold")
                     );
                     ui.add(

@@ -108,6 +108,33 @@ impl App {
         }
     }
 
+    fn simulation_substep_dt(&self) -> f32 {
+        // Keep existing project semantics: delta_time is per-substep.
+        self.state.simulation.delta_time
+    }
+
+    fn create_initial_particles(&self) -> Vec<crate::simulation::SphParticle3D> {
+        // Keep the original lattice spacing (solver tuning depends on this),
+        // but place the block low enough to avoid immediate ceiling collisions.
+        let spacing = self.state.sph.kernel_radius * 0.6;
+        let cube_size = self.state.simulation.initial_cube_size;
+        let mut particles = create_particle_block(spacing, cube_size);
+
+        let source_min_y = 0.2;
+        let block_height = (cube_size.saturating_sub(1) as f32) * spacing;
+        let margin = self.state.rendering.visual_margin();
+        let min_y = self.state.container.floor_y + margin + spacing * 0.25;
+        let max_y = self.state.container.ceiling_y() - margin - spacing * 0.25;
+        let target_min_y = (max_y - block_height).max(min_y);
+        let y_shift = target_min_y - source_min_y;
+
+        for p in &mut particles {
+            p.position[1] += y_shift;
+        }
+
+        particles
+    }
+
     fn initialize(&mut self, window: Arc<Window>) {
         let gpu = pollster::block_on(GpuContext::new(window.clone()));
 
@@ -133,8 +160,7 @@ impl App {
 
         // Create initial 3D SPH particles (dam break style - half the box)
         // Spacing = 0.6 * h (slightly looser than reference to reduce initial pressure)
-        let spacing = self.state.sph.kernel_radius * 0.6;
-        let particles = create_particle_block(spacing, self.state.simulation.initial_cube_size);
+        let particles = self.create_initial_particles();
         self.state.runtime.particle_count = particles.len() as u32;
 
         // Load duck mesh SDF for custom rigid body collision
@@ -155,7 +181,7 @@ impl App {
         // Create 3D SPH simulation (O(n²) version - works correctly)
         let sph_params = self.state.sph.to_gpu_params_3d(
             self.state.runtime.particle_count,
-            self.state.simulation.delta_time,
+            self.simulation_substep_dt(),
         );
         let bounds_params = self.state.container.to_gpu_bounds_3d(
                 self.state.sph.wall_stiffness,
@@ -436,13 +462,12 @@ impl App {
         self.state.rigid_body.orientation = [0.0, 0.0, 0.0, 1.0];
 
         if let Some(gpu) = &self.gpu {
-            let spacing = self.state.sph.kernel_radius * 0.6;
-            let particles = create_particle_block(spacing, self.state.simulation.initial_cube_size);
+            let particles = self.create_initial_particles();
             self.state.runtime.particle_count = particles.len() as u32;
 
             let sph_params = self.state.sph.to_gpu_params_3d(
                 self.state.runtime.particle_count,
-                self.state.simulation.delta_time,
+                self.simulation_substep_dt(),
             );
             let bounds_params = self.state.container.to_gpu_bounds_3d(
                 self.state.sph.wall_stiffness,
@@ -752,10 +777,11 @@ impl App {
         };
 
         let gpu = self.gpu.as_ref().unwrap();
+        let substep_dt = self.simulation_substep_dt();
         if let (Some(sph_sim), Some(renderer)) = (&mut self.sph_simulation, &self.renderer) {
             let sph_params = self.state.sph.to_gpu_params_3d(
                 self.state.runtime.particle_count,
-                self.state.simulation.delta_time,
+                substep_dt,
             );
             sph_sim.update_sph_params(&gpu.queue, &sph_params);
             sph_sim.set_pcisph_iterations(self.state.simulation.pcisph_iterations);
@@ -824,6 +850,7 @@ impl App {
             .unwrap_or([0.0, 0.0, 0.0]);
 
         let gpu = self.gpu.as_ref().unwrap();
+        let substep_dt = self.simulation_substep_dt();
         if let Some(sph_sim) = &mut self.sph_simulation {
 
             let spawned = sph_sim.spawn_particles(&gpu.queue, spawn_pos, 10, 0.08);
@@ -832,7 +859,7 @@ impl App {
             if spawned > 0 {
                 let sph_params = self.state.sph.to_gpu_params_3d(
                     self.state.runtime.particle_count,
-                    self.state.simulation.delta_time,
+                    substep_dt,
                 );
                 sph_sim.update_sph_params(&gpu.queue, &sph_params);
             }
@@ -913,6 +940,7 @@ impl App {
         // Run SPH simulation if not paused (multiple sub-steps for stability)
         // Note: Grid simulation manages its own command encoding/submission
         let num_substeps = self.state.simulation.substeps;
+        let substep_dt = self.simulation_substep_dt();
         if !self.state.simulation.paused {
             if let Some(sph_sim) = &mut self.sph_simulation {
                 // Clear accumulator once, then accumulate over all sub-steps
@@ -955,7 +983,7 @@ impl App {
                 integrate_rigid_body(
                     &mut self.state.rigid_body,
                     &self.state.container,
-                    self.state.simulation.delta_time,
+                    substep_dt,
                     num_substeps,
                     self.state.simulation.gravity_vector(),
                     accum,
@@ -1067,7 +1095,7 @@ impl App {
                         let blur_radius = self.state.rendering.mc_blur_radius;
                         mc_renderer.update_params(
                             &gpu.queue,
-                            self.state.sph.kernel_radius * 2.5, // Larger radius for smoother density field
+                            self.state.sph.kernel_radius * self.state.rendering.mc_density_radius_scale,
                             iso_value,
                             sph_sim.num_particles(),
                             blur_radius,

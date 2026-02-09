@@ -68,6 +68,9 @@ const SHAPE_SPHERE: u32 = 1u;
 const SHAPE_CYLINDER: u32 = 2u;
 const SHAPE_TORUS: u32 = 3u;
 const SHAPE_CUSTOM: u32 = 4u;
+const EPS_DT: f32 = 1e-4;
+const WALL_DAMPING_DT_SCALE: f32 = 0.1;
+const MAX_BACKSTOP_CORRECTION_RATIO: f32 = 0.5;
 
 struct RigidBody {
     position: vec3<f32>,
@@ -130,44 +133,70 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         dot(rot_row1, pos),
         dot(rot_row2, pos)
     );
+    let local_vel = vec3<f32>(
+        dot(rot_row0, vel),
+        dot(rot_row1, vel),
+        dot(rot_row2, vel)
+    );
 
     let boundary_layer = params.kernel_radius;
+    // Damping scales with dt and user bounce control.
+    // Lower bounds.damping => stronger normal-velocity damping near walls.
+    let wall_damping = (1.0 - bounds.damping) * WALL_DAMPING_DT_SCALE / max(params.dt, EPS_DT);
     var wall_accel = vec3<f32>(0.0, 0.0, 0.0);
 
     // X axis (symmetric: -bound_x to +bound_x)
     let dist_neg_x = local_pos.x - (-bounds.bound_x);
     if (dist_neg_x < boundary_layer) {
-        let t = 1.0 - dist_neg_x / boundary_layer;
+        let t = clamp(1.0 - dist_neg_x / boundary_layer, 0.0, 1.0);
         wall_accel.x += bounds.wall_stiffness * t * t;
+        if (local_vel.x < 0.0) {
+            wall_accel.x += -local_vel.x * wall_damping * t;
+        }
     }
     let dist_pos_x = bounds.bound_x - local_pos.x;
     if (dist_pos_x < boundary_layer) {
-        let t = 1.0 - dist_pos_x / boundary_layer;
+        let t = clamp(1.0 - dist_pos_x / boundary_layer, 0.0, 1.0);
         wall_accel.x -= bounds.wall_stiffness * t * t;
+        if (local_vel.x > 0.0) {
+            wall_accel.x += -local_vel.x * wall_damping * t;
+        }
     }
 
     // Y axis (asymmetric: floor_y to ceiling_y)
     let dist_floor = local_pos.y - bounds.floor_y;
     if (dist_floor < boundary_layer) {
-        let t = 1.0 - dist_floor / boundary_layer;
+        let t = clamp(1.0 - dist_floor / boundary_layer, 0.0, 1.0);
         wall_accel.y += bounds.wall_stiffness * t * t;
+        if (local_vel.y < 0.0) {
+            wall_accel.y += -local_vel.y * wall_damping * t;
+        }
     }
     let dist_ceiling = bounds.ceiling_y - local_pos.y;
     if (dist_ceiling < boundary_layer) {
-        let t = 1.0 - dist_ceiling / boundary_layer;
+        let t = clamp(1.0 - dist_ceiling / boundary_layer, 0.0, 1.0);
         wall_accel.y -= bounds.wall_stiffness * t * t;
+        if (local_vel.y > 0.0) {
+            wall_accel.y += -local_vel.y * wall_damping * t;
+        }
     }
 
     // Z axis (symmetric: -bound_z to +bound_z)
     let dist_neg_z = local_pos.z - (-bounds.bound_z);
     if (dist_neg_z < boundary_layer) {
-        let t = 1.0 - dist_neg_z / boundary_layer;
+        let t = clamp(1.0 - dist_neg_z / boundary_layer, 0.0, 1.0);
         wall_accel.z += bounds.wall_stiffness * t * t;
+        if (local_vel.z < 0.0) {
+            wall_accel.z += -local_vel.z * wall_damping * t;
+        }
     }
     let dist_pos_z = bounds.bound_z - local_pos.z;
     if (dist_pos_z < boundary_layer) {
-        let t = 1.0 - dist_pos_z / boundary_layer;
+        let t = clamp(1.0 - dist_pos_z / boundary_layer, 0.0, 1.0);
         wall_accel.z -= bounds.wall_stiffness * t * t;
+        if (local_vel.z > 0.0) {
+            wall_accel.z += -local_vel.z * wall_damping * t;
+        }
     }
 
     // Transform wall acceleration from local to world space (multiply by R^T)
@@ -330,7 +359,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
             // Quadratic penalty ramp
             let penetration = interact_range - sdf;
-            let t = penetration / interact_range;
+            let t = clamp(penetration / interact_range, 0.0, 1.0);
             let penalty = normal * rigid_body.stiffness * t * t;
             accel += penalty;
 
@@ -377,33 +406,57 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         dot(rot_row2, vel)
     );
 
-    let restitution = bounds.damping;
+    var hit_wall = false;
+    let max_correction = params.kernel_radius * MAX_BACKSTOP_CORRECTION_RATIO;
 
     // X axis (symmetric: -bound_x to +bound_x)
+    // Use bounded projection and remove inward normal velocity (no hard bounce).
     if (local_pos_new.x < -bounds.bound_x) {
-        local_pos_new.x = -bounds.bound_x;
-        local_vel_new.x = abs(local_vel_new.x) * restitution;
+        let penetration = -bounds.bound_x - local_pos_new.x;
+        local_pos_new.x += min(penetration, max_correction);
+        local_vel_new.x = max(local_vel_new.x, 0.0);
+        hit_wall = true;
     } else if (local_pos_new.x > bounds.bound_x) {
-        local_pos_new.x = bounds.bound_x;
-        local_vel_new.x = -abs(local_vel_new.x) * restitution;
+        let penetration = local_pos_new.x - bounds.bound_x;
+        local_pos_new.x -= min(penetration, max_correction);
+        local_vel_new.x = min(local_vel_new.x, 0.0);
+        hit_wall = true;
     }
 
     // Y axis (asymmetric: floor_y to ceiling_y)
     if (local_pos_new.y < bounds.floor_y) {
-        local_pos_new.y = bounds.floor_y;
-        local_vel_new.y = abs(local_vel_new.y) * restitution;
+        let penetration = bounds.floor_y - local_pos_new.y;
+        local_pos_new.y += min(penetration, max_correction);
+        local_vel_new.y = max(local_vel_new.y, 0.0);
+        hit_wall = true;
     } else if (local_pos_new.y > bounds.ceiling_y) {
-        local_pos_new.y = bounds.ceiling_y;
-        local_vel_new.y = -abs(local_vel_new.y) * restitution;
+        let penetration = local_pos_new.y - bounds.ceiling_y;
+        local_pos_new.y -= min(penetration, max_correction);
+        local_vel_new.y = min(local_vel_new.y, 0.0);
+        hit_wall = true;
     }
 
     // Z axis (symmetric: -bound_z to +bound_z)
     if (local_pos_new.z < -bounds.bound_z) {
-        local_pos_new.z = -bounds.bound_z;
-        local_vel_new.z = abs(local_vel_new.z) * restitution;
+        let penetration = -bounds.bound_z - local_pos_new.z;
+        local_pos_new.z += min(penetration, max_correction);
+        local_vel_new.z = max(local_vel_new.z, 0.0);
+        hit_wall = true;
     } else if (local_pos_new.z > bounds.bound_z) {
-        local_pos_new.z = bounds.bound_z;
-        local_vel_new.z = -abs(local_vel_new.z) * restitution;
+        let penetration = local_pos_new.z - bounds.bound_z;
+        local_pos_new.z -= min(penetration, max_correction);
+        local_vel_new.z = min(local_vel_new.z, 0.0);
+        hit_wall = true;
+    }
+
+    // Resize/teleport safety: prevent one-frame velocity spikes from boundary correction.
+    if (hit_wall) {
+        let max_wall_speed = params.kernel_radius / max(params.dt, EPS_DT);
+        local_vel_new = clamp(
+            local_vel_new,
+            vec3<f32>(-max_wall_speed),
+            vec3<f32>(max_wall_speed),
+        );
     }
 
     // Transform back to world space (multiply by transpose of rotation matrix)

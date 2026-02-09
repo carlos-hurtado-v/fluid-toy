@@ -168,8 +168,8 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     // === ABSORPTION (Beer's Law) ===
     // Light attenuates exponentially through water
     // Different wavelengths absorb at different rates (red absorbs fastest)
-    let absorption_coeffs = vec3<f32>(0.45, 0.09, 0.02);  // RGB absorption rates
-    let density = 1.5;  // Water density factor
+    let absorption_coeffs = vec3<f32>(0.30, 0.08, 0.02);  // RGB absorption rates
+    let density = 1.1;  // Effective optical density
     let transmittance = exp(-absorption_coeffs * density * thickness);
 
     // Reflection — solid color or HDR environment
@@ -205,7 +205,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     let water_interior = mix(refracted_background, deep_color, depth_blend);
 
     // Add water's own color contribution (subsurface scattering approximation)
-    let scatter_strength = 0.3 * (1.0 - exp(-thickness * 1.5));
+    let scatter_strength = 0.12 * (1.0 - exp(-thickness * 1.5));
     let scatter_color = water.water_color * scatter_strength;
     let interior_with_scatter = water_interior + scatter_color * (1.0 - transmittance);
 
@@ -249,19 +249,19 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         // Subsurface illumination — light enters water, scatters, exits toward viewer
         let light_entering = NdotL * (1.0 - F_spec);
         let interior_glow = water.water_color * transmittance;
-        sun_subsurface = interior_glow * light_entering * light.sun_color * light.sun_intensity * 0.4;
+        sun_subsurface = interior_glow * light_entering * light.sun_color * light.sun_intensity * 0.18;
 
         // Forward scattering — thin areas glow when backlit (translucency)
         let VdotL = max(0.0, dot(-view_dir, light_dir));
         let forward_scatter = pow(VdotL, 4.0) * exp(-thickness * 2.0);
-        sun_subsurface += water.water_color * forward_scatter * light.sun_color * light.sun_intensity * 0.25;
+        sun_subsurface += water.water_color * forward_scatter * light.sun_color * light.sun_intensity * 0.10;
     }
 
     // IBL diffuse irradiance from spherical harmonics
     // Light enters the water (1-F), travels through the volume (transmittance),
     // and scatters back (scatter_strength) — same physics as subsurface scattering
     let ambient_irradiance = evaluate_sh_irradiance(normal) * water.env_intensity;
-    let ambient_subsurface = ambient_irradiance * water.water_color * transmittance * scatter_strength;
+    let ambient_subsurface = ambient_irradiance * water.water_color * transmittance * scatter_strength * 0.6;
 
     // Add sun subsurface (weighted by 1-fresnel for energy conservation) and ambient irradiance
     let lit_interior = interior_with_scatter
