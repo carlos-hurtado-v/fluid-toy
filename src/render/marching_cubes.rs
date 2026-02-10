@@ -6,6 +6,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
+use super::ContainerRenderer;
 use super::RigidBodyRenderer;
 use super::SprayRenderer;
 use crate::render::GpuCameraParams;
@@ -1833,6 +1834,7 @@ impl MarchingCubesRenderer {
         _background_color: &[f32; 3],
         rigid_body: Option<&RigidBodyRenderer>,
         spray: Option<&SprayRenderer>,
+        container: Option<&ContainerRenderer>,
     ) {
         // Pass 0: Render front faces to front_depth_texture (for GTAO)
         {
@@ -1857,6 +1859,10 @@ impl MarchingCubesRenderer {
             // Also render rigid body into front depth
             if let Some(rb) = rigid_body {
                 rb.render_depth_only(&mut front_pass);
+            }
+            // Render container into front depth (for GTAO)
+            if let Some(ct) = container {
+                ct.render_depth_only(&mut front_pass);
             }
         }
 
@@ -1915,6 +1921,11 @@ impl MarchingCubesRenderer {
             // screen-space refraction shows it through the water surface
             if let Some(rb) = rigid_body {
                 rb.render(&mut env_pass);
+            }
+
+            // Render container into background (visible through water refraction + SSR)
+            if let Some(ct) = container {
+                ct.render(&mut env_pass);
             }
 
             // Render spray into background (visible through water refraction)
@@ -1977,6 +1988,11 @@ impl MarchingCubesRenderer {
             // Draw rigid body into the carved-out gap before water mesh
             if let Some(rb) = rigid_body {
                 rb.render_msaa(&mut pass);
+            }
+
+            // Draw container walls into the scene before water mesh
+            if let Some(ct) = container {
+                ct.render_msaa(&mut pass);
             }
 
             // Draw spray particles before water mesh

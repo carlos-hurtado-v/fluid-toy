@@ -1,6 +1,6 @@
 //! GUI module - egui integration for parameter control
 
-use crate::state::{AoDebugMode, AppState, BackgroundMode, FluidRenderMode, ForceMode, HdrEnvironment, RigidBodyShape, SimulationConfig};
+use crate::state::{AoDebugMode, AppState, BackgroundMode, ContainerStyle, FluidRenderMode, ForceMode, HdrEnvironment, RigidBodyShape, SimulationConfig};
 
 /// Renders the control panel and returns any triggered action
 pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAction {
@@ -74,6 +74,25 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
 
             // Container controls
             ui.collapsing("Container", |ui| {
+                ui.label("Style:");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut state.container.style, ContainerStyle::Wireframe, "Wireframe");
+                    ui.selectable_value(&mut state.container.style, ContainerStyle::OpaquePool, "Pool");
+                });
+
+                if state.container.style == ContainerStyle::OpaquePool {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Wall Color:");
+                        egui::color_picker::color_edit_button_rgb(ui, &mut state.container.wall_color);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Floor Color:");
+                        egui::color_picker::color_edit_button_rgb(ui, &mut state.container.floor_color);
+                    });
+                }
+
+                ui.add_space(4.0);
                 ui.label("Dimensions:");
                 ui.add(
                     egui::Slider::new(&mut state.container.width, 0.5..=3.0)

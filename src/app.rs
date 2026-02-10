@@ -14,7 +14,8 @@ use wgpu::util::DeviceExt;
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, GpuContainerParams, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
+use crate::render::{Camera, ContainerRenderer, GpuContainerParams, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
+use crate::state::ContainerStyle;
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
 use crate::render::mesh_loader::{self, SdfData};
@@ -27,6 +28,7 @@ pub struct App {
     renderer: Option<ParticleRenderer3D>,
     mc_renderer: Option<MarchingCubesRenderer>,
     wireframe_renderer: Option<WireframeRenderer>,
+    container_renderer: Option<ContainerRenderer>,
     rigid_body_renderer: Option<RigidBodyRenderer>,
     rigid_body_depth_view: Option<wgpu::TextureView>,  // Fallback depth for modes without shared depth
     spray_system: Option<SpraySystem>,
@@ -75,6 +77,7 @@ impl App {
             renderer: None,
             mc_renderer: None,
             wireframe_renderer: None,
+            container_renderer: None,
             rigid_body_renderer: None,
             rigid_body_depth_view: None,
             spray_system: None,
@@ -223,6 +226,20 @@ impl App {
             gpu.config.format,
             &camera_params,
             &container_params,
+        );
+
+        // Create opaque pool container renderer
+        let container_render_params = self.state.container.to_gpu_render_params(
+            self.state.lighting.sun_direction_normalized(),
+        );
+        let container_renderer = ContainerRenderer::new(
+            &gpu.device,
+            gpu.config.format,
+            &camera_params,
+            &container_render_params,
+            &self.state.container,
+            self.state.quality.msaa.as_u32(),
+            self.state.sph.kernel_radius,
         );
 
         // Create rigid body renderer + fallback depth texture
@@ -433,6 +450,7 @@ impl App {
         self.renderer = Some(renderer);
         self.mc_renderer = Some(mc_renderer);
         self.wireframe_renderer = Some(wireframe_renderer);
+        self.container_renderer = Some(container_renderer);
         self.rigid_body_renderer = Some(rigid_body_renderer);
         self.rigid_body_depth_view = Some(rigid_body_depth_view);
         self.spray_system = Some(spray_system);
@@ -799,6 +817,16 @@ impl App {
                 wireframe.update_container(&gpu.queue, &container_params);
             }
 
+            // Update opaque pool container renderer
+            if let Some(container_r) = &mut self.container_renderer {
+                let cr_params = self.state.container.to_gpu_render_params(
+                    self.state.lighting.sun_direction_normalized(),
+                );
+                container_r.update_params(&gpu.queue, &cr_params);
+                container_r.update_camera(&gpu.queue, &self.camera.to_gpu_params());
+                container_r.maybe_rebuild_mesh(&gpu.device, &self.state.container, self.state.sph.kernel_radius);
+            }
+
             // Update gravity (based on tilt)
             let gravity = self.state.simulation.to_gpu_gravity();
             sph_sim.update_gravity(&gpu.queue, &gravity);
@@ -1118,12 +1146,18 @@ impl App {
                         } else {
                             None
                         };
+                        let container_for_mc = if self.state.container.style == ContainerStyle::OpaquePool {
+                            self.container_renderer.as_ref()
+                        } else {
+                            None
+                        };
                         mc_renderer.render(
                             &mut encoder,
                             render_target,
                             &self.state.environment.background_color,
                             rb_for_mc,
                             spray_for_mc,
+                            container_for_mc,
                         );
                     }
                 }
@@ -1262,7 +1296,9 @@ impl App {
         }
 
         // Render wireframe container visualization (on top of fluid, below UI)
+        // Skip when using opaque pool style
         if let Some(wireframe) = &self.wireframe_renderer {
+        if self.state.container.style == ContainerStyle::Wireframe {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Wireframe Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1279,6 +1315,7 @@ impl App {
                 occlusion_query_set: None,
             });
             wireframe.render(&mut render_pass);
+        }
         }
 
         // Render egui

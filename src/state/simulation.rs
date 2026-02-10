@@ -51,6 +51,19 @@ impl SimulationConfig {
     }
 }
 
+/// Container visual style
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerStyle {
+    Wireframe,
+    OpaquePool,
+}
+
+impl Default for ContainerStyle {
+    fn default() -> Self {
+        Self::Wireframe
+    }
+}
+
 /// Container configuration - defines the fluid container
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
@@ -70,6 +83,12 @@ pub struct ContainerConfig {
     pub tilt_x_target: f32,
     /// Target tilt around Z axis (radians) - set by GUI slider
     pub tilt_z_target: f32,
+    /// Visual rendering style
+    pub style: ContainerStyle,
+    /// Wall color (RGB, linear)
+    pub wall_color: [f32; 3],
+    /// Floor color (RGB, linear)
+    pub floor_color: [f32; 3],
 }
 
 impl Default for ContainerConfig {
@@ -83,6 +102,9 @@ impl Default for ContainerConfig {
             tilt_z: 0.0,
             tilt_x_target: 0.0,
             tilt_z_target: 0.0,
+            style: ContainerStyle::default(),
+            wall_color: [0.75, 0.78, 0.82],
+            floor_color: [0.6, 0.63, 0.67],
         }
     }
 }
@@ -170,6 +192,29 @@ impl ContainerConfig {
         (min, max)
     }
 
+    /// Convert to GPU render params for the opaque pool renderer
+    pub fn to_gpu_render_params(&self, light_dir: [f32; 3]) -> GpuContainerRenderParams {
+        let (sin_x, cos_x) = self.tilt_x.sin_cos();
+        let (sin_z, cos_z) = self.tilt_z.sin_cos();
+
+        // Forward rotation: local → world (same as wireframe)
+        let rotation_row0 = [cos_z, sin_z, 0.0, 0.0];
+        let rotation_row1 = [-sin_z * cos_x, cos_z * cos_x, sin_x, 0.0];
+        let rotation_row2 = [sin_z * sin_x, -cos_z * sin_x, cos_x, 0.0];
+
+        GpuContainerRenderParams {
+            wall_color: self.wall_color,
+            roughness: 0.85,
+            floor_color: self.floor_color,
+            specular_strength: 0.15,
+            light_dir,
+            _pad0: 0.0,
+            rotation_row0,
+            rotation_row1,
+            rotation_row2,
+        }
+    }
+
     /// Convert to 3D GPU-compatible bounds struct with rotation
     ///
     /// `particle_visual_radius` is used to shrink bounds so the rendered fluid
@@ -204,6 +249,21 @@ impl ContainerConfig {
             rotation_row2,
         }
     }
+}
+
+/// GPU-compatible container render parameters for opaque pool rendering
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuContainerRenderParams {
+    pub wall_color: [f32; 3],
+    pub roughness: f32,
+    pub floor_color: [f32; 3],
+    pub specular_strength: f32,
+    pub light_dir: [f32; 3],
+    pub _pad0: f32,
+    pub rotation_row0: [f32; 4],
+    pub rotation_row1: [f32; 4],
+    pub rotation_row2: [f32; 4],
 }
 
 /// SPH physics configuration
