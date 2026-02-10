@@ -24,14 +24,14 @@ pub struct SimulationConfig {
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            delta_time: 0.0045,
+            delta_time: 0.0080,
             gravity: 9.8,
-            damping: 0.20,        // Lower wall restitution for less "rubbery" bounce
+            damping: 0.55,        // Energy retained on wall bounce
             paused: false,
             max_particles: 50_000,
             initial_cube_size: 20, // 20×20×20 = 8000 particles
-            substeps: 4,
-            pcisph_iterations: 6,
+            substeps: 2,
+            pcisph_iterations: 4,
         }
     }
 }
@@ -234,10 +234,10 @@ impl Default for SphConfig {
             kernel_radius: 0.08,
             rest_density: 8000.0,
             stiffness: 35.0,
-            near_stiffness: 0.35,
+            near_stiffness: 0.40,
             viscosity: 0.75,
             mass: 1.0,
-            surface_tension: 0.030,
+            surface_tension: 0.10,    // Akinci 2013 surface tension coefficient
             wall_stiffness: 250.0,
         }
     }
