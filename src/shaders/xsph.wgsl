@@ -1,4 +1,7 @@
-// SPH 3D Density Computation with Grid-based neighbor search
+// XSPH Velocity Smoothing (Monaghan 1989)
+// Smooths each particle's velocity toward the local weighted average,
+// damping relative jitter while preserving bulk flow.
+// v_smoothed = v_i + epsilon * sum_j (m_j / rho_j) * (v_j - v_i) * W_poly6(r_ij, h)
 
 struct SphParticle3D {
     position: vec3<f32>,
@@ -46,23 +49,16 @@ struct GridParams {
 
 @group(0) @binding(0) var<uniform> params: SphParams;
 @group(0) @binding(1) var<storage, read_write> particles: array<SphParticle3D>;
-@group(0) @binding(2) var<storage, read_write> sorted_particles: array<SphParticle3D>;
-@group(0) @binding(6) var<storage, read> sorted_index: array<u32>;
+@group(0) @binding(2) var<storage, read> sorted_particles: array<SphParticle3D>;
 @group(0) @binding(3) var<storage, read> cell_starts: array<u32>;
 @group(0) @binding(4) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(5) var<uniform> grid: GridParams;
 
 const PI: f32 = 3.14159265359;
 
-fn density_kernel(r_sq: f32) -> f32 {
+fn poly6_kernel(r_sq: f32) -> f32 {
     let scale = 315.0 / (64.0 * PI * params.kernel_radius_pow9);
     let diff = params.kernel_radius_sq - r_sq;
-    return scale * diff * diff * diff;
-}
-
-fn near_density_kernel(r: f32) -> f32 {
-    let scale = 15.0 / (PI * params.kernel_radius_pow6);
-    let diff = params.kernel_radius - r;
     return scale * diff * diff * diff;
 }
 
@@ -88,12 +84,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
+    let epsilon = params.xsph_epsilon;
+    if (epsilon <= 0.0) {
+        return;
+    }
+
     let pos_i = particles[i].position;
+    let vel_i = particles[i].velocity;
     let cell_i = position_to_cell(pos_i);
 
-    var density = 0.0;
-    var near_density = 0.0;
-    var normal = vec3<f32>(0.0, 0.0, 0.0);
+    var vel_correction = vec3<f32>(0.0, 0.0, 0.0);
 
     // Iterate over 3x3x3 neighboring cells
     for (var dz = -1i; dz <= 1i; dz++) {
@@ -107,46 +107,25 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
                 let cell_idx = cell_to_index(neighbor_cell);
                 let count = cell_counts[cell_idx];
-                // cell_starts contains inclusive prefix sum, so start = end - count
                 let end = cell_starts[cell_idx];
                 let start = end - count;
 
-                // Iterate over particles in this cell
                 for (var k = 0u; k < count; k++) {
                     let j = start + k;
                     let pos_j = sorted_particles[j].position;
                     let r_vec = pos_i - pos_j;
                     let r_sq = dot(r_vec, r_vec);
 
-                    if (r_sq < params.kernel_radius_sq) {
-                        let r = sqrt(r_sq);
-                        density += params.mass * density_kernel(r_sq);
-                        near_density += params.mass * near_density_kernel(r);
-
-                        // Surface normal: unweighted poly6 gradient (proportional to ∇W)
-                        // Points outward from surface (away from fluid bulk)
-                        if (r_sq > 1e-12) {
-                            let diff = params.kernel_radius_sq - r_sq;
-                            normal += r_vec * diff * diff;
-                        }
+                    if (r_sq < params.kernel_radius_sq && r_sq > 1e-12) {
+                        let density_j = max(sorted_particles[j].density, 1.0);
+                        let vel_j = sorted_particles[j].velocity;
+                        let w = poly6_kernel(r_sq);
+                        vel_correction += (params.mass / density_j) * (vel_j - vel_i) * w;
                     }
                 }
             }
         }
     }
 
-    particles[i].density = density;
-    particles[i].near_density = near_density;
-    particles[i].normal_x = normal.x;
-    particles[i].normal_y = normal.y;
-    particles[i].normal_z = normal.z;
-
-    // Also update sorted buffer so force shader can read neighbor data
-    // without needing a second reorder pass
-    let si = sorted_index[i];
-    sorted_particles[si].density = density;
-    sorted_particles[si].near_density = near_density;
-    sorted_particles[si].normal_x = normal.x;
-    sorted_particles[si].normal_y = normal.y;
-    sorted_particles[si].normal_z = normal.z;
+    particles[i].velocity = vel_i + epsilon * vel_correction;
 }

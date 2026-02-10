@@ -41,6 +41,7 @@ pub struct SphSimulation3DGrid {
     prefix_sum_pipeline: wgpu::ComputePipeline,
     grid_reorder_pipeline: wgpu::ComputePipeline,
     density_pipeline: wgpu::ComputePipeline,
+    xsph_pipeline: wgpu::ComputePipeline,
     force_pipeline: wgpu::ComputePipeline,
     integrate_pipeline: wgpu::ComputePipeline,
 
@@ -68,6 +69,7 @@ pub struct SphSimulation3DGrid {
     prefix_sum_bind_groups: Vec<(wgpu::BindGroup, wgpu::BindGroup)>, // Pairs for ping-pong
     grid_reorder_bind_group: wgpu::BindGroup,
     density_bind_group: wgpu::BindGroup,
+    xsph_bind_group: wgpu::BindGroup,
     force_bind_group: wgpu::BindGroup,
     integrate_bind_group: wgpu::BindGroup,
 
@@ -165,6 +167,11 @@ impl SphSimulation3DGrid {
         let density_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SPH 3D Density Grid Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/sph_density_3d_grid.wgsl").into()),
+        });
+
+        let xsph_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("XSPH Velocity Smoothing Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/xsph.wgsl").into()),
         });
 
         let force_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -778,6 +785,75 @@ impl SphSimulation3DGrid {
             ],
         });
 
+        // XSPH velocity smoothing (same layout as density minus sorted_index)
+        let xsph_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("XSPH Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+
+        let xsph_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("XSPH Pipeline"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&xsph_layout],
+                push_constant_ranges: &[],
+            })),
+            module: &xsph_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let xsph_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("XSPH Bind Group"),
+            layout: &xsph_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sph_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sorted_particle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cell_starts_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: cell_counts_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: grid_params_buffer.as_entire_binding() },
+            ],
+        });
+
         // Force (with grid and gravity)
         let force_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Force Grid Layout"),
@@ -1111,6 +1187,7 @@ impl SphSimulation3DGrid {
             prefix_sum_pipeline,
             grid_reorder_pipeline,
             density_pipeline,
+            xsph_pipeline,
             force_pipeline,
             integrate_pipeline,
             particle_buffer,
@@ -1130,6 +1207,7 @@ impl SphSimulation3DGrid {
             prefix_sum_bind_groups,
             grid_reorder_bind_group,
             density_bind_group,
+            xsph_bind_group,
             force_bind_group,
             integrate_bind_group,
             rigid_body_buffer,
@@ -1252,7 +1330,18 @@ impl SphSimulation3DGrid {
             pass.dispatch_workgroups(particle_workgroups, 1, 1);
         }
 
-        // 6. Force computation
+        // 6. XSPH velocity smoothing (damps jitter while preserving bulk flow)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("XSPH Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.xsph_pipeline);
+            pass.set_bind_group(0, &self.xsph_bind_group, &[]);
+            pass.dispatch_workgroups(particle_workgroups, 1, 1);
+        }
+
+        // 7. Force computation
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Force Pass"),

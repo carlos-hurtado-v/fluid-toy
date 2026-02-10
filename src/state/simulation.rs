@@ -211,8 +211,6 @@ impl ContainerConfig {
 pub struct SphConfig {
     /// Kernel support radius
     pub kernel_radius: f32,
-    /// Target rest density
-    pub rest_density: f32,
     /// Pressure stiffness coefficient
     pub stiffness: f32,
     /// Near pressure stiffness (prevents particle collapse)
@@ -225,20 +223,21 @@ pub struct SphConfig {
     pub surface_tension: f32,
     /// Wall repulsion stiffness
     pub wall_stiffness: f32,
+    /// XSPH velocity smoothing coefficient (0 = off, 0.5 = heavy damping)
+    pub xsph_epsilon: f32,
 }
 
 impl Default for SphConfig {
     fn default() -> Self {
-        // Tuned values for realistic water-like behavior
         Self {
-            kernel_radius: 0.08,
-            rest_density: 8000.0,
+            kernel_radius: 0.065,
             stiffness: 35.0,
-            near_stiffness: 0.40,
+            near_stiffness: 0.85,
             viscosity: 0.75,
             mass: 1.0,
-            surface_tension: 0.10,    // Akinci 2013 surface tension coefficient
-            wall_stiffness: 250.0,
+            surface_tension: 0.115,
+            wall_stiffness: 200.0,
+            xsph_epsilon: 0.3,
         }
     }
 }
@@ -248,9 +247,17 @@ impl SphConfig {
         *self = Self::default();
     }
 
+    /// Rest density derived from kernel evaluation at equilibrium spacing.
+    /// This ensures the initial particle configuration is at true equilibrium —
+    /// no perpetual pressure correction oscillation.
+    pub fn rest_density(&self) -> f32 {
+        compute_rest_density(self.kernel_radius, self.mass)
+    }
+
     /// Convert to 3D GPU-compatible uniform struct
     pub fn to_gpu_params_3d(&self, num_particles: u32, dt: f32) -> GpuSphParams3D {
         let h = self.kernel_radius;
+        let rest_density = self.rest_density();
         GpuSphParams3D {
             kernel_radius: h,
             kernel_radius_sq: h * h,
@@ -258,15 +265,16 @@ impl SphConfig {
             kernel_radius_pow6: h.powi(6),
             kernel_radius_pow9: h.powi(9),
             mass: self.mass,
-            rest_density: self.rest_density,
+            rest_density,
             stiffness: self.stiffness,
             near_stiffness: self.near_stiffness,
             viscosity: self.viscosity,
             dt,
             num_particles,
             surface_tension: self.surface_tension,
-            pcisph_delta: compute_pcisph_delta(h, self.mass, self.rest_density, dt),
-            _padding_st: [0.0; 2],
+            pcisph_delta: compute_pcisph_delta(h, self.mass, rest_density, dt),
+            xsph_epsilon: self.xsph_epsilon,
+            _padding_st: 0.0,
         }
     }
 }
@@ -291,7 +299,8 @@ pub struct GpuSphParams3D {
     pub num_particles: u32,
     pub surface_tension: f32,
     pub pcisph_delta: f32,
-    pub _padding_st: [f32; 2],
+    pub xsph_epsilon: f32,
+    pub _padding_st: f32,
 }
 
 /// GPU-compatible 3D boundary parameters (matches WGSL struct layout)
@@ -320,6 +329,35 @@ pub struct GpuGravity {
 }
 
 // --- Helper functions ---
+
+/// Compute rest density by evaluating the poly6 kernel sum over a prototype cubic
+/// lattice at particle spacing = 0.6 * h. This is what the density shader will
+/// actually compute when particles are at their initial equilibrium spacing,
+/// so using it as rest_density means the system starts at true equilibrium.
+fn compute_rest_density(h: f32, mass: f32) -> f32 {
+    let spacing = h * 0.6;
+    let cells = (h / spacing).ceil() as i32 + 1;
+    let pi = std::f32::consts::PI;
+    let h2 = h * h;
+    let h9 = h.powi(9);
+    let scale = 315.0 / (64.0 * pi * h9);
+
+    let mut density = 0.0f32;
+    for dz in -cells..=cells {
+        for dy in -cells..=cells {
+            for dx in -cells..=cells {
+                let r_sq = (dx as f32 * spacing).powi(2)
+                         + (dy as f32 * spacing).powi(2)
+                         + (dz as f32 * spacing).powi(2);
+                if r_sq < h2 {
+                    let diff = h2 - r_sq;
+                    density += mass * scale * diff * diff * diff;
+                }
+            }
+        }
+    }
+    density
+}
 
 /// Precompute PCISPH pressure correction factor (δ) from kernel properties.
 /// Uses a regular cubic lattice prototype to numerically estimate the gradient sums.

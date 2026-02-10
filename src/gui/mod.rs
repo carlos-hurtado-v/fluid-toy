@@ -173,7 +173,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                             .text("Density")
                             .logarithmic(true)
                     );
-                    ui.label(format!("  Fluid density: {:.0}", state.sph.rest_density));
+                    ui.label(format!("  Fluid density: {:.0}", state.sph.rest_density()));
 
                     if state.rigid_body.held {
                         ui.add_space(4.0);
@@ -208,11 +208,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     egui::Slider::new(&mut state.sph.kernel_radius, 0.02..=0.15)
                         .text("Kernel Radius")
                 );
-                ui.add(
-                    egui::Slider::new(&mut state.sph.rest_density, 1000.0..=30000.0)
-                        .text("Rest Density")
-                        .logarithmic(true)
-                );
+                ui.label(format!("Rest Density: {:.0}", state.sph.rest_density()));
                 ui.add(
                     egui::Slider::new(&mut state.sph.near_stiffness, 0.05..=2.0)
                         .text("Near Stiffness")
@@ -232,6 +228,10 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.add(
                     egui::Slider::new(&mut state.sph.wall_stiffness, 50.0..=500.0)
                         .text("Wall Stiffness")
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.sph.xsph_epsilon, 0.0..=0.5)
+                        .text("XSPH Smoothing")
                 );
             });
 

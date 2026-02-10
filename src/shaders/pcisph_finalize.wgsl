@@ -26,7 +26,7 @@ struct SphParams {
     num_particles: u32,
     surface_tension: f32,
     pcisph_delta: f32,
-    _pad_st1: f32,
+    xsph_epsilon: f32,
     _pad_st2: f32,
 }
 
