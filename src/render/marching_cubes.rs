@@ -9,7 +9,7 @@ use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
 use super::RigidBodyRenderer;
 use super::SprayRenderer;
 use crate::render::GpuCameraParams;
-use crate::state::{GpuEnvironmentParams, GpuLightParams, GpuShCoefficients};
+use crate::state::{GpuEnvironmentParams, GpuLightParams, GpuShCoefficients, GpuSsrParams};
 
 /// Grid resolution for marching cubes (cells per dimension)
 const GRID_SIZE: u32 = 100;
@@ -269,6 +269,15 @@ pub struct MarchingCubesRenderer {
     // Bind group layouts (needed for recreating bind groups on resize)
     render_bind_group_layout: wgpu::BindGroupLayout,
 
+    // SSR (screen-space reflections)
+    ssr_texture: wgpu::Texture,
+    ssr_view: wgpu::TextureView,
+    ssr_pipeline: wgpu::ComputePipeline,
+    ssr_bind_group: wgpu::BindGroup,
+    ssr_bind_group_layout: wgpu::BindGroupLayout,
+    ssr_params_buffer: wgpu::Buffer,
+    ssr_color_sampler: wgpu::Sampler,
+
     // For reading back vertex count
     counter_staging_buffer: wgpu::Buffer,
 
@@ -377,8 +386,8 @@ impl MarchingCubesRenderer {
         // Create background texture for screen-space refraction
         let (background_texture, background_view) = create_background_texture(device, surface_format, width, height);
 
-        // Create single-sampled depth texture for background pass (always 1x)
-        let (background_depth_texture, background_depth_view) = create_depth_texture(device, width, height);
+        // Create single-sampled depth texture for background pass (always 1x, samplable for SSR)
+        let (background_depth_texture, background_depth_view) = create_samplable_depth_texture(device, width, height);
 
         // Create buffers
         let grid_params = GpuGridParams {
@@ -500,6 +509,30 @@ impl MarchingCubesRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // === SSR resources ===
+        let ssr_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SSR Texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let ssr_view = ssr_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let ssr_params = GpuSsrParams::default();
+        let ssr_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SSR Params"),
+            contents: bytemuck::bytes_of(&ssr_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         // Load shaders
         let density_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Density Shader"),
@@ -529,6 +562,11 @@ impl MarchingCubesRenderer {
         let back_depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Back Depth Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_back_depth.wgsl").into()),
+        });
+
+        let ssr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("SSR Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/ssr.wgsl").into()),
         });
 
         // === Density Pipeline ===
@@ -943,6 +981,17 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // SSR texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1163,6 +1212,160 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: sh_coefficients_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(&ssr_view),
+                },
+            ],
+        });
+
+        // === SSR Compute Pipeline ===
+        let ssr_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SSR BGL"),
+            entries: &[
+                // Camera uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Front depth (water surface)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Background depth (scene without water)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Background color
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Depth sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // Color sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // SSR params
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // SSR output
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let ssr_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("SSR Pipeline Layout"),
+            bind_group_layouts: &[&ssr_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let ssr_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("SSR Pipeline"),
+            layout: Some(&ssr_pipeline_layout),
+            module: &ssr_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        let color_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("SSR Color Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let ssr_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SSR BG"),
+            layout: &ssr_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&front_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&background_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&background_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&back_depth_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&color_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: ssr_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&ssr_view),
                 },
             ],
         });
@@ -1394,6 +1597,13 @@ impl MarchingCubesRenderer {
             width,
             height,
             surface_format,
+            ssr_texture,
+            ssr_view,
+            ssr_pipeline,
+            ssr_bind_group,
+            ssr_bind_group_layout: ssr_bind_group_layout,
+            ssr_params_buffer,
+            ssr_color_sampler: color_sampler,
         }
     }
 
@@ -1506,6 +1716,15 @@ impl MarchingCubesRenderer {
             ..Default::default()
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
+    }
+
+    /// Set whether SSR is enabled and update GPU params
+    pub fn set_ssr_enabled(&self, queue: &wgpu::Queue, enabled: bool) {
+        let params = GpuSsrParams {
+            enabled: if enabled { 1 } else { 0 },
+            ..GpuSsrParams::default()
+        };
+        queue.write_buffer(&self.ssr_params_buffer, 0, bytemuck::bytes_of(&params));
     }
 
     /// Generate mesh from particles
@@ -1704,6 +1923,20 @@ impl MarchingCubesRenderer {
             }
         }
 
+        // SSR compute pass: ray-march against background depth for screen-space reflections
+        // Always dispatch — shader checks enabled flag, writes zeros when disabled
+        {
+            let mut ssr_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("SSR Pass"),
+                timestamp_writes: None,
+            });
+            ssr_pass.set_pipeline(&self.ssr_pipeline);
+            ssr_pass.set_bind_group(0, &self.ssr_bind_group, &[]);
+            let wg_x = (self.width + 7) / 8;
+            let wg_y = (self.height + 7) / 8;
+            ssr_pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
         // Pass 3: Render water mesh with screen-space refraction from background
         // Uses MSAA if enabled (renders to msaa_view, resolves to color_view)
         {
@@ -1791,8 +2024,8 @@ impl MarchingCubesRenderer {
         self.back_depth_texture = back_depth_texture;
         self.back_depth_view = back_depth_view;
 
-        // Recreate background depth texture (always single-sampled for background pass)
-        let (background_depth_texture, background_depth_view) = create_depth_texture(device, width, height);
+        // Recreate background depth texture (always single-sampled, samplable for SSR)
+        let (background_depth_texture, background_depth_view) = create_samplable_depth_texture(device, width, height);
         self.background_depth_texture = background_depth_texture;
         self.background_depth_view = background_depth_view;
 
@@ -1800,6 +2033,64 @@ impl MarchingCubesRenderer {
         let (background_texture, background_view) = create_background_texture(device, self.surface_format, width, height);
         self.background_texture = background_texture;
         self.background_view = background_view;
+
+        // Recreate SSR texture
+        let ssr_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SSR Texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.ssr_view = ssr_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.ssr_texture = ssr_texture;
+
+        // Rebuild SSR bind group
+        self.ssr_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SSR BG"),
+            layout: &self.ssr_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.front_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.background_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.background_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.back_depth_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&self.ssr_color_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.ssr_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&self.ssr_view),
+                },
+            ],
+        });
 
         // Recreate render bind group with new textures
         self.render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1845,6 +2136,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: self.sh_coefficients_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(&self.ssr_view),
                 },
             ],
         });
@@ -1921,6 +2216,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: self.sh_coefficients_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(&self.ssr_view),
                 },
             ],
         });

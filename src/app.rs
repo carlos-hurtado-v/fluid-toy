@@ -1091,6 +1091,7 @@ impl App {
                         );
                         let env_params = self.state.environment.to_gpu_params();
                         mc_renderer.update_env_params(&gpu.queue, &env_params);
+                        mc_renderer.set_ssr_enabled(&gpu.queue, self.state.rendering.ssr_enabled);
                         let iso_value = self.state.rendering.compute_iso_value(self.state.sph.kernel_radius);
                         let blur_radius = self.state.rendering.mc_blur_radius;
                         mc_renderer.update_params(

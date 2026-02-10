@@ -55,6 +55,7 @@ struct Vertex {
 @group(0) @binding(7) var background_tex: texture_2d<f32>;
 @group(0) @binding(8) var<uniform> light: LightParams;
 @group(0) @binding(9) var<uniform> sh_coeffs: array<vec4<f32>, 9>;
+@group(0) @binding(10) var ssr_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -180,6 +181,12 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     } else {
         reflection_color = sample_environment(reflect_dir) * water.env_intensity;
     }
+
+    // Screen-space reflections — blend with env map based on SSR confidence
+    let ssr_dims = textureDimensions(ssr_tex);
+    let ssr_coord = vec2<i32>(screen_uv * vec2<f32>(f32(ssr_dims.x), f32(ssr_dims.y)));
+    let ssr_sample = textureLoad(ssr_tex, ssr_coord, 0);
+    reflection_color = mix(reflection_color, ssr_sample.rgb, ssr_sample.a);
 
     // === SCREEN-SPACE REFRACTION ===
     // Transform normal to view space for screen-space distortion

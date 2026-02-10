@@ -153,6 +153,8 @@ pub struct RenderConfig {
     pub mc_blur_radius: u32,
     /// Water surface roughness for PBR specular (0.01 = mirror, 0.5 = rough)
     pub water_roughness: f32,
+    /// Screen-space reflections enabled
+    pub ssr_enabled: bool,
 }
 
 impl Default for RenderConfig {
@@ -168,6 +170,7 @@ impl Default for RenderConfig {
             deep_water_color: [0.005, 0.03, 0.08],
             mc_blur_radius: 3,
             water_roughness: 0.04,
+            ssr_enabled: true,
         }
     }
 }
@@ -307,4 +310,25 @@ pub struct GpuEnvironmentParams {
     pub background_b: f32,
     pub env_intensity: f32,
     pub _pad: [f32; 3],
+}
+
+/// GPU SSR parameters (16 bytes, uniform buffer)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuSsrParams {
+    pub max_distance: f32,
+    pub thickness: f32,
+    pub enabled: u32,
+    pub _pad: u32,
+}
+
+impl Default for GpuSsrParams {
+    fn default() -> Self {
+        Self {
+            max_distance: 10.0,
+            thickness: 0.15,
+            enabled: 1,
+            _pad: 0,
+        }
+    }
 }

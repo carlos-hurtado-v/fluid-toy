@@ -348,6 +348,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         egui::Slider::new(&mut state.rendering.refraction_strength, 0.0..=0.5)
                             .text("Refraction")
                     );
+                    ui.checkbox(&mut state.rendering.ssr_enabled, "Screen-Space Reflections");
                     ui.label("Deep Water Color:");
                     egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.deep_water_color);
                 }
