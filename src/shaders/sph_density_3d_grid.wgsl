@@ -170,11 +170,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         density += params.mass * density_kernel(r_sq);
                         near_density += params.mass * near_density_kernel(r);
 
-                        // Surface normal: unweighted poly6 gradient (proportional to ∇W)
-                        // Points outward from surface (away from fluid bulk)
+                        // Akinci surface normal: n_i = h * Σ_j (m_j/ρ_j) * ∇W(r_ij, h)
+                        // Using ρ_j ≈ ρ₀ (rest density approximation, avoids chicken-and-egg)
+                        // ∇W_poly6 ∝ -(h²-r²)² * r_vec (note: r_vec = pos_i - pos_j)
                         if (r_sq > 1e-12) {
                             let diff = params.kernel_radius_sq - r_sq;
-                            normal += r_vec * diff * diff;
+                            normal += (params.mass / params.rest_density) * r_vec * diff * diff;
                         }
                     }
                 }
@@ -187,6 +188,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // dividing by it restores the density that would exist with a full neighborhood.
     let gamma = boundary_gamma(pos_i);
     density = density / gamma;
+
+    // Apply remaining Akinci normal normalization: h * (-945/(32πh⁹)) = -945/(32πh⁸)
+    // The sum already includes (m/ρ₀) per neighbor. This gives the full Akinci normal.
+    let h8 = params.kernel_radius_pow6 * params.kernel_radius * params.kernel_radius;
+    let normal_scale = 945.0 / (32.0 * PI * h8);
+    // Negate: poly6 gradient has a minus sign, but we want outward-pointing normals.
+    // The sum Σ r_vec * diff² already points outward, and the gradient formula has -sign,
+    // so the full gradient points inward. We keep the outward convention by not negating.
+    normal = normal * normal_scale;
 
     particles[i].density = density;
     particles[i].near_density = near_density;

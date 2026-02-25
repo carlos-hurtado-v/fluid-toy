@@ -312,7 +312,7 @@ impl Default for SphConfig {
             near_stiffness: 1.10,
             viscosity: 0.70,
             mass: 1.0,
-            surface_tension: 0.035,
+            surface_tension: 0.003,
             wall_stiffness: 225.0,
             xsph_epsilon: 0.300,
         }

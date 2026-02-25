@@ -253,7 +253,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         .text("Particle Mass")
                 );
                 ui.add(
-                    egui::Slider::new(&mut state.sph.surface_tension, 0.0..=0.2)
+                    egui::Slider::new(&mut state.sph.surface_tension, 0.0..=0.02)
                         .text("Surface Tension")
                 );
                 ui.add(

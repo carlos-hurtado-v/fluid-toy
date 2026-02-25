@@ -71,7 +71,8 @@ fn near_density_kernel_gradient(r: f32) -> f32 {
     return scale * diff * diff;
 }
 
-// Akinci 2013 cohesion kernel: attractive at medium range, repulsive when close
+// Akinci 2013 cohesion kernel: positive at medium range, negative very close (repulsive).
+// Continuous at r = h/2 (both branches equal scale * h⁶/64 there).
 fn akinci_cohesion_kernel(r: f32) -> f32 {
     let h = params.kernel_radius;
     let scale = 32.0 / (PI * params.kernel_radius_pow9);
@@ -193,11 +194,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         }
 
                         // Akinci 2013 surface tension: cohesion + curvature correction
+                        // K_ij normalizes by local density (reduces force in compressed regions)
+                        let K_ij = 2.0 * params.rest_density / (density_i + density_j);
                         let cohesion = akinci_cohesion_kernel(r);
-                        a_cohesion += -params.mass * cohesion * dir;
-                        // Curvature term: (n_i - n_j) drives surface toward minimal area
+                        // Cohesion: +m*K*C*dir (C>0 → attractive toward neighbor, C<0 → repulsive)
+                        // Akinci: a = -γ * m * C * r̂, and dir = -r̂, so a = +γ * m * C * dir
+                        a_cohesion += params.mass * K_ij * cohesion * dir;
+                        // Curvature: -(n_i - n_j) drives surface toward minimal area
+                        // (normals point outward, so negating gives inward correction)
                         let n_j = vec3<f32>(sorted_particles[j].normal_x, sorted_particles[j].normal_y, sorted_particles[j].normal_z);
-                        a_cohesion += params.mass * (n_i - n_j);
+                        a_cohesion -= params.mass * K_ij * (n_i - n_j);
                     }
                 }
             }
