@@ -28,7 +28,11 @@ struct WaterParams {
     deep_color_r: f32,
     deep_color_g: f32,
     deep_color_b: f32,
-    _pad0: f32,
+    ripple_strength: f32,
+    clarity: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 }
 
 struct LightParams {
@@ -173,6 +177,63 @@ fn world_to_container(world_pos: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(x1, y2, z2);
 }
 
+// GPU-friendly hash → pseudo-random [0,1]
+fn hash2(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Smooth value noise with analytic gradient (returns: vec3(noise, dN/dx, dN/dz))
+fn value_noise_grad(p: vec2<f32>) -> vec3<f32> {
+    let i = floor(p);
+    let f = fract(p);
+    // Quintic Hermite interpolation (C2 continuous — no grid artifacts)
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+
+    let a = hash2(i + vec2<f32>(0.0, 0.0));
+    let b = hash2(i + vec2<f32>(1.0, 0.0));
+    let c = hash2(i + vec2<f32>(0.0, 1.0));
+    let d = hash2(i + vec2<f32>(1.0, 1.0));
+
+    let val = a + (b - a) * u.x + (c - a) * u.y + (a - b - c + d) * u.x * u.y;
+    let dx = du.x * ((b - a) + (a - b - c + d) * u.y);
+    let dy = du.y * ((c - a) + (a - b - c + d) * u.x);
+    return vec3<f32>(val, dx, dy);
+}
+
+// Multi-octave noise normal perturbation with analytic derivatives.
+// Each octave doubles frequency and halves amplitude (fBm).
+fn ripple_normal(world_pos: vec3<f32>, t: f32) -> vec3<f32> {
+    var grad = vec2<f32>(0.0);
+    var amp = 1.0;
+    var freq = 10.0;
+
+    // 4 octaves at different time offsets to avoid coherent drift
+    for (var oct = 0u; oct < 4u; oct++) {
+        let time_offset = t * (0.3 + f32(oct) * 0.15);
+        // Rotate sample coords per octave to break axis alignment
+        let angle = f32(oct) * 1.8;
+        let cs = cos(angle);
+        let sn = sin(angle);
+        let p = vec2<f32>(
+            world_pos.x * cs - world_pos.z * sn,
+            world_pos.x * sn + world_pos.z * cs,
+        );
+        let n = value_noise_grad(p * freq + vec2<f32>(time_offset, -time_offset * 0.7));
+        // Rotate gradient back to world XZ
+        grad += amp * vec2<f32>(
+            n.y * cs + n.z * sn,
+            -n.y * sn + n.z * cs,
+        );
+        freq *= 2.0;
+        amp *= 0.5;
+    }
+
+    return vec3<f32>(grad.x, 0.0, grad.y);
+}
+
 @fragment
 fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     // Clip to container bounds when enabled
@@ -194,6 +255,10 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         normal = -normal;
     }
 
+    // Micro-ripple perturbation: adds small-scale surface detail the MC mesh can't capture.
+    let ripple_grad = ripple_normal(input.world_position, water.time);
+    normal = normalize(normal + ripple_grad * water.ripple_strength);
+
     // === THICKNESS CALCULATION ===
     // Sample back face depth at this screen position
     let screen_size = vec2<f32>(textureDimensions(back_depth_tex));
@@ -212,33 +277,51 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     // === ABSORPTION (Beer's Law) ===
     // Light attenuates exponentially through water
     // Different wavelengths absorb at different rates (red absorbs fastest)
+    // Clarity controls optical density: 0 = murky (dense), 1 = crystal clear (sparse)
     let absorption_coeffs = vec3<f32>(0.30, 0.08, 0.02);  // RGB absorption rates
-    let density = 1.1;  // Effective optical density
-    let transmittance = exp(-absorption_coeffs * density * thickness);
+    let optical_density = (1.0 - water.clarity) * 2.5 + 0.05;
+    let transmittance = exp(-absorption_coeffs * optical_density * thickness);
 
     // Reflection — solid color or HDR environment
     let reflect_dir = reflect(-view_dir, normal);
+    let roughness_sq = water.roughness * water.roughness;
     var reflection_color: vec3<f32>;
     if (water.use_env_background == 0u) {
         reflection_color = vec3<f32>(water.background_r, water.background_g, water.background_b);
     } else {
-        reflection_color = sample_environment(reflect_dir) * water.env_intensity;
+        // Roughness-blurred environment reflection:
+        // Sharp env sample at roughness=0 (mirror), SH irradiance at roughness=1 (fully diffuse).
+        // Squared roughness maps perceptual roughness to GGX lobe width more naturally.
+        let sharp_env = sample_environment(reflect_dir) * water.env_intensity;
+        let diffuse_env = evaluate_sh_irradiance(reflect_dir) * water.env_intensity;
+        var env_reflection = mix(sharp_env, diffuse_env, roughness_sq);
+
+        // Fade env reflection when reflect direction points below horizon.
+        // The env map only contains sky — it can't represent nearby scene geometry
+        // (walls, floor). Downward reflections would show incorrect sky colors.
+        // SSR handles these directions; without SSR, fade to the interior instead.
+        let horizon_fade = smoothstep(-0.15, 0.1, reflect_dir.y);
+        reflection_color = env_reflection * horizon_fade;
     }
 
     // Screen-space reflections — blend with env map based on SSR confidence
+    // Reduce SSR contribution for rough surfaces (sharp reflections look wrong on rough water)
     let ssr_dims = textureDimensions(ssr_tex);
     let ssr_coord = vec2<i32>(screen_uv * vec2<f32>(f32(ssr_dims.x), f32(ssr_dims.y)));
     let ssr_sample = textureLoad(ssr_tex, ssr_coord, 0);
-    reflection_color = mix(reflection_color, ssr_sample.rgb, ssr_sample.a);
+    let ssr_confidence = ssr_sample.a * (1.0 - roughness_sq);
+    reflection_color = mix(reflection_color, ssr_sample.rgb, ssr_confidence);
 
     // === SCREEN-SPACE REFRACTION ===
-    // Transform normal to view space for screen-space distortion
-    let normal_view = (camera.view * vec4<f32>(normal, 0.0)).xyz;
+    // Use normal deviation from a flat surface — a perfectly flat water surface
+    // should have zero screen-space distortion (you see straight through).
+    // Only waves and ripples create visible refraction distortion.
+    let flat_normal_view = normalize((camera.view * vec4<f32>(0.0, 1.0, 0.0, 0.0)).xyz);
+    let normal_view = normalize((camera.view * vec4<f32>(normal, 0.0)).xyz);
+    let normal_deviation = normal_view - flat_normal_view;
 
-    // Compute refraction UV offset based on normal and thickness
-    // Stronger distortion for thicker water and more angled surfaces
     let refract_strength = water.refraction_strength * (1.0 + thickness * 0.5);
-    let uv_offset = normal_view.xy * refract_strength;
+    let uv_offset = normal_deviation.xy * refract_strength;
 
     // Sample background with distorted UVs (clamp to avoid sampling outside)
     let refract_uv = clamp(screen_uv + uv_offset, vec2<f32>(0.001), vec2<f32>(0.999));
@@ -251,11 +334,12 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     let deep_color = vec3<f32>(water.deep_color_r, water.deep_color_g, water.deep_color_b);
 
     // Blend between refracted background and deep water based on thickness
-    let depth_blend = 1.0 - exp(-thickness * 0.6);
+    // Clarity scales the depth blend rate — clearer water shows background longer
+    let depth_blend = 1.0 - exp(-thickness * optical_density * 0.5);
     let water_interior = mix(refracted_background, deep_color, depth_blend);
 
     // Add water's own color contribution (subsurface scattering approximation)
-    let scatter_strength = 0.12 * (1.0 - exp(-thickness * 1.5));
+    let scatter_strength = 0.12 * (1.0 - exp(-thickness * optical_density * 1.2));
     let scatter_color = water.water_color * scatter_strength;
     let interior_with_scatter = water_interior + scatter_color * (1.0 - transmittance);
 
@@ -303,7 +387,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
 
         // Forward scattering — thin areas glow when backlit (translucency)
         let VdotL = max(0.0, dot(-view_dir, light_dir));
-        let forward_scatter = pow(VdotL, 4.0) * exp(-thickness * 2.0);
+        let forward_scatter = pow(VdotL, 4.0) * exp(-thickness * optical_density * 1.5);
         sun_subsurface += water.water_color * forward_scatter * light.sun_color * light.sun_intensity * 0.10;
     }
 

@@ -62,7 +62,11 @@ pub struct GpuWaterParams {
     pub deep_color_r: f32,
     pub deep_color_g: f32,
     pub deep_color_b: f32,
-    pub _pad: f32,
+    pub ripple_strength: f32,
+    pub clarity: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
+    pub _pad3: f32,
 }
 
 impl Default for GpuWaterParams {
@@ -81,7 +85,11 @@ impl Default for GpuWaterParams {
             deep_color_r: 0.01,
             deep_color_g: 0.04,
             deep_color_b: 0.1,
-            _pad: 0.0,
+            ripple_strength: 0.015,
+            clarity: 0.65,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
         }
     }
 }
@@ -1911,10 +1919,13 @@ impl MarchingCubesRenderer {
         time: f32,
         refraction_strength: f32,
         deep_color: &[f32; 3],
+        ripple_strength: f32,
+        clarity: f32,
     ) {
         let params = GpuWaterParams {
             water_color: *water_color,
             roughness,
+            ior: 1.333,
             env_intensity,
             use_env_background: if use_env_background { 1 } else { 0 },
             background_r: background_color[0],
@@ -1925,7 +1936,11 @@ impl MarchingCubesRenderer {
             deep_color_r: deep_color[0],
             deep_color_g: deep_color[1],
             deep_color_b: deep_color[2],
-            ..Default::default()
+            ripple_strength,
+            clarity,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
     }

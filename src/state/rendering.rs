@@ -153,6 +153,10 @@ pub struct RenderConfig {
     pub mc_blur_radius: u32,
     /// Water surface roughness for PBR specular (0.01 = mirror, 0.5 = rough)
     pub water_roughness: f32,
+    /// Micro-ripple normal perturbation strength (0 = glass-smooth, 1 = choppy)
+    pub ripple_strength: f32,
+    /// Water clarity (0 = murky, 1 = crystal clear) — controls absorption and depth tinting
+    pub water_clarity: f32,
     /// Screen-space reflections enabled
     pub ssr_enabled: bool,
 }
@@ -166,10 +170,12 @@ impl Default for RenderConfig {
             render_mode: FluidRenderMode::MarchingCubes,
             mc_threshold: 0.65,
             mc_density_radius_scale: 2.0,
-            refraction_strength: 0.14,
+            refraction_strength: 0.050,
             deep_water_color: [0.005, 0.03, 0.08],
             mc_blur_radius: 2,
             water_roughness: 0.090,
+            ripple_strength: 0.015,
+            water_clarity: 0.65,
             ssr_enabled: true,
         }
     }

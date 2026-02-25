@@ -1134,6 +1134,8 @@ impl App {
                             self.state.runtime.time_elapsed,
                             self.state.rendering.refraction_strength,
                             &self.state.rendering.deep_water_color,
+                            self.state.rendering.ripple_strength,
+                            self.state.rendering.water_clarity,
                         );
                         let env_params = self.state.environment.to_gpu_params();
                         mc_renderer.update_env_params(&gpu.queue, &env_params);

@@ -376,7 +376,15 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                             .text("Roughness")
                     );
                     ui.add(
-                        egui::Slider::new(&mut state.rendering.refraction_strength, 0.0..=0.5)
+                        egui::Slider::new(&mut state.rendering.ripple_strength, 0.0..=0.06)
+                            .text("Ripple Strength")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.water_clarity, 0.0..=1.0)
+                            .text("Clarity")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.refraction_strength, 0.0..=0.10)
                             .text("Refraction")
                     );
                     ui.checkbox(&mut state.rendering.ssr_enabled, "Screen-Space Reflections");
