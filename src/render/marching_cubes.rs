@@ -86,6 +86,39 @@ impl Default for GpuWaterParams {
     }
 }
 
+/// Container clipping parameters — clips MC mesh to container interior
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct GpuContainerClipParams {
+    pub half_width: f32,
+    pub half_depth: f32,
+    pub half_height: f32,
+    pub center_y: f32,
+    pub sin_x: f32,
+    pub cos_x: f32,
+    pub sin_z: f32,
+    pub cos_z: f32,
+    pub clip_enabled: u32,
+    pub _pad: [u32; 3],
+}
+
+impl Default for GpuContainerClipParams {
+    fn default() -> Self {
+        Self {
+            half_width: 0.9,
+            half_depth: 0.9,
+            half_height: 0.9,
+            center_y: 0.0,
+            sin_x: 0.0,
+            cos_x: 1.0,
+            sin_z: 0.0,
+            cos_z: 1.0,
+            clip_enabled: 0,
+            _pad: [0; 3],
+        }
+    }
+}
+
 /// Vertex output from marching cubes
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -269,6 +302,9 @@ pub struct MarchingCubesRenderer {
 
     // Bind group layouts (needed for recreating bind groups on resize)
     render_bind_group_layout: wgpu::BindGroupLayout,
+
+    // Container clipping
+    clip_params_buffer: wgpu::Buffer,
 
     // SSR (screen-space reflections)
     ssr_texture: wgpu::Texture,
@@ -470,6 +506,14 @@ impl MarchingCubesRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Container clip params buffer
+        let clip_params = GpuContainerClipParams::default();
+        let clip_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MC Container Clip Params"),
+            contents: bytemuck::bytes_of(&clip_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         // Light params buffer
         let light_params = GpuLightParams {
             sun_direction: [0.5, 0.8, 0.3],
@@ -604,6 +648,17 @@ impl MarchingCubesRenderer {
                         access: wgpu::StorageTextureAccess::WriteOnly,
                         format: wgpu::TextureFormat::R32Float,
                         view_dimension: wgpu::TextureViewDimension::D3,
+                    },
+                    count: None,
+                },
+                // Container clip params (for wall mirror density)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
@@ -993,6 +1048,17 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Container clip params
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1065,6 +1131,17 @@ impl MarchingCubesRenderer {
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Container clip params
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -1167,6 +1244,10 @@ impl MarchingCubesRenderer {
                     binding: 1,
                     resource: vertex_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: clip_params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -1217,6 +1298,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: wgpu::BindingResource::TextureView(&ssr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: clip_params_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1541,6 +1626,10 @@ impl MarchingCubesRenderer {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(&density_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: clip_params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -1605,6 +1694,8 @@ impl MarchingCubesRenderer {
             ssr_bind_group_layout: ssr_bind_group_layout,
             ssr_params_buffer,
             ssr_color_sampler: color_sampler,
+
+            clip_params_buffer,
         }
     }
 
@@ -1626,6 +1717,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(&self.density_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.clip_params_buffer.as_entire_binding(),
                 },
             ],
         })
@@ -1686,6 +1781,11 @@ impl MarchingCubesRenderer {
     pub fn set_bounds(&mut self, min: [f32; 3], max: [f32; 3]) {
         self.grid_min = min;
         self.grid_max = max;
+    }
+
+    /// Update container clipping parameters
+    pub fn update_container_clip_params(&self, queue: &wgpu::Queue, params: &GpuContainerClipParams) {
+        queue.write_buffer(&self.clip_params_buffer, 0, bytemuck::bytes_of(params));
     }
 
     /// Update water shading parameters
@@ -2157,6 +2257,10 @@ impl MarchingCubesRenderer {
                     binding: 10,
                     resource: wgpu::BindingResource::TextureView(&self.ssr_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.clip_params_buffer.as_entire_binding(),
+                },
             ],
         });
     }
@@ -2236,6 +2340,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: wgpu::BindingResource::TextureView(&self.ssr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.clip_params_buffer.as_entire_binding(),
                 },
             ],
         });

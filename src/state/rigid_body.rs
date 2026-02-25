@@ -366,29 +366,95 @@ pub fn integrate_rigid_body(
         ]);
     }
 
-    // Container collision in tilted local space
-    // (same rotation matrix as particle boundary handling)
+    // Container collision with proper rotated AABB
+    clamp_rigid_body_to_container(rigid_body, container, true);
+}
+
+/// Compute per-axis AABB half-extents of the rotated rigid body in container-local space.
+/// For a cube/cylinder, accounts for rotation so corners don't poke through walls.
+/// For a sphere, the extent is uniform regardless of rotation.
+fn rotated_aabb_half_extents(
+    shape: RigidBodyShape,
+    half_extent: f32,
+    orientation: [f32; 4],
+    container_rot: [[f32; 3]; 3],
+) -> [f32; 3] {
+    let he = half_extent;
+
+    if shape == RigidBodyShape::Sphere {
+        // Sphere: rotationally symmetric, no AABB inflation needed
+        return [he, he, he];
+    }
+
+    // Body-local half-extents per axis (before rotation)
+    let local_he = match shape {
+        RigidBodyShape::Torus => {
+            // major=he, minor=0.3*he → bounding box [1.3*he, 0.3*he, 1.3*he]
+            let r_minor = 0.3 * he;
+            [he + r_minor, r_minor, he + r_minor]
+        }
+        // Cube, Cylinder, Custom: all fit in [-he, he]^3
+        _ => [he, he, he],
+    };
+
+    // Body rotation matrix rows (stored as R^T, i.e. world→body)
+    let br = quat_to_rotation_rows(orientation);
+
+    // Combined M = C * R (body-local → container-local)
+    // M[i][j] = dot(container_rot[i], body_rot_row[j])
+    // because R (local→world) = (stored R^T)^T, so R[k][j] = br[j][k]
+    let mut aabb = [0.0f32; 3];
+    for i in 0..3 {
+        let mut sum = 0.0f32;
+        for j in 0..3 {
+            let m_ij = container_rot[i][0] * br[j][0]
+                     + container_rot[i][1] * br[j][1]
+                     + container_rot[i][2] * br[j][2];
+            sum += m_ij.abs() * local_he[j];
+        }
+        aabb[i] = sum;
+    }
+
+    aabb
+}
+
+/// Clamp rigid body position (and optionally velocity) to container bounds.
+/// Uses the rotated AABB so corners of cubes etc. don't poke through walls.
+pub fn clamp_rigid_body_to_container(
+    rigid_body: &mut RigidBodyConfig,
+    container: &ContainerConfig,
+    bounce_velocity: bool,
+) {
     let (sin_x, cos_x) = container.tilt_x.sin_cos();
     let (sin_z, cos_z) = container.tilt_z.sin_cos();
-    // Rotation rows (world → container local): Rz * Rx
-    let r0 = [cos_z, -sin_z * cos_x, sin_z * sin_x];
-    let r1 = [sin_z,  cos_z * cos_x, -cos_z * sin_x];
-    let r2 = [0.0,    sin_x,           cos_x];
+    // Container rotation rows (world → container local): Rz * Rx
+    let cr = [
+        [cos_z, -sin_z * cos_x, sin_z * sin_x],
+        [sin_z,  cos_z * cos_x, -cos_z * sin_x],
+        [0.0,    sin_x,          cos_x],
+    ];
 
-    let rhe = rigid_body.half_extent;
+    // Per-axis AABB half-extents in container-local space
+    let aabb = rotated_aabb_half_extents(
+        rigid_body.shape,
+        rigid_body.half_extent,
+        rigid_body.orientation,
+        cr,
+    );
+
     let pos = rigid_body.position;
     let vel = rigid_body.velocity;
 
-    // Transform to local space
+    // Transform center to container-local space
     let mut lp = [
-        r0[0]*pos[0] + r0[1]*pos[1] + r0[2]*pos[2],
-        r1[0]*pos[0] + r1[1]*pos[1] + r1[2]*pos[2],
-        r2[0]*pos[0] + r2[1]*pos[1] + r2[2]*pos[2],
+        cr[0][0]*pos[0] + cr[0][1]*pos[1] + cr[0][2]*pos[2],
+        cr[1][0]*pos[0] + cr[1][1]*pos[1] + cr[1][2]*pos[2],
+        cr[2][0]*pos[0] + cr[2][1]*pos[1] + cr[2][2]*pos[2],
     ];
     let mut lv = [
-        r0[0]*vel[0] + r0[1]*vel[1] + r0[2]*vel[2],
-        r1[0]*vel[0] + r1[1]*vel[1] + r1[2]*vel[2],
-        r2[0]*vel[0] + r2[1]*vel[1] + r2[2]*vel[2],
+        cr[0][0]*vel[0] + cr[0][1]*vel[1] + cr[0][2]*vel[2],
+        cr[1][0]*vel[0] + cr[1][1]*vel[1] + cr[1][2]*vel[2],
+        cr[2][0]*vel[0] + cr[2][1]*vel[1] + cr[2][2]*vel[2],
     ];
 
     let hw = container.half_width();
@@ -396,23 +462,25 @@ pub fn integrate_rigid_body(
     let floor_y = container.floor_y;
     let ceil_y = container.ceiling_y();
 
-    // Clamp in local space
-    if lp[0] - rhe < -hw  { lp[0] = -hw + rhe;  lv[0] =  lv[0].abs() * 0.3; }
-    if lp[0] + rhe >  hw  { lp[0] =  hw - rhe;  lv[0] = -lv[0].abs() * 0.3; }
-    if lp[1] - rhe < floor_y { lp[1] = floor_y + rhe; lv[1] =  lv[1].abs() * 0.3; }
-    if lp[1] + rhe > ceil_y  { lp[1] = ceil_y - rhe;  lv[1] = -lv[1].abs() * 0.3; }
-    if lp[2] - rhe < -hd  { lp[2] = -hd + rhe;  lv[2] =  lv[2].abs() * 0.3; }
-    if lp[2] + rhe >  hd  { lp[2] =  hd - rhe;  lv[2] = -lv[2].abs() * 0.3; }
+    // Clamp per-axis using the rotated AABB extents
+    if lp[0] - aabb[0] < -hw      { lp[0] = -hw + aabb[0];      if bounce_velocity { lv[0] =  lv[0].abs() * 0.3; } }
+    if lp[0] + aabb[0] >  hw      { lp[0] =  hw - aabb[0];      if bounce_velocity { lv[0] = -lv[0].abs() * 0.3; } }
+    if lp[1] - aabb[1] < floor_y  { lp[1] = floor_y + aabb[1];  if bounce_velocity { lv[1] =  lv[1].abs() * 0.3; } }
+    if lp[1] + aabb[1] > ceil_y   { lp[1] = ceil_y - aabb[1];   if bounce_velocity { lv[1] = -lv[1].abs() * 0.3; } }
+    if lp[2] - aabb[2] < -hd      { lp[2] = -hd + aabb[2];      if bounce_velocity { lv[2] =  lv[2].abs() * 0.3; } }
+    if lp[2] + aabb[2] >  hd      { lp[2] =  hd - aabb[2];      if bounce_velocity { lv[2] = -lv[2].abs() * 0.3; } }
 
-    // Transform back to world space (multiply by R^T)
+    // Transform back to world space (multiply by C^T)
     rigid_body.position = [
-        r0[0]*lp[0] + r1[0]*lp[1] + r2[0]*lp[2],
-        r0[1]*lp[0] + r1[1]*lp[1] + r2[1]*lp[2],
-        r0[2]*lp[0] + r1[2]*lp[1] + r2[2]*lp[2],
+        cr[0][0]*lp[0] + cr[1][0]*lp[1] + cr[2][0]*lp[2],
+        cr[0][1]*lp[0] + cr[1][1]*lp[1] + cr[2][1]*lp[2],
+        cr[0][2]*lp[0] + cr[1][2]*lp[1] + cr[2][2]*lp[2],
     ];
-    rigid_body.velocity = [
-        r0[0]*lv[0] + r1[0]*lv[1] + r2[0]*lv[2],
-        r0[1]*lv[0] + r1[1]*lv[1] + r2[1]*lv[2],
-        r0[2]*lv[0] + r1[2]*lv[1] + r2[2]*lv[2],
-    ];
+    if bounce_velocity {
+        rigid_body.velocity = [
+            cr[0][0]*lv[0] + cr[1][0]*lv[1] + cr[2][0]*lv[2],
+            cr[0][1]*lv[0] + cr[1][1]*lv[1] + cr[2][1]*lv[2],
+            cr[0][2]*lv[0] + cr[1][2]*lv[1] + cr[2][2]*lv[2],
+        ];
+    }
 }

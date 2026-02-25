@@ -14,12 +14,12 @@ use wgpu::util::DeviceExt;
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, ContainerRenderer, GpuContainerParams, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
+use crate::render::{Camera, ContainerRenderer, GpuContainerParams, GpuContainerClipParams, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
 use crate::state::ContainerStyle;
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
 use crate::render::mesh_loader::{self, SdfData};
-use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuShCoefficients, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, integrate_rigid_body};
+use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuShCoefficients, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, integrate_rigid_body, clamp_rigid_body_to_container};
 use crate::render::environment::ShCoefficients;
 
 pub struct App {
@@ -1019,6 +1019,15 @@ impl App {
             }
         }
 
+        // Clamp held rigid body to container (physics mode clamps in integrate_rigid_body)
+        if self.state.rigid_body.enabled && self.state.rigid_body.held {
+            clamp_rigid_body_to_container(
+                &mut self.state.rigid_body,
+                &self.state.container,
+                false,
+            );
+        }
+
         // Determine render target (post-process intermediate or direct to screen)
         let post_process_enabled = self.state.post_process.enabled;
         let render_target = if post_process_enabled {
@@ -1094,7 +1103,9 @@ impl App {
                 FluidRenderMode::MarchingCubes => {
                     // Marching cubes surface mesh rendering
                     if let Some(mc_renderer) = &mut self.mc_renderer {
-                        // Update grid bounds to match tilted container (with margin for kernel)
+                        // MC grid extends beyond container by kernel margin so the density
+                        // field isn't truncated at the boundary. In pool mode, fragment-shader
+                        // clipping (GpuContainerClipParams) hides any surface outside the walls.
                         let margin = self.state.sph.kernel_radius * 2.0;
                         let (aabb_min, aabb_max) = self.state.container.tilted_aabb();
                         mc_renderer.set_bounds(
@@ -1120,6 +1131,29 @@ impl App {
                         let env_params = self.state.environment.to_gpu_params();
                         mc_renderer.update_env_params(&gpu.queue, &env_params);
                         mc_renderer.set_ssr_enabled(&gpu.queue, self.state.rendering.ssr_enabled);
+
+                        // Update container clipping params
+                        {
+                            let c = &self.state.container;
+                            let is_pool = c.style == ContainerStyle::OpaquePool;
+                            let (sin_x, cos_x) = c.tilt_x.sin_cos();
+                            let (sin_z, cos_z) = c.tilt_z.sin_cos();
+                            let center_y = c.floor_y + c.height / 2.0;
+                            let clip_params = GpuContainerClipParams {
+                                half_width: c.width / 2.0,
+                                half_depth: c.depth / 2.0,
+                                half_height: c.height / 2.0,
+                                center_y,
+                                sin_x,
+                                cos_x,
+                                sin_z,
+                                cos_z,
+                                clip_enabled: if is_pool { 1 } else { 0 },
+                                _pad: [0; 3],
+                            };
+                            mc_renderer.update_container_clip_params(&gpu.queue, &clip_params);
+                        }
+
                         let iso_value = self.state.rendering.compute_iso_value(self.state.sph.kernel_radius);
                         let blur_radius = self.state.rendering.mc_blur_radius;
                         mc_renderer.update_params(

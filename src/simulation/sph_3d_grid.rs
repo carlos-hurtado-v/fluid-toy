@@ -755,6 +755,12 @@ impl SphSimulation3DGrid {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
 
@@ -782,6 +788,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 4, resource: cell_counts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: grid_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: particle_cell_indices_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: bounds_buffer.as_entire_binding() },
             ],
         });
 

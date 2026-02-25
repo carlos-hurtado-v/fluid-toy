@@ -331,25 +331,28 @@ impl ContainerRenderer {
     }
 }
 
-/// Generate container mesh: floor + 4 walls (no top). 20 vertices, 30 indices.
-/// Positions in container-local space. Normals point inward.
-///
-/// The pool must fully contain the MC fluid surface:
-/// - Walls at full container width + small outset (MC density extends beyond
-///   particle positions by up to kernel_radius, pool must cover that)
-/// - Floor extended well below floor_y (particles near floor create density
-///   that spills below via the kernel radius)
-/// - Height capped at 50% of container height (pool walls shouldn't tower
-///   over the water — the physics ceiling is invisible)
-fn generate_container_mesh(config: &ContainerConfig, kernel_radius: f32) -> (Vec<ContainerVertex>, Vec<u32>) {
-    let outset = kernel_radius * 0.5;
-    let hw = config.width / 2.0 + outset;
-    let hd = config.depth / 2.0 + outset;
-    let y0 = config.floor_y - kernel_radius * 2.0;
-    let y1 = config.floor_y + config.height * 0.5;
+/// Wall thickness for the opaque pool container
+const WALL_THICKNESS: f32 = 0.06;
 
-    let mut vertices = Vec::with_capacity(20);
-    let mut indices = Vec::with_capacity(30);
+/// Generate thick-walled pool container mesh (open top).
+/// Inner cavity matches the container config dimensions.
+/// Outer shell is offset by WALL_THICKNESS in all directions.
+/// Positions in container-local space.
+/// Wall height is capped at 50% so the pool doesn't tower over the water.
+fn generate_container_mesh(config: &ContainerConfig, _kernel_radius: f32) -> (Vec<ContainerVertex>, Vec<u32>) {
+    // Inner dimensions
+    let hw = config.width / 2.0;
+    let hd = config.depth / 2.0;
+    let y0 = config.floor_y;
+    let y1 = config.floor_y + config.height * 0.5;
+    // Outer dimensions (expanded by wall thickness)
+    let t = WALL_THICKNESS;
+    let ohw = hw + t;
+    let ohd = hd + t;
+    let oy0 = y0 - t;
+
+    let mut vertices = Vec::with_capacity(80);
+    let mut indices = Vec::with_capacity(120);
 
     // Helper to push a quad (2 triangles) with given normal and face_id
     let mut push_quad = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3], face_id: f32| {
@@ -366,54 +369,83 @@ fn generate_container_mesh(config: &ContainerConfig, kernel_radius: f32) -> (Vec
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     };
 
-    // Floor (normal up = inward for a pool)
+    // === Inner faces (facing into cavity) ===
+
+    // Inner floor (normal up)
     push_quad(
-        [-hw, y0, -hd],
-        [ hw, y0, -hd],
-        [ hw, y0,  hd],
-        [-hw, y0,  hd],
-        [0.0, 1.0, 0.0],
-        0.0,
+        [-hw, y0, -hd], [ hw, y0, -hd], [ hw, y0,  hd], [-hw, y0,  hd],
+        [0.0, 1.0, 0.0], 0.0,
+    );
+    // Inner front wall (Z = -hd, normal +Z)
+    push_quad(
+        [-hw, y0, -hd], [ hw, y0, -hd], [ hw, y1, -hd], [-hw, y1, -hd],
+        [0.0, 0.0, 1.0], 1.0,
+    );
+    // Inner back wall (Z = +hd, normal -Z)
+    push_quad(
+        [ hw, y0, hd], [-hw, y0, hd], [-hw, y1, hd], [ hw, y1, hd],
+        [0.0, 0.0, -1.0], 1.0,
+    );
+    // Inner left wall (X = -hw, normal +X)
+    push_quad(
+        [-hw, y0,  hd], [-hw, y0, -hd], [-hw, y1, -hd], [-hw, y1,  hd],
+        [1.0, 0.0, 0.0], 1.0,
+    );
+    // Inner right wall (X = +hw, normal -X)
+    push_quad(
+        [ hw, y0, -hd], [ hw, y0,  hd], [ hw, y1,  hd], [ hw, y1, -hd],
+        [-1.0, 0.0, 0.0], 1.0,
     );
 
-    // Front wall (Z = -hd, normal +Z = inward)
+    // === Outer faces (facing outward) ===
+
+    // Outer bottom (normal down)
     push_quad(
-        [-hw, y0, -hd],
-        [ hw, y0, -hd],
-        [ hw, y1, -hd],
-        [-hw, y1, -hd],
-        [0.0, 0.0, 1.0],
-        1.0,
+        [-ohw, oy0,  ohd], [ ohw, oy0,  ohd], [ ohw, oy0, -ohd], [-ohw, oy0, -ohd],
+        [0.0, -1.0, 0.0], 0.0,
+    );
+    // Outer front wall (Z = -ohd, normal -Z)
+    push_quad(
+        [ ohw, oy0, -ohd], [-ohw, oy0, -ohd], [-ohw, y1, -ohd], [ ohw, y1, -ohd],
+        [0.0, 0.0, -1.0], 1.0,
+    );
+    // Outer back wall (Z = +ohd, normal +Z)
+    push_quad(
+        [-ohw, oy0, ohd], [ ohw, oy0, ohd], [ ohw, y1, ohd], [-ohw, y1, ohd],
+        [0.0, 0.0, 1.0], 1.0,
+    );
+    // Outer left wall (X = -ohw, normal -X)
+    push_quad(
+        [-ohw, oy0, -ohd], [-ohw, oy0,  ohd], [-ohw, y1,  ohd], [-ohw, y1, -ohd],
+        [-1.0, 0.0, 0.0], 1.0,
+    );
+    // Outer right wall (X = +ohw, normal +X)
+    push_quad(
+        [ ohw, oy0,  ohd], [ ohw, oy0, -ohd], [ ohw, y1, -ohd], [ ohw, y1,  ohd],
+        [1.0, 0.0, 0.0], 1.0,
     );
 
-    // Back wall (Z = +hd, normal -Z = inward)
-    push_quad(
-        [ hw, y0, hd],
-        [-hw, y0, hd],
-        [-hw, y1, hd],
-        [ hw, y1, hd],
-        [0.0, 0.0, -1.0],
-        1.0,
-    );
+    // === Top rim (connects inner wall top edge to outer wall top edge, normal up) ===
 
-    // Left wall (X = -hw, normal +X = inward)
+    // Front rim
     push_quad(
-        [-hw, y0,  hd],
-        [-hw, y0, -hd],
-        [-hw, y1, -hd],
-        [-hw, y1,  hd],
-        [1.0, 0.0, 0.0],
-        1.0,
+        [-ohw, y1, -ohd], [ ohw, y1, -ohd], [ hw, y1, -hd], [-hw, y1, -hd],
+        [0.0, 1.0, 0.0], 1.0,
     );
-
-    // Right wall (X = +hw, normal -X = inward)
+    // Back rim
     push_quad(
-        [ hw, y0, -hd],
-        [ hw, y0,  hd],
-        [ hw, y1,  hd],
-        [ hw, y1, -hd],
-        [-1.0, 0.0, 0.0],
-        1.0,
+        [ ohw, y1, ohd], [-ohw, y1, ohd], [-hw, y1, hd], [ hw, y1, hd],
+        [0.0, 1.0, 0.0], 1.0,
+    );
+    // Left rim
+    push_quad(
+        [-ohw, y1,  ohd], [-ohw, y1, -ohd], [-hw, y1, -hd], [-hw, y1,  hd],
+        [0.0, 1.0, 0.0], 1.0,
+    );
+    // Right rim
+    push_quad(
+        [ ohw, y1, -ohd], [ ohw, y1,  ohd], [ hw, y1,  hd], [ hw, y1, -hd],
+        [0.0, 1.0, 0.0], 1.0,
     );
 
     (vertices, indices)

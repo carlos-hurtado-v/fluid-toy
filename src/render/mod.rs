@@ -16,7 +16,7 @@ pub mod wireframe;
 pub use camera::{Camera, GpuCameraParams};
 pub use container_renderer::ContainerRenderer;
 pub use gtao::GtaoRenderer;
-pub use marching_cubes::MarchingCubesRenderer;
+pub use marching_cubes::{GpuContainerClipParams, MarchingCubesRenderer};
 pub use particle_renderer_3d::ParticleRenderer3D;
 pub use post_process::PostProcessRenderer;
 pub use rigid_body_renderer::RigidBodyRenderer;
