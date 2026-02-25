@@ -14,7 +14,7 @@ use wgpu::util::DeviceExt;
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, ContainerRenderer, GpuContainerParams, GpuContainerClipParams, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
+use crate::render::{Camera, ContainerRenderer, GpuPoolStyle, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
 use crate::state::ContainerStyle;
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
@@ -186,17 +186,18 @@ impl App {
             self.state.runtime.particle_count,
             self.simulation_substep_dt(),
         );
-        let bounds_params = self.state.container.to_gpu_bounds_3d(
+        let container_geom = self.state.container.to_gpu_geometry(
                 self.state.sph.wall_stiffness,
                 self.state.simulation.damping,
-                self.state.rendering.visual_margin(),
+                self.state.container.style == ContainerStyle::OpaquePool,
+                0.0,
             );
         let sph_simulation = SphSimulation3DGrid::new(
             &gpu.device,
             &gpu.queue,
             &particles,
             sph_params,
-            bounds_params,
+            container_geom,
             self.state.simulation.max_particles,
             sdf_data.as_ref(),
         );
@@ -220,16 +221,16 @@ impl App {
         );
 
         // Create wireframe renderer for container visualization
-        let container_params = GpuContainerParams::from_config(&self.state.container);
         let wireframe_renderer = WireframeRenderer::new(
             &gpu.device,
             gpu.config.format,
             &camera_params,
-            &container_params,
+            &container_geom,
         );
 
         // Create opaque pool container renderer
-        let container_render_params = self.state.container.to_gpu_render_params(
+        let pool_style = GpuPoolStyle::from_config(
+            &self.state.container,
             self.state.lighting.sun_direction_normalized(),
         );
         let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
@@ -237,7 +238,8 @@ impl App {
             &gpu.device,
             gpu.config.format,
             &camera_params,
-            &container_render_params,
+            &container_geom,
+            &pool_style,
             &self.state.container,
             self.state.quality.msaa.as_u32(),
             self.state.sph.kernel_radius,
@@ -279,7 +281,7 @@ impl App {
             &gpu.device,
             sph_simulation.particle_buffer(),
             &sph_simulation.sph_params_buffer(),
-            &sph_simulation.bounds_buffer(),
+            &sph_simulation.container_geom_buffer(),
             self.state.spray.max_particles,
             &spray_params,
         );
@@ -488,17 +490,18 @@ impl App {
                 self.state.runtime.particle_count,
                 self.simulation_substep_dt(),
             );
-            let bounds_params = self.state.container.to_gpu_bounds_3d(
+            let container_geom = self.state.container.to_gpu_geometry(
                 self.state.sph.wall_stiffness,
                 self.state.simulation.damping,
-                self.state.rendering.visual_margin(),
+                self.state.container.style == ContainerStyle::OpaquePool,
+                0.0,
             );
             self.sph_simulation = Some(SphSimulation3DGrid::new(
                 &gpu.device,
                 &gpu.queue,
                 &particles,
                 sph_params,
-                bounds_params,
+                container_geom,
                 self.state.simulation.max_particles,
                 self.sdf_data.as_ref(),
             ));
@@ -811,25 +814,28 @@ impl App {
             sph_sim.update_sph_params(&gpu.queue, &sph_params);
             sph_sim.set_pcisph_iterations(self.state.simulation.pcisph_iterations);
 
-            let bounds_params = self.state.container.to_gpu_bounds_3d(
+            let is_pool = self.state.container.style == ContainerStyle::OpaquePool;
+            let container_geom = self.state.container.to_gpu_geometry(
                 self.state.sph.wall_stiffness,
                 self.state.simulation.damping,
-                self.state.rendering.visual_margin(),
+                is_pool,
+                0.0, // clip_margin updated by MC renderer when needed
             );
-            sph_sim.update_bounds_params(&gpu.queue, &bounds_params);
+            sph_sim.update_container_geometry(&gpu.queue, &container_geom);
 
             // Update wireframe container visualization
             if let Some(wireframe) = &self.wireframe_renderer {
-                let container_params = GpuContainerParams::from_config(&self.state.container);
-                wireframe.update_container(&gpu.queue, &container_params);
+                wireframe.update_container_geometry(&gpu.queue, &container_geom);
             }
 
             // Update opaque pool container renderer
             if let Some(container_r) = &mut self.container_renderer {
-                let cr_params = self.state.container.to_gpu_render_params(
+                let pool_style = GpuPoolStyle::from_config(
+                    &self.state.container,
                     self.state.lighting.sun_direction_normalized(),
                 );
-                container_r.update_params(&gpu.queue, &cr_params);
+                container_r.update_container_geometry(&gpu.queue, &container_geom);
+                container_r.update_pool_style(&gpu.queue, &pool_style);
                 container_r.update_camera(&gpu.queue, &self.camera.to_gpu_params());
                 container_r.maybe_rebuild_mesh(&gpu.device, &self.state.container, self.state.sph.kernel_radius);
             }
@@ -1139,32 +1145,21 @@ impl App {
                             [aabb_max[0] + mc_margin, aabb_max[1] + mc_margin, aabb_max[2] + mc_margin],
                         );
 
-                        // Update container clipping params (after set_bounds so we can compute cell_size)
+                        // Update container geometry for MC clipping (with clip_margin from MC cell_size)
                         {
                             let c = &self.state.container;
                             let is_pool = c.style == ContainerStyle::OpaquePool;
-                            let (sin_x, cos_x) = c.tilt_x.sin_cos();
-                            let (sin_z, cos_z) = c.tilt_z.sin_cos();
-                            let center_y = c.floor_y + c.height / 2.0;
-                            // MC cell_size: boundary vertices can overshoot by up to ~1 cell
                             let grid_extent = (aabb_max[0] - aabb_min[0] + 2.0 * mc_margin)
                                 .max(aabb_max[1] - aabb_min[1] + 2.0 * mc_margin)
                                 .max(aabb_max[2] - aabb_min[2] + 2.0 * mc_margin);
                             let mc_cell_size = grid_extent / 100.0; // GRID_SIZE = 100
-                            let clip_params = GpuContainerClipParams {
-                                half_width: c.width / 2.0,
-                                half_depth: c.depth / 2.0,
-                                half_height: c.height / 2.0,
-                                center_y,
-                                sin_x,
-                                cos_x,
-                                sin_z,
-                                cos_z,
-                                clip_enabled: if is_pool { 1 } else { 0 },
-                                clip_margin: mc_cell_size * 1.5,
-                                _pad: [0; 2],
-                            };
-                            mc_renderer.update_container_clip_params(&gpu.queue, &clip_params);
+                            let geom = c.to_gpu_geometry(
+                                self.state.sph.wall_stiffness,
+                                self.state.simulation.damping,
+                                is_pool,
+                                mc_cell_size * 1.5,
+                            );
+                            mc_renderer.update_container_geometry(&gpu.queue, &geom);
                         }
 
                         let iso_value = self.state.rendering.compute_iso_value(self.state.sph.kernel_radius);

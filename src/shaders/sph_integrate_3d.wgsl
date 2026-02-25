@@ -31,21 +31,6 @@ struct SphParams {
     _pad_st2: f32,
 }
 
-struct BoundsParams {
-    bound_x: f32,        // Half-width (symmetric: -bound_x to +bound_x)
-    bound_z: f32,        // Half-depth (symmetric: -bound_z to +bound_z)
-    floor_y: f32,        // Floor Y position (asymmetric)
-    ceiling_y: f32,      // Ceiling Y position (asymmetric)
-    wall_stiffness: f32,
-    damping: f32,
-    _padding1: f32,
-    _padding2: f32,
-    // Rotation matrix rows (transforms world -> container local space)
-    rotation_row0: vec4<f32>,
-    rotation_row1: vec4<f32>,
-    rotation_row2: vec4<f32>,
-}
-
 struct MouseForce {
     position: vec3<f32>,
     radius: f32,
@@ -96,7 +81,7 @@ struct RigidBodyAccum {
 
 @group(0) @binding(0) var<uniform> params: SphParams;
 @group(0) @binding(1) var<storage, read_write> particles: array<SphParticle3D>;
-@group(0) @binding(2) var<uniform> bounds: BoundsParams;
+@group(0) @binding(2) var<uniform> container: ContainerGeometry;
 @group(0) @binding(3) var<uniform> mouse_force: MouseForce;
 @group(0) @binding(4) var<uniform> rigid_body: RigidBody;
 @group(0) @binding(5) var<storage, read_write> body_accum: RigidBodyAccum;
@@ -120,74 +105,59 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // === SOFT WALL PENALTY FORCES ===
     // Repulsive force + wall-normal velocity damping within the penalty zone.
     // The damping prevents oscillation between penalty forces and PCISPH pressure correction.
-    let rot_row0 = bounds.rotation_row0.xyz;
-    let rot_row1 = bounds.rotation_row1.xyz;
-    let rot_row2 = bounds.rotation_row2.xyz;
 
     // Transform position and velocity to container-local space
-    let local_pos = vec3<f32>(
-        dot(rot_row0, pos),
-        dot(rot_row1, pos),
-        dot(rot_row2, pos)
-    );
-    let local_vel = vec3<f32>(
-        dot(rot_row0, vel),
-        dot(rot_row1, vel),
-        dot(rot_row2, vel)
-    );
+    let local_pos = world_to_local(container, pos);
+    let local_vel = world_dir_to_local(container, vel);
 
     let boundary_layer = params.kernel_radius * 0.4;
     let wall_damping = 8.0;  // Wall-normal velocity damping coefficient
     var wall_accel = vec3<f32>(0.0, 0.0, 0.0);
 
-    // X axis (symmetric: -bound_x to +bound_x)
-    let dist_neg_x = local_pos.x - (-bounds.bound_x);
+    // X axis (symmetric: -half_width to +half_width)
+    let dist_neg_x = local_pos.x - (-container.half_width);
     if (dist_neg_x < boundary_layer) {
         let t = 1.0 - dist_neg_x / boundary_layer;
-        wall_accel.x += bounds.wall_stiffness * t * t;
+        wall_accel.x += container.wall_stiffness * t * t;
         if (local_vel.x < 0.0) { wall_accel.x -= local_vel.x * wall_damping * t; }
     }
-    let dist_pos_x = bounds.bound_x - local_pos.x;
+    let dist_pos_x = container.half_width - local_pos.x;
     if (dist_pos_x < boundary_layer) {
         let t = 1.0 - dist_pos_x / boundary_layer;
-        wall_accel.x -= bounds.wall_stiffness * t * t;
+        wall_accel.x -= container.wall_stiffness * t * t;
         if (local_vel.x > 0.0) { wall_accel.x -= local_vel.x * wall_damping * t; }
     }
 
-    // Y axis (asymmetric: floor_y to ceiling_y)
-    let dist_floor = local_pos.y - bounds.floor_y;
+    // Y axis (symmetric: -half_height to +half_height)
+    let dist_floor = local_pos.y - (-container.half_height);
     if (dist_floor < boundary_layer) {
         let t = 1.0 - dist_floor / boundary_layer;
-        wall_accel.y += bounds.wall_stiffness * t * t;
+        wall_accel.y += container.wall_stiffness * t * t;
         if (local_vel.y < 0.0) { wall_accel.y -= local_vel.y * wall_damping * t; }
     }
-    let dist_ceiling = bounds.ceiling_y - local_pos.y;
+    let dist_ceiling = container.half_height - local_pos.y;
     if (dist_ceiling < boundary_layer) {
         let t = 1.0 - dist_ceiling / boundary_layer;
-        wall_accel.y -= bounds.wall_stiffness * t * t;
+        wall_accel.y -= container.wall_stiffness * t * t;
         if (local_vel.y > 0.0) { wall_accel.y -= local_vel.y * wall_damping * t; }
     }
 
-    // Z axis (symmetric: -bound_z to +bound_z)
-    let dist_neg_z = local_pos.z - (-bounds.bound_z);
+    // Z axis (symmetric: -half_depth to +half_depth)
+    let dist_neg_z = local_pos.z - (-container.half_depth);
     if (dist_neg_z < boundary_layer) {
         let t = 1.0 - dist_neg_z / boundary_layer;
-        wall_accel.z += bounds.wall_stiffness * t * t;
+        wall_accel.z += container.wall_stiffness * t * t;
         if (local_vel.z < 0.0) { wall_accel.z -= local_vel.z * wall_damping * t; }
     }
-    let dist_pos_z = bounds.bound_z - local_pos.z;
+    let dist_pos_z = container.half_depth - local_pos.z;
     if (dist_pos_z < boundary_layer) {
         let t = 1.0 - dist_pos_z / boundary_layer;
-        wall_accel.z -= bounds.wall_stiffness * t * t;
+        wall_accel.z -= container.wall_stiffness * t * t;
         if (local_vel.z > 0.0) { wall_accel.z -= local_vel.z * wall_damping * t; }
     }
 
-    // Transform wall acceleration from local to world space (multiply by R^T)
-    accel += vec3<f32>(
-        rot_row0.x * wall_accel.x + rot_row1.x * wall_accel.y + rot_row2.x * wall_accel.z,
-        rot_row0.y * wall_accel.x + rot_row1.y * wall_accel.y + rot_row2.y * wall_accel.z,
-        rot_row0.z * wall_accel.x + rot_row1.z * wall_accel.y + rot_row2.z * wall_accel.z,
-    );
+    // Transform wall acceleration from local to world space
+    accel += local_dir_to_world(container, wall_accel);
 
     // Apply mouse force (if active)
     if (mouse_force.is_active == 1u) {
@@ -377,59 +347,41 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // === HARD BOUNDARY BACKSTOP ===
     // Safety clamp for particles that escape the soft penalty layer.
     // This should rarely activate — the soft forces above handle normal containment.
-    var local_pos_new = vec3<f32>(
-        dot(rot_row0, pos),
-        dot(rot_row1, pos),
-        dot(rot_row2, pos)
-    );
+    var local_pos_new = world_to_local(container, pos);
+    var local_vel_new = world_dir_to_local(container, vel);
 
-    var local_vel_new = vec3<f32>(
-        dot(rot_row0, vel),
-        dot(rot_row1, vel),
-        dot(rot_row2, vel)
-    );
+    let restitution = container.damping;
 
-    let restitution = bounds.damping;
-
-    // X axis (symmetric: -bound_x to +bound_x)
-    if (local_pos_new.x < -bounds.bound_x) {
-        local_pos_new.x = -bounds.bound_x;
+    // X axis (symmetric: -half_width to +half_width)
+    if (local_pos_new.x < -container.half_width) {
+        local_pos_new.x = -container.half_width;
         local_vel_new.x = abs(local_vel_new.x) * restitution;
-    } else if (local_pos_new.x > bounds.bound_x) {
-        local_pos_new.x = bounds.bound_x;
+    } else if (local_pos_new.x > container.half_width) {
+        local_pos_new.x = container.half_width;
         local_vel_new.x = -abs(local_vel_new.x) * restitution;
     }
 
-    // Y axis (asymmetric: floor_y to ceiling_y)
-    if (local_pos_new.y < bounds.floor_y) {
-        local_pos_new.y = bounds.floor_y;
+    // Y axis (symmetric: -half_height to +half_height)
+    if (local_pos_new.y < -container.half_height) {
+        local_pos_new.y = -container.half_height;
         local_vel_new.y = abs(local_vel_new.y) * restitution;
-    } else if (local_pos_new.y > bounds.ceiling_y) {
-        local_pos_new.y = bounds.ceiling_y;
+    } else if (local_pos_new.y > container.half_height) {
+        local_pos_new.y = container.half_height;
         local_vel_new.y = -abs(local_vel_new.y) * restitution;
     }
 
-    // Z axis (symmetric: -bound_z to +bound_z)
-    if (local_pos_new.z < -bounds.bound_z) {
-        local_pos_new.z = -bounds.bound_z;
+    // Z axis (symmetric: -half_depth to +half_depth)
+    if (local_pos_new.z < -container.half_depth) {
+        local_pos_new.z = -container.half_depth;
         local_vel_new.z = abs(local_vel_new.z) * restitution;
-    } else if (local_pos_new.z > bounds.bound_z) {
-        local_pos_new.z = bounds.bound_z;
+    } else if (local_pos_new.z > container.half_depth) {
+        local_pos_new.z = container.half_depth;
         local_vel_new.z = -abs(local_vel_new.z) * restitution;
     }
 
-    // Transform back to world space (multiply by transpose of rotation matrix)
-    pos = vec3<f32>(
-        rot_row0.x * local_pos_new.x + rot_row1.x * local_pos_new.y + rot_row2.x * local_pos_new.z,
-        rot_row0.y * local_pos_new.x + rot_row1.y * local_pos_new.y + rot_row2.y * local_pos_new.z,
-        rot_row0.z * local_pos_new.x + rot_row1.z * local_pos_new.y + rot_row2.z * local_pos_new.z
-    );
-
-    vel = vec3<f32>(
-        rot_row0.x * local_vel_new.x + rot_row1.x * local_vel_new.y + rot_row2.x * local_vel_new.z,
-        rot_row0.y * local_vel_new.x + rot_row1.y * local_vel_new.y + rot_row2.y * local_vel_new.z,
-        rot_row0.z * local_vel_new.x + rot_row1.z * local_vel_new.y + rot_row2.z * local_vel_new.z
-    );
+    // Transform back to world space
+    pos = local_to_world(container, local_pos_new);
+    vel = local_dir_to_world(container, local_vel_new);
 
     particles[i].velocity = vel;
     particles[i].position = pos;

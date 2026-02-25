@@ -44,20 +44,6 @@ struct GridParams {
     _padding: vec2<u32>,
 }
 
-struct BoundsParams {
-    bound_x: f32,
-    bound_z: f32,
-    floor_y: f32,
-    ceiling_y: f32,
-    wall_stiffness: f32,
-    damping: f32,
-    _padding1: f32,
-    _padding2: f32,
-    rotation_row0: vec4<f32>,
-    rotation_row1: vec4<f32>,
-    rotation_row2: vec4<f32>,
-}
-
 @group(0) @binding(0) var<uniform> params: SphParams;
 @group(0) @binding(1) var<storage, read_write> particles: array<SphParticle3D>;
 @group(0) @binding(2) var<storage, read_write> sorted_particles: array<SphParticle3D>;
@@ -65,7 +51,7 @@ struct BoundsParams {
 @group(0) @binding(3) var<storage, read> cell_starts: array<u32>;
 @group(0) @binding(4) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(5) var<uniform> grid: GridParams;
-@group(0) @binding(7) var<uniform> bounds: BoundsParams;
+@group(0) @binding(7) var<uniform> container: ContainerGeometry;
 
 const PI: f32 = 3.14159265359;
 
@@ -102,21 +88,17 @@ fn is_valid_cell(cell: vec3<i32>) -> bool {
 fn boundary_gamma(pos: vec3<f32>) -> f32 {
     let h = params.kernel_radius;
     // Transform world position into container-local space
-    let local = vec3<f32>(
-        dot(bounds.rotation_row0.xyz, pos),
-        dot(bounds.rotation_row1.xyz, pos),
-        dot(bounds.rotation_row2.xyz, pos),
-    );
+    let local = world_to_local(container, pos);
 
     var gamma = 1.0;
 
-    // 6 walls: ±X, floor/ceiling Y, ±Z
-    let dist_nx = local.x - (-bounds.bound_x);
-    let dist_px = bounds.bound_x - local.x;
-    let dist_floor = local.y - bounds.floor_y;
-    let dist_ceil = bounds.ceiling_y - local.y;
-    let dist_nz = local.z - (-bounds.bound_z);
-    let dist_pz = bounds.bound_z - local.z;
+    // 6 walls: ±X, ±Y, ±Z (all symmetric in local space)
+    let dist_nx = local.x - (-container.half_width);
+    let dist_px = container.half_width - local.x;
+    let dist_floor = local.y - (-container.half_height);
+    let dist_ceil = container.half_height - local.y;
+    let dist_nz = local.z - (-container.half_depth);
+    let dist_pz = container.half_depth - local.z;
 
     if (dist_nx < h) { gamma *= 0.5 + 0.5 * clamp(dist_nx / h, 0.0, 1.0); }
     if (dist_px < h) { gamma *= 0.5 + 0.5 * clamp(dist_px / h, 0.0, 1.0); }

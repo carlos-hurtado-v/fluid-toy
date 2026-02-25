@@ -123,6 +123,54 @@ impl ContainerConfig {
         *self = Self::default();
     }
 
+    /// Compute the forward rotation matrix R = Rz * Rx (local → world)
+    /// and the inverse R^T (world → local) from the current tilt angles.
+    pub fn rotation_matrices(&self) -> ([[f32; 4]; 3], [[f32; 4]; 3]) {
+        let (sin_x, cos_x) = self.tilt_x.sin_cos();
+        let (sin_z, cos_z) = self.tilt_z.sin_cos();
+
+        // Forward rotation R = Rz * Rx: transforms local → world.
+        // Stored as rows: shader does vec3(dot(row0,v), dot(row1,v), dot(row2,v)) = R*v
+        let forward = [
+            [cos_z, -sin_z * cos_x,  sin_z * sin_x, 0.0],
+            [sin_z,  cos_z * cos_x, -cos_z * sin_x, 0.0],
+            [0.0,    sin_x,           cos_x,         0.0],
+        ];
+
+        // Inverse rotation R^T = Rx^T * Rz^T: transforms world → local.
+        let inverse = [
+            [ cos_z,              sin_z,  0.0, 0.0],
+            [-sin_z * cos_x, cos_z * cos_x, sin_x, 0.0],
+            [ sin_z * sin_x, -cos_z * sin_x, cos_x, 0.0],
+        ];
+
+        (forward, inverse)
+    }
+
+    /// Build the unified GPU container geometry struct.
+    /// Rotation is computed once here — every shader gets the same matrices.
+    pub fn to_gpu_geometry(&self, wall_stiffness: f32, damping: f32, clip_enabled: bool, clip_margin: f32) -> GpuContainerGeometry {
+        let (forward, inverse) = self.rotation_matrices();
+        let center_y = self.floor_y + self.height / 2.0;
+
+        GpuContainerGeometry {
+            half_width: self.width / 2.0,
+            half_height: self.height / 2.0,
+            half_depth: self.depth / 2.0,
+            center_y,
+            forward_row0: forward[0],
+            forward_row1: forward[1],
+            forward_row2: forward[2],
+            inverse_row0: inverse[0],
+            inverse_row1: inverse[1],
+            inverse_row2: inverse[2],
+            wall_stiffness,
+            damping,
+            clip_enabled: if clip_enabled { 1 } else { 0 },
+            clip_margin,
+        }
+    }
+
     /// Smoothly interpolate current tilt toward target (call once per frame)
     pub fn update_tilt(&mut self, dt: f32) {
         // Exponential smoothing: ~90% of the way in 0.15 seconds
@@ -201,88 +249,6 @@ impl ContainerConfig {
         (min, max)
     }
 
-    /// Convert to GPU render params for the opaque pool renderer
-    pub fn to_gpu_render_params(&self, light_dir: [f32; 3]) -> GpuContainerRenderParams {
-        let (sin_x, cos_x) = self.tilt_x.sin_cos();
-        let (sin_z, cos_z) = self.tilt_z.sin_cos();
-
-        // Forward rotation R = Rz * Rx: transforms local → world.
-        // The shader does vec3(dot(row0,v), dot(row1,v), dot(row2,v)) = M*v,
-        // so storing R rows gives R*local = world (correct forward rotation).
-        let rotation_row0 = [cos_z, -sin_z * cos_x, sin_z * sin_x, 0.0];
-        let rotation_row1 = [sin_z, cos_z * cos_x, -cos_z * sin_x, 0.0];
-        let rotation_row2 = [0.0, sin_x, cos_x, 0.0];
-
-        GpuContainerRenderParams {
-            tile_color: self.tile_color,
-            tile_scale: self.tile_scale,
-            grout_color: self.grout_color,
-            specular_strength: self.specular_strength,
-            light_dir,
-            grout_width: self.grout_width,
-            rotation_row0,
-            rotation_row1,
-            rotation_row2,
-            ibl_strength: 0.6,
-            _pad0: 0.0,
-            _pad1: 0.0,
-            _pad2: 0.0,
-        }
-    }
-
-    /// Convert to 3D GPU-compatible bounds struct with rotation
-    ///
-    /// `particle_visual_radius` is used to shrink bounds so the rendered fluid
-    /// surface stays within the visual wireframe (particle centers are constrained
-    /// inside bounds minus this margin)
-    pub fn to_gpu_bounds_3d(&self, wall_stiffness: f32, damping: f32, particle_visual_radius: f32) -> GpuBoundsParams3D {
-        // Compute rotation matrix from tilt angles
-        // Rotation around X (tilt_x) then around Z (tilt_z)
-        let (sin_x, cos_x) = self.tilt_x.sin_cos();
-        let (sin_z, cos_z) = self.tilt_z.sin_cos();
-
-        // Inverse rotation (R^T): transforms world positions INTO container-local space.
-        // Forward rotation R = Rz * Rx. Inverse = R^T = Rx^T * Rz^T.
-        // Must match the world_to_local transform in mc_density.wgsl.
-        let rotation_row0 = [cos_z, sin_z, 0.0, 0.0];
-        let rotation_row1 = [-sin_z * cos_x, cos_z * cos_x, sin_x, 0.0];
-        let rotation_row2 = [sin_z * sin_x, -cos_z * sin_x, cos_x, 0.0];
-
-        // Shrink physics bounds by visual radius so rendered surface fits inside wireframe
-        let margin = particle_visual_radius;
-
-        GpuBoundsParams3D {
-            bound_x: (self.half_width() - margin).max(0.1),
-            bound_z: (self.half_depth() - margin).max(0.1),
-            floor_y: self.floor_y + margin,
-            ceiling_y: (self.ceiling_y() - margin).max(self.floor_y + margin + 0.1),
-            wall_stiffness,
-            damping,
-            _padding: [0.0; 2],
-            rotation_row0,
-            rotation_row1,
-            rotation_row2,
-        }
-    }
-}
-
-/// GPU-compatible container render parameters for opaque pool rendering (112 bytes)
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GpuContainerRenderParams {
-    pub tile_color: [f32; 3],
-    pub tile_scale: f32,
-    pub grout_color: [f32; 3],
-    pub specular_strength: f32,
-    pub light_dir: [f32; 3],
-    pub grout_width: f32,
-    pub rotation_row0: [f32; 4],
-    pub rotation_row1: [f32; 4],
-    pub rotation_row2: [f32; 4],
-    pub ibl_strength: f32,
-    pub _pad0: f32,
-    pub _pad1: f32,
-    pub _pad2: f32,
 }
 
 /// SPH physics configuration
@@ -382,21 +348,29 @@ pub struct GpuSphParams3D {
     pub _padding_st: f32,
 }
 
-/// GPU-compatible 3D boundary parameters (matches WGSL struct layout)
+/// Unified container geometry for GPU (128 bytes).
+/// One buffer, one write, every shader that touches the container reads this.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GpuBoundsParams3D {
-    pub bound_x: f32,        // Half-width (symmetric: -bound_x to +bound_x)
-    pub bound_z: f32,        // Half-depth (symmetric: -bound_z to +bound_z)
-    pub floor_y: f32,        // Floor Y position
-    pub ceiling_y: f32,      // Ceiling Y position
+pub struct GpuContainerGeometry {
+    // Geometry (16 bytes)
+    pub half_width: f32,
+    pub half_height: f32,
+    pub half_depth: f32,
+    pub center_y: f32,
+    // Forward rotation R = Rz * Rx: local -> world (48 bytes)
+    pub forward_row0: [f32; 4],
+    pub forward_row1: [f32; 4],
+    pub forward_row2: [f32; 4],
+    // Inverse rotation R^T: world -> local (48 bytes)
+    pub inverse_row0: [f32; 4],
+    pub inverse_row1: [f32; 4],
+    pub inverse_row2: [f32; 4],
+    // Physics + clip (16 bytes)
     pub wall_stiffness: f32,
-    pub damping: f32,         // Restitution coefficient for boundary bounce (0=inelastic, 1=elastic)
-    pub _padding: [f32; 2],  // Padding for 16-byte alignment
-    // Rotation matrix for container orientation (3x3 stored as 3 vec4s for alignment)
-    pub rotation_row0: [f32; 4],  // First row + padding
-    pub rotation_row1: [f32; 4],  // Second row + padding
-    pub rotation_row2: [f32; 4],  // Third row + padding
+    pub damping: f32,
+    pub clip_enabled: u32,
+    pub clip_margin: f32,
 }
 
 /// GPU-compatible gravity parameters

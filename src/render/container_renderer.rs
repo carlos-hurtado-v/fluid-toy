@@ -3,7 +3,40 @@
 use wgpu::util::DeviceExt;
 
 use crate::render::camera::GpuCameraParams;
-use crate::state::{ContainerConfig, GpuContainerRenderParams, GpuShCoefficients};
+use crate::state::{ContainerConfig, GpuContainerGeometry, GpuShCoefficients};
+
+/// Pool material style parameters (tile pattern, lighting)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuPoolStyle {
+    pub tile_color: [f32; 3],
+    pub tile_scale: f32,
+    pub grout_color: [f32; 3],
+    pub specular_strength: f32,
+    pub light_dir: [f32; 3],
+    pub grout_width: f32,
+    pub ibl_strength: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
+}
+
+impl GpuPoolStyle {
+    pub fn from_config(config: &ContainerConfig, light_dir: [f32; 3]) -> Self {
+        Self {
+            tile_color: config.tile_color,
+            tile_scale: config.tile_scale,
+            grout_color: config.grout_color,
+            specular_strength: config.specular_strength,
+            light_dir,
+            grout_width: config.grout_width,
+            ibl_strength: 0.6,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        }
+    }
+}
 
 /// Vertex layout matching the WGSL VertexInput (32 bytes)
 #[repr(C)]
@@ -21,8 +54,9 @@ pub struct ContainerRenderer {
     depth_only_pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
-    params_buffer: wgpu::Buffer,
+    container_geom_buffer: wgpu::Buffer,
     sh_buffer: wgpu::Buffer,
+    pool_style_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
@@ -39,15 +73,20 @@ impl ContainerRenderer {
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         camera_params: &GpuCameraParams,
-        render_params: &GpuContainerRenderParams,
+        container_geom: &GpuContainerGeometry,
+        pool_style: &GpuPoolStyle,
         config: &ContainerConfig,
         msaa_sample_count: u32,
         kernel_radius: f32,
         sh_coefficients: &GpuShCoefficients,
     ) -> Self {
+        // Load shader (prepend container_common.wgsl)
+        let container_common_wgsl = include_str!("../shaders/container_common.wgsl");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Container Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/container.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/container.wgsl")).into(),
+            ),
         });
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -56,15 +95,21 @@ impl ContainerRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Container Params Buffer"),
-            contents: bytemuck::bytes_of(render_params),
+        let container_geom_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Container Geometry Buffer"),
+            contents: bytemuck::bytes_of(container_geom),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let sh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Container SH Buffer"),
             contents: bytemuck::bytes_of(sh_coefficients),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let pool_style_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Container Pool Style"),
+            contents: bytemuck::bytes_of(pool_style),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -101,6 +146,16 @@ impl ContainerRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -114,11 +169,15 @@ impl ContainerRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: params_buffer.as_entire_binding(),
+                    resource: container_geom_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: sh_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pool_style_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -148,7 +207,7 @@ impl ContainerRenderer {
                     offset: 24,
                     shader_location: 2,
                 },
-                wgpu::VertexAttribute { // _pad
+                wgpu::VertexAttribute { // _pad (is_inner)
                     format: wgpu::VertexFormat::Float32,
                     offset: 28,
                     shader_location: 3,
@@ -250,7 +309,7 @@ impl ContainerRenderer {
             cache: None,
         });
 
-        // Generate mesh
+        // Generate mesh (in centered local space)
         let (vertices, indices) = generate_container_mesh(config, kernel_radius);
         let index_count = indices.len() as u32;
 
@@ -272,8 +331,9 @@ impl ContainerRenderer {
             depth_only_pipeline,
             bind_group,
             camera_buffer,
-            params_buffer,
+            container_geom_buffer,
             sh_buffer,
+            pool_style_buffer,
             vertex_buffer,
             index_buffer,
             index_count,
@@ -289,8 +349,12 @@ impl ContainerRenderer {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(params));
     }
 
-    pub fn update_params(&self, queue: &wgpu::Queue, params: &GpuContainerRenderParams) {
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
+    pub fn update_container_geometry(&self, queue: &wgpu::Queue, geom: &GpuContainerGeometry) {
+        queue.write_buffer(&self.container_geom_buffer, 0, bytemuck::bytes_of(geom));
+    }
+
+    pub fn update_pool_style(&self, queue: &wgpu::Queue, style: &GpuPoolStyle) {
+        queue.write_buffer(&self.pool_style_buffer, 0, bytemuck::bytes_of(style));
     }
 
     pub fn update_sh_coefficients(&self, queue: &wgpu::Queue, coeffs: &GpuShCoefficients) {
@@ -364,14 +428,15 @@ const WALL_THICKNESS: f32 = 0.06;
 /// Generate thick-walled pool container mesh (open top).
 /// Inner cavity matches the container config dimensions.
 /// Outer shell is offset by WALL_THICKNESS in all directions.
-/// Positions in container-local space.
+/// Positions in container-local centered space (origin at container center).
 /// Wall height is capped at 50% so the pool doesn't tower over the water.
 fn generate_container_mesh(config: &ContainerConfig, _kernel_radius: f32) -> (Vec<ContainerVertex>, Vec<u32>) {
-    // Inner dimensions
+    // Inner dimensions in centered local space
     let hw = config.width / 2.0;
     let hd = config.depth / 2.0;
-    let y0 = config.floor_y;
-    let y1 = config.floor_y + config.height * 0.5;
+    let hh = config.height / 2.0;
+    let y0 = -hh;                   // inner floor
+    let y1 = -hh + config.height * 0.5; // wall height (50% of container)
     // Outer dimensions (expanded by wall thickness)
     let t = WALL_THICKNESS;
     let ohw = hw + t;

@@ -3,57 +3,19 @@
 use wgpu::util::DeviceExt;
 
 use crate::render::camera::GpuCameraParams;
-use crate::state::ContainerConfig;
+use crate::state::GpuContainerGeometry;
 
-/// GPU-compatible container parameters for wireframe rendering
+/// Wireframe-specific style parameters (color only)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GpuContainerParams {
-    pub min_x: f32,
-    pub max_x: f32,
-    pub min_y: f32,
-    pub max_y: f32,
-    pub min_z: f32,
-    pub max_z: f32,
-    pub color_r: f32,
-    pub color_g: f32,
-    pub color_b: f32,
-    pub color_a: f32,
-    pub _padding: [f32; 2],
-    // Rotation matrix (3x3 stored as 3 vec4s for alignment)
-    pub rotation_row0: [f32; 4],
-    pub rotation_row1: [f32; 4],
-    pub rotation_row2: [f32; 4],
+pub struct GpuWireframeStyle {
+    pub color: [f32; 4],
 }
 
-impl GpuContainerParams {
-    pub fn from_config(config: &ContainerConfig) -> Self {
-        // Compute rotation matrix from tilt angles (same as physics bounds)
-        let (sin_x, cos_x) = config.tilt_x.sin_cos();
-        let (sin_z, cos_z) = config.tilt_z.sin_cos();
-
-        // Forward rotation R = Rz * Rx: transforms local → world.
-        // Shader does M*v with these as rows, giving R*local = world.
-        let rotation_row0 = [cos_z, -sin_z * cos_x, sin_z * sin_x, 0.0];
-        let rotation_row1 = [sin_z, cos_z * cos_x, -cos_z * sin_x, 0.0];
-        let rotation_row2 = [0.0, sin_x, cos_x, 0.0];
-
+impl Default for GpuWireframeStyle {
+    fn default() -> Self {
         Self {
-            min_x: -config.half_width(),
-            max_x: config.half_width(),
-            min_y: config.floor_y,
-            max_y: config.ceiling_y(),
-            min_z: -config.half_depth(),
-            max_z: config.half_depth(),
-            // Light blue/cyan color for visibility
-            color_r: 0.3,
-            color_g: 0.7,
-            color_b: 1.0,
-            color_a: 0.8,
-            _padding: [0.0; 2],
-            rotation_row0,
-            rotation_row1,
-            rotation_row2,
+            color: [0.3, 0.7, 1.0, 0.8],
         }
     }
 }
@@ -62,7 +24,8 @@ pub struct WireframeRenderer {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
-    container_buffer: wgpu::Buffer,
+    container_geom_buffer: wgpu::Buffer,
+    _style_buffer: wgpu::Buffer,
 }
 
 impl WireframeRenderer {
@@ -70,12 +33,15 @@ impl WireframeRenderer {
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         camera_params: &GpuCameraParams,
-        container_params: &GpuContainerParams,
+        container_geom: &GpuContainerGeometry,
     ) -> Self {
-        // Load shader
+        // Load shader (prepend container_common.wgsl)
+        let container_common_wgsl = include_str!("../shaders/container_common.wgsl");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Wireframe Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/wireframe.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/wireframe.wgsl")).into(),
+            ),
         });
 
         // Create buffers
@@ -85,9 +51,16 @@ impl WireframeRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let container_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Wireframe Container Buffer"),
-            contents: bytemuck::bytes_of(container_params),
+        let container_geom_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Wireframe Container Geometry"),
+            contents: bytemuck::bytes_of(container_geom),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let style = GpuWireframeStyle::default();
+        let style_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Wireframe Style"),
+            contents: bytemuck::bytes_of(&style),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -115,6 +88,16 @@ impl WireframeRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -128,7 +111,11 @@ impl WireframeRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: container_buffer.as_entire_binding(),
+                    resource: container_geom_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: style_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -179,7 +166,8 @@ impl WireframeRenderer {
             pipeline,
             bind_group,
             camera_buffer,
-            container_buffer,
+            container_geom_buffer,
+            _style_buffer: style_buffer,
         }
     }
 
@@ -187,8 +175,8 @@ impl WireframeRenderer {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(params));
     }
 
-    pub fn update_container(&self, queue: &wgpu::Queue, params: &GpuContainerParams) {
-        queue.write_buffer(&self.container_buffer, 0, bytemuck::bytes_of(params));
+    pub fn update_container_geometry(&self, queue: &wgpu::Queue, geom: &GpuContainerGeometry) {
+        queue.write_buffer(&self.container_geom_buffer, 0, bytemuck::bytes_of(geom));
     }
 
     pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {

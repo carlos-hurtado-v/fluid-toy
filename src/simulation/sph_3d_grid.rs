@@ -2,7 +2,7 @@
 
 use crate::render::mesh_loader::SdfData;
 use crate::simulation::particle::SphParticle3D;
-use crate::state::{GpuBoundsParams3D, GpuGravity, GpuMouseForce, GpuRigidBody, GpuRigidBodyAccum, GpuSphParams3D};
+use crate::state::{GpuContainerGeometry, GpuGravity, GpuMouseForce, GpuRigidBody, GpuRigidBodyAccum, GpuSphParams3D};
 use wgpu::util::DeviceExt;
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -58,7 +58,7 @@ pub struct SphSimulation3DGrid {
 
     // Parameter buffers
     sph_params_buffer: wgpu::Buffer,
-    bounds_buffer: wgpu::Buffer,
+    container_geom_buffer: wgpu::Buffer,
     mouse_force_buffer: wgpu::Buffer,
     gravity_buffer: wgpu::Buffer,
     grid_params_buffer: wgpu::Buffer,
@@ -109,22 +109,20 @@ impl SphSimulation3DGrid {
         queue: &wgpu::Queue,
         particles: &[SphParticle3D],
         sph_params: GpuSphParams3D,
-        bounds_params: GpuBoundsParams3D,
+        container_geom: GpuContainerGeometry,
         max_particles: u32,
         sdf_data: Option<&SdfData>,
     ) -> Self {
         let num_particles = particles.len() as u32;
         let max_particles = max_particles.max(num_particles); // Ensure at least enough for initial particles
 
-        // Calculate grid dimensions based on bounds and kernel radius.
+        // Calculate grid dimensions based on kernel radius.
         // Pre-allocate for the maximum possible container configuration:
-        // sliders allow up to 3.0 per axis (half-extent 1.5), full tilt (±π),
-        // and asymmetric floor_y. The diagonal of a 1.5×1.5×1.5 half-box is
-        // 1.5*sqrt(3) ≈ 2.6. With center_y offset and margin, 4.0 covers all cases.
+        // sliders allow up to 3.0 per axis (half-extent 1.5), full tilt (±π).
+        // The diagonal of a 1.5×1.5×1.5 half-box is 1.5*sqrt(3) ≈ 2.6.
+        // With center_y offset and margin, 4.0 covers all cases.
         let cell_size = sph_params.kernel_radius;
-        let y_extent = bounds_params.floor_y.abs().max(bounds_params.ceiling_y.abs());
-        let base_extent = bounds_params.bound_x.max(y_extent).max(bounds_params.bound_z);
-        let bounds_extent = (base_extent * 1.8 + 0.2).max(4.0);
+        let bounds_extent = 4.0f32;
         let grid_size = ((2.0 * bounds_extent) / cell_size).ceil() as u32 + 2;
         let total_cells = grid_size * grid_size * grid_size;
 
@@ -166,9 +164,13 @@ impl SphSimulation3DGrid {
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/grid_reorder.wgsl").into()),
         });
 
+        let container_common_wgsl = include_str!("../shaders/container_common.wgsl");
+
         let density_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SPH 3D Density Grid Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/sph_density_3d_grid.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/sph_density_3d_grid.wgsl")).into(),
+            ),
         });
 
         let xsph_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -183,7 +185,9 @@ impl SphSimulation3DGrid {
 
         let integrate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SPH 3D Integrate Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/sph_integrate_3d.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/sph_integrate_3d.wgsl")).into(),
+            ),
         });
 
         // Create buffers with max capacity for dynamic spawning
@@ -245,9 +249,9 @@ impl SphSimulation3DGrid {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let bounds_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Bounds Buffer"),
-            contents: bytemuck::bytes_of(&bounds_params),
+        let container_geom_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Container Geometry Buffer"),
+            contents: bytemuck::bytes_of(&container_geom),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -790,7 +794,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 4, resource: cell_counts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: grid_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: particle_cell_indices_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: bounds_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: container_geom_buffer.as_entire_binding() },
             ],
         });
 
@@ -1017,7 +1021,7 @@ impl SphSimulation3DGrid {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: sph_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: bounds_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: container_geom_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: mouse_force_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: rigid_body_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: rigid_body_accum_buffer.as_entire_binding() },
@@ -1207,7 +1211,7 @@ impl SphSimulation3DGrid {
             cell_offsets_buffer,
             _particle_cell_indices_buffer: particle_cell_indices_buffer,
             sph_params_buffer,
-            bounds_buffer,
+            container_geom_buffer,
             mouse_force_buffer,
             gravity_buffer,
             grid_params_buffer,
@@ -1439,8 +1443,8 @@ impl SphSimulation3DGrid {
         }
     }
 
-    pub fn update_bounds_params(&self, queue: &wgpu::Queue, params: &GpuBoundsParams3D) {
-        queue.write_buffer(&self.bounds_buffer, 0, bytemuck::bytes_of(params));
+    pub fn update_container_geometry(&self, queue: &wgpu::Queue, geom: &GpuContainerGeometry) {
+        queue.write_buffer(&self.container_geom_buffer, 0, bytemuck::bytes_of(geom));
     }
 
     pub fn update_mouse_force(&self, queue: &wgpu::Queue, params: &GpuMouseForce) {
@@ -1508,8 +1512,8 @@ impl SphSimulation3DGrid {
         &self.sph_params_buffer
     }
 
-    pub fn bounds_buffer(&self) -> &wgpu::Buffer {
-        &self.bounds_buffer
+    pub fn container_geom_buffer(&self) -> &wgpu::Buffer {
+        &self.container_geom_buffer
     }
 
     pub fn num_particles(&self) -> u32 {

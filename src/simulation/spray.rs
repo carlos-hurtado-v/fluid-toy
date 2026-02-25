@@ -26,7 +26,7 @@ impl SpraySystem {
         device: &wgpu::Device,
         sph_particle_buffer: &wgpu::Buffer,
         sph_params_buffer: &wgpu::Buffer,
-        bounds_buffer: &wgpu::Buffer,
+        container_geom_buffer: &wgpu::Buffer,
         max_spray: u32,
         initial_params: &GpuSprayParams,
     ) -> Self {
@@ -160,10 +160,11 @@ impl SpraySystem {
         });
 
         // === Simulate Pipeline ===
+        let container_common_wgsl = include_str!("../shaders/container_common.wgsl");
         let simulate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Spray Simulate Shader"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/spray_simulate.wgsl").into(),
+                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/spray_simulate.wgsl")).into(),
             ),
         });
 
@@ -233,7 +234,7 @@ impl SpraySystem {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: bounds_buffer.as_entire_binding(),
+                    resource: container_geom_buffer.as_entire_binding(),
                 },
             ],
         });

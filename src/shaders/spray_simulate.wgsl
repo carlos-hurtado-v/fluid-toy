@@ -27,23 +27,9 @@ struct SprayParams {
     gravity_y: f32,
 };
 
-struct BoundsParams {
-    bound_x: f32,
-    bound_z: f32,
-    floor_y: f32,
-    ceiling_y: f32,
-    wall_stiffness: f32,
-    damping: f32,
-    _padding1: f32,
-    _padding2: f32,
-    rotation_row0: vec4<f32>,
-    rotation_row1: vec4<f32>,
-    rotation_row2: vec4<f32>,
-};
-
 @group(0) @binding(0) var<storage, read_write> spray_particles: array<SprayParticle>;
 @group(0) @binding(1) var<uniform> params: SprayParams;
-@group(0) @binding(2) var<uniform> bounds: BoundsParams;
+@group(0) @binding(2) var<uniform> container: ContainerGeometry;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -84,20 +70,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     p.lifetime = p.lifetime - dt;
 
     // Kill spray particles that exit the container bounds
-    // Transform position to container-local space
     let pos = vec3<f32>(p.pos_x, p.pos_y, p.pos_z);
-    let rot_row0 = bounds.rotation_row0.xyz;
-    let rot_row1 = bounds.rotation_row1.xyz;
-    let rot_row2 = bounds.rotation_row2.xyz;
-    let local_pos = vec3<f32>(
-        dot(rot_row0, pos),
-        dot(rot_row1, pos),
-        dot(rot_row2, pos)
-    );
+    let local_pos = world_to_local(container, pos);
 
-    if (local_pos.x < -bounds.bound_x || local_pos.x > bounds.bound_x ||
-        local_pos.y < bounds.floor_y || local_pos.y > bounds.ceiling_y ||
-        local_pos.z < -bounds.bound_z || local_pos.z > bounds.bound_z) {
+    if (!is_inside_box(container, local_pos, 0.0)) {
         p.lifetime = 0.0;
     }
 

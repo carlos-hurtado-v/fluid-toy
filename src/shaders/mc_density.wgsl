@@ -25,21 +25,6 @@ struct GridParams {
     max_vertices: u32,
 }
 
-struct ContainerClipParams {
-    half_width: f32,
-    half_depth: f32,
-    half_height: f32,
-    center_y: f32,
-    sin_x: f32,
-    cos_x: f32,
-    sin_z: f32,
-    cos_z: f32,
-    clip_enabled: u32,
-    clip_margin: f32,
-    _pad1: u32,
-    _pad2: u32,
-}
-
 struct SphGridParams {
     grid_size_x: u32,
     grid_size_y: u32,
@@ -57,7 +42,7 @@ struct SphGridParams {
 @group(0) @binding(0) var<storage, read> sorted_particles: array<SphParticle3D>;
 @group(0) @binding(1) var<uniform> params: GridParams;
 @group(0) @binding(2) var density_field: texture_storage_3d<r32float, write>;
-@group(0) @binding(3) var<uniform> clip: ContainerClipParams;
+@group(0) @binding(3) var<uniform> container: ContainerGeometry;
 @group(0) @binding(4) var<storage, read> cell_starts: array<u32>;
 @group(0) @binding(5) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(6) var<uniform> sph_grid: SphGridParams;
@@ -99,34 +84,18 @@ fn is_valid_sph_cell(cell: vec3<i32>) -> bool {
 
 // --- Boundary gamma correction ---
 
-// Transform world position to container-local space (inverse tilt)
-fn world_to_local(world_pos: vec3<f32>) -> vec3<f32> {
-    var p = world_pos;
-    p.y -= clip.center_y;
-
-    // Inverse Z rotation
-    let x1 = p.x * clip.cos_z + p.y * clip.sin_z;
-    let y1 = -p.x * clip.sin_z + p.y * clip.cos_z;
-
-    // Inverse X rotation
-    let y2 = y1 * clip.cos_x + p.z * clip.sin_x;
-    let z2 = -y1 * clip.sin_x + p.z * clip.cos_x;
-
-    return vec3<f32>(x1, y2, z2);
-}
-
 // Estimate fraction of kernel support volume inside the container.
 fn boundary_gamma(world_pos: vec3<f32>, h: f32) -> f32 {
-    let local = world_to_local(world_pos);
+    let local = world_to_local(container, world_pos);
 
     var gamma = 1.0;
 
     // 5 walls: ±X, floor Y, ±Z (no ceiling — open top)
-    let dist_nx = local.x + clip.half_width;
-    let dist_px = clip.half_width - local.x;
-    let dist_floor = local.y + clip.half_height;
-    let dist_nz = local.z + clip.half_depth;
-    let dist_pz = clip.half_depth - local.z;
+    let dist_nx = local.x + container.half_width;
+    let dist_px = container.half_width - local.x;
+    let dist_floor = local.y + container.half_height;
+    let dist_nz = local.z + container.half_depth;
+    let dist_pz = container.half_depth - local.z;
 
     if (dist_nx < h) { gamma *= 0.5 + 0.5 * clamp(dist_nx / h, 0.0, 1.0); }
     if (dist_px < h) { gamma *= 0.5 + 0.5 * clamp(dist_px / h, 0.0, 1.0); }
@@ -195,11 +164,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Mark voxels outside the container with a sentinel (-1).
     // The blur shader skips sentinels, preventing density bleed across walls.
-    let local = world_to_local(world_pos);
-    if (clip.clip_enabled != 0u &&
-        (local.x < -clip.half_width || local.x > clip.half_width ||
-         local.y < -clip.half_height || local.y > clip.half_height ||
-         local.z < -clip.half_depth || local.z > clip.half_depth)) {
+    let local = world_to_local(container, world_pos);
+    if (container.clip_enabled != 0u && !is_inside_box(container, local, 0.0)) {
         textureStore(density_field, vec3<i32>(global_id), vec4<f32>(-1.0, 0.0, 0.0, 0.0));
         return;
     }

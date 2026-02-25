@@ -61,22 +61,7 @@ struct Vertex {
 @group(0) @binding(9) var<uniform> sh_coeffs: array<vec4<f32>, 9>;
 @group(0) @binding(10) var ssr_tex: texture_2d<f32>;
 
-struct ContainerClipParams {
-    half_width: f32,
-    half_depth: f32,
-    half_height: f32,
-    center_y: f32,
-    sin_x: f32,
-    cos_x: f32,
-    sin_z: f32,
-    cos_z: f32,
-    clip_enabled: u32,
-    clip_margin: f32,
-    _pad1: u32,
-    _pad2: u32,
-}
-
-@group(0) @binding(11) var<uniform> clip: ContainerClipParams;
+@group(0) @binding(11) var<uniform> container: ContainerGeometry;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -161,22 +146,6 @@ fn linearize_depth(d: f32, near: f32, far: f32) -> f32 {
     return near * far / (far - d * (far - near));
 }
 
-// Transform world position to container-local space (inverse tilt)
-fn world_to_container(world_pos: vec3<f32>) -> vec3<f32> {
-    var p = world_pos;
-    p.y -= clip.center_y;
-
-    // Inverse Z rotation (negate sin_z)
-    let x1 = p.x * clip.cos_z + p.y * clip.sin_z;
-    let y1 = -p.x * clip.sin_z + p.y * clip.cos_z;
-
-    // Inverse X rotation (negate sin_x)
-    let y2 = y1 * clip.cos_x + p.z * clip.sin_x;
-    let z2 = -y1 * clip.sin_x + p.z * clip.cos_x;
-
-    return vec3<f32>(x1, y2, z2);
-}
-
 // GPU-friendly hash → pseudo-random [0,1]
 fn hash2(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
@@ -238,12 +207,9 @@ fn ripple_normal(world_pos: vec3<f32>, t: f32) -> vec3<f32> {
 fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     // Clip to container bounds with margin (MC interpolation can place vertices
     // slightly outside the container; clip_margin ≈ 1.5× MC cell_size).
-    if (clip.clip_enabled != 0u) {
-        let local = world_to_container(input.world_position);
-        let m = clip.clip_margin;
-        if (local.x < -(clip.half_width + m) || local.x > (clip.half_width + m) ||
-            local.y < -(clip.half_height + m) || local.y > (clip.half_height + m) ||
-            local.z < -(clip.half_depth + m) || local.z > (clip.half_depth + m)) {
+    if (container.clip_enabled != 0u) {
+        let local = world_to_local(container, input.world_position);
+        if (!is_inside_box(container, local, container.clip_margin)) {
             discard;
         }
     }

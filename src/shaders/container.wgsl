@@ -9,16 +9,13 @@ struct CameraParams {
     eye_position: vec4<f32>,
 };
 
-struct ContainerRenderParams {
+struct PoolStyle {
     tile_color: vec3<f32>,
     tile_scale: f32,
     grout_color: vec3<f32>,
     specular_strength: f32,
     light_dir: vec3<f32>,
     grout_width: f32,
-    rotation_row0: vec4<f32>,
-    rotation_row1: vec4<f32>,
-    rotation_row2: vec4<f32>,
     ibl_strength: f32,
     _pad0: f32,
     _pad1: f32,
@@ -26,8 +23,9 @@ struct ContainerRenderParams {
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraParams;
-@group(0) @binding(1) var<uniform> params: ContainerRenderParams;
+@group(0) @binding(1) var<uniform> container: ContainerGeometry;
 @group(0) @binding(2) var<uniform> sh_coeffs: array<vec4<f32>, 9>;
+@group(0) @binding(3) var<uniform> pool: PoolStyle;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -44,21 +42,10 @@ struct VertexOutput {
     @location(3) is_inner: f32,
 };
 
-fn rotate_local_to_world(v: vec3<f32>) -> vec3<f32> {
-    let r0 = params.rotation_row0.xyz;
-    let r1 = params.rotation_row1.xyz;
-    let r2 = params.rotation_row2.xyz;
-    return vec3<f32>(
-        dot(r0, v),
-        dot(r1, v),
-        dot(r2, v),
-    );
-}
-
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
-    let world_pos = rotate_local_to_world(input.position);
-    let world_normal = rotate_local_to_world(input.normal);
+    let world_pos = local_to_world(container, input.position);
+    let world_normal = local_dir_to_world(container, input.normal);
 
     var out: VertexOutput;
     out.clip_position = camera.projection * camera.view * vec4<f32>(world_pos, 1.0);
@@ -94,7 +81,7 @@ fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
 // --- Tile pattern ---
 // Returns (variation, grout_factor) where grout_factor=1 means grout, 0 means tile
 fn tile_pattern(uv: vec2<f32>) -> vec2<f32> {
-    let scaled = uv * params.tile_scale;
+    let scaled = uv * pool.tile_scale;
     let cell = floor(scaled);
     let f = fract(scaled);
 
@@ -102,7 +89,7 @@ fn tile_pattern(uv: vec2<f32>) -> vec2<f32> {
     let variation = (hash2(cell) - 0.5) * 0.16;
 
     // Grout detection: distance from edges
-    let gw = params.grout_width;
+    let gw = pool.grout_width;
     let edge_x = min(f.x, 1.0 - f.x);
     let edge_y = min(f.y, 1.0 - f.y);
     let edge_dist = min(edge_x, edge_y);
@@ -138,7 +125,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         N = -N;
     }
 
-    let L = normalize(params.light_dir);
+    let L = normalize(pool.light_dir);
     let H = normalize(L + V);
     let NdotL = max(dot(N, L), 0.0);
     let NdotV = max(dot(N, V), 0.0);
@@ -161,17 +148,17 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let grout = tile_info.y;
 
     // Blend tile and grout colors with per-tile variation
-    let tile_col = params.tile_color * (1.0 + variation);
-    let base_color = mix(tile_col, params.grout_color, grout);
+    let tile_col = pool.tile_color * (1.0 + variation);
+    let base_color = mix(tile_col, pool.grout_color, grout);
 
     // IBL diffuse lighting
-    let ibl_diffuse = evaluate_sh_irradiance(N) * params.ibl_strength;
+    let ibl_diffuse = evaluate_sh_irradiance(N) * pool.ibl_strength;
 
     // Wet specular (Blinn-Phong with Schlick Fresnel, F0=0.04 for wet ceramic)
     let NdotH = max(dot(N, H), 0.0);
     let f0 = 0.04;
     let fresnel = f0 + (1.0 - f0) * pow(1.0 - NdotV, 5.0);
-    let spec = fresnel * params.specular_strength * pow(NdotH, 64.0);
+    let spec = fresnel * pool.specular_strength * pow(NdotH, 64.0);
 
     // Final composition
     let color = base_color * (ibl_diffuse + NdotL * 0.65) + vec3<f32>(spec);

@@ -10,7 +10,7 @@ use super::ContainerRenderer;
 use super::RigidBodyRenderer;
 use super::SprayRenderer;
 use crate::render::GpuCameraParams;
-use crate::state::{GpuEnvironmentParams, GpuLightParams, GpuShCoefficients, GpuSsrParams};
+use crate::state::{GpuContainerGeometry, GpuEnvironmentParams, GpuLightParams, GpuShCoefficients, GpuSsrParams};
 
 /// Grid resolution for marching cubes (cells per dimension)
 const GRID_SIZE: u32 = 100;
@@ -90,41 +90,6 @@ impl Default for GpuWaterParams {
             _pad1: 0.0,
             _pad2: 0.0,
             _pad3: 0.0,
-        }
-    }
-}
-
-/// Container clipping parameters — clips MC mesh to container interior
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct GpuContainerClipParams {
-    pub half_width: f32,
-    pub half_depth: f32,
-    pub half_height: f32,
-    pub center_y: f32,
-    pub sin_x: f32,
-    pub cos_x: f32,
-    pub sin_z: f32,
-    pub cos_z: f32,
-    pub clip_enabled: u32,
-    pub clip_margin: f32,  // MC cell_size: allows boundary vertices slightly outside container
-    pub _pad: [u32; 2],
-}
-
-impl Default for GpuContainerClipParams {
-    fn default() -> Self {
-        Self {
-            half_width: 0.9,
-            half_depth: 0.9,
-            half_height: 0.9,
-            center_y: 0.0,
-            sin_x: 0.0,
-            cos_x: 1.0,
-            sin_z: 0.0,
-            cos_z: 1.0,
-            clip_enabled: 0,
-            clip_margin: 0.0,
-            _pad: [0; 2],
         }
     }
 }
@@ -336,8 +301,8 @@ pub struct MarchingCubesRenderer {
     // Bind group layouts (needed for recreating bind groups on resize)
     render_bind_group_layout: wgpu::BindGroupLayout,
 
-    // Container clipping
-    clip_params_buffer: wgpu::Buffer,
+    // Container geometry (shared: geometry, rotation, physics, clip)
+    container_geom_buffer: wgpu::Buffer,
 
     // SSR (screen-space reflections)
     ssr_texture: wgpu::Texture,
@@ -545,11 +510,11 @@ impl MarchingCubesRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Container clip params buffer
-        let clip_params = GpuContainerClipParams::default();
-        let clip_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Container Clip Params"),
-            contents: bytemuck::bytes_of(&clip_params),
+        // Container geometry buffer (shared struct: geometry, rotation, physics, clip)
+        let container_geom = GpuContainerGeometry::zeroed();
+        let container_geom_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MC Container Geometry"),
+            contents: bytemuck::bytes_of(&container_geom),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -617,10 +582,14 @@ impl MarchingCubesRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Load shaders
+        // Load shaders (prepend container_common.wgsl to those that use ContainerGeometry)
+        let container_common_wgsl = include_str!("../shaders/container_common.wgsl");
+
         let density_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Density Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_density.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/mc_density.wgsl")).into(),
+            ),
         });
 
         let generate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -630,7 +599,9 @@ impl MarchingCubesRenderer {
 
         let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Render Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_render.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/mc_render.wgsl")).into(),
+            ),
         });
 
         let env_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -645,7 +616,9 @@ impl MarchingCubesRenderer {
 
         let back_depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Back Depth Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_back_depth.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/mc_back_depth.wgsl")).into(),
+            ),
         });
 
         let ssr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -690,7 +663,7 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
-                // Container clip params (for boundary gamma correction)
+                // Container geometry (for boundary gamma correction + clipping)
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -1322,7 +1295,7 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: clip_params_buffer.as_entire_binding(),
+                    resource: container_geom_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1377,7 +1350,7 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
-                    resource: clip_params_buffer.as_entire_binding(),
+                    resource: container_geom_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1719,7 +1692,7 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: clip_params_buffer.as_entire_binding(),
+                    resource: container_geom_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -1800,7 +1773,7 @@ impl MarchingCubesRenderer {
             ssr_params_buffer,
             ssr_color_sampler: color_sampler,
 
-            clip_params_buffer,
+            container_geom_buffer,
         }
     }
 
@@ -1832,7 +1805,7 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.clip_params_buffer.as_entire_binding(),
+                    resource: self.container_geom_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -1910,9 +1883,9 @@ impl MarchingCubesRenderer {
         self.grid_max = max;
     }
 
-    /// Update container clipping parameters
-    pub fn update_container_clip_params(&self, queue: &wgpu::Queue, params: &GpuContainerClipParams) {
-        queue.write_buffer(&self.clip_params_buffer, 0, bytemuck::bytes_of(params));
+    /// Update container geometry (shared struct: geometry, rotation, physics, clip)
+    pub fn update_container_geometry(&self, queue: &wgpu::Queue, geom: &GpuContainerGeometry) {
+        queue.write_buffer(&self.container_geom_buffer, 0, bytemuck::bytes_of(geom));
     }
 
     /// Update water shading parameters
@@ -2434,7 +2407,7 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
-                    resource: self.clip_params_buffer.as_entire_binding(),
+                    resource: self.container_geom_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -2518,7 +2491,7 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
-                    resource: self.clip_params_buffer.as_entire_binding(),
+                    resource: self.container_geom_buffer.as_entire_binding(),
                 },
             ],
         });

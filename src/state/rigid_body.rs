@@ -425,13 +425,18 @@ pub fn clamp_rigid_body_to_container(
     container: &ContainerConfig,
     bounce_velocity: bool,
 ) {
-    let (sin_x, cos_x) = container.tilt_x.sin_cos();
-    let (sin_z, cos_z) = container.tilt_z.sin_cos();
-    // Container rotation rows (world → container local): Rz * Rx
-    let cr = [
-        [cos_z, -sin_z * cos_x, sin_z * sin_x],
-        [sin_z,  cos_z * cos_x, -cos_z * sin_x],
-        [0.0,    sin_x,          cos_x],
+    let (forward, inverse) = container.rotation_matrices();
+    // Inverse R^T rows (world → container local), truncated to 3-component
+    let inv = [
+        [inverse[0][0], inverse[0][1], inverse[0][2]],
+        [inverse[1][0], inverse[1][1], inverse[1][2]],
+        [inverse[2][0], inverse[2][1], inverse[2][2]],
+    ];
+    // Forward R rows (container local → world), truncated to 3-component
+    let fwd = [
+        [forward[0][0], forward[0][1], forward[0][2]],
+        [forward[1][0], forward[1][1], forward[1][2]],
+        [forward[2][0], forward[2][1], forward[2][2]],
     ];
 
     // Per-axis AABB half-extents in container-local space
@@ -439,48 +444,49 @@ pub fn clamp_rigid_body_to_container(
         rigid_body.shape,
         rigid_body.half_extent,
         rigid_body.orientation,
-        cr,
+        inv,
     );
 
     let pos = rigid_body.position;
     let vel = rigid_body.velocity;
+    let center_y = container.floor_y + container.height / 2.0;
 
-    // Transform center to container-local space
+    // Transform center to container-local centered space (subtract center_y, apply R^T)
+    let cy = [pos[0], pos[1] - center_y, pos[2]];
     let mut lp = [
-        cr[0][0]*pos[0] + cr[0][1]*pos[1] + cr[0][2]*pos[2],
-        cr[1][0]*pos[0] + cr[1][1]*pos[1] + cr[1][2]*pos[2],
-        cr[2][0]*pos[0] + cr[2][1]*pos[1] + cr[2][2]*pos[2],
+        inv[0][0]*cy[0] + inv[0][1]*cy[1] + inv[0][2]*cy[2],
+        inv[1][0]*cy[0] + inv[1][1]*cy[1] + inv[1][2]*cy[2],
+        inv[2][0]*cy[0] + inv[2][1]*cy[1] + inv[2][2]*cy[2],
     ];
     let mut lv = [
-        cr[0][0]*vel[0] + cr[0][1]*vel[1] + cr[0][2]*vel[2],
-        cr[1][0]*vel[0] + cr[1][1]*vel[1] + cr[1][2]*vel[2],
-        cr[2][0]*vel[0] + cr[2][1]*vel[1] + cr[2][2]*vel[2],
+        inv[0][0]*vel[0] + inv[0][1]*vel[1] + inv[0][2]*vel[2],
+        inv[1][0]*vel[0] + inv[1][1]*vel[1] + inv[1][2]*vel[2],
+        inv[2][0]*vel[0] + inv[2][1]*vel[1] + inv[2][2]*vel[2],
     ];
 
     let hw = container.half_width();
     let hd = container.half_depth();
-    let floor_y = container.floor_y;
-    let ceil_y = container.ceiling_y();
+    let hh = container.height / 2.0;
 
-    // Clamp per-axis using the rotated AABB extents
-    if lp[0] - aabb[0] < -hw      { lp[0] = -hw + aabb[0];      if bounce_velocity { lv[0] =  lv[0].abs() * 0.3; } }
-    if lp[0] + aabb[0] >  hw      { lp[0] =  hw - aabb[0];      if bounce_velocity { lv[0] = -lv[0].abs() * 0.3; } }
-    if lp[1] - aabb[1] < floor_y  { lp[1] = floor_y + aabb[1];  if bounce_velocity { lv[1] =  lv[1].abs() * 0.3; } }
-    if lp[1] + aabb[1] > ceil_y   { lp[1] = ceil_y - aabb[1];   if bounce_velocity { lv[1] = -lv[1].abs() * 0.3; } }
-    if lp[2] - aabb[2] < -hd      { lp[2] = -hd + aabb[2];      if bounce_velocity { lv[2] =  lv[2].abs() * 0.3; } }
-    if lp[2] + aabb[2] >  hd      { lp[2] =  hd - aabb[2];      if bounce_velocity { lv[2] = -lv[2].abs() * 0.3; } }
+    // Clamp per-axis using the rotated AABB extents (symmetric half-extent bounds)
+    if lp[0] - aabb[0] < -hw { lp[0] = -hw + aabb[0]; if bounce_velocity { lv[0] =  lv[0].abs() * 0.3; } }
+    if lp[0] + aabb[0] >  hw { lp[0] =  hw - aabb[0]; if bounce_velocity { lv[0] = -lv[0].abs() * 0.3; } }
+    if lp[1] - aabb[1] < -hh { lp[1] = -hh + aabb[1]; if bounce_velocity { lv[1] =  lv[1].abs() * 0.3; } }
+    if lp[1] + aabb[1] >  hh { lp[1] =  hh - aabb[1]; if bounce_velocity { lv[1] = -lv[1].abs() * 0.3; } }
+    if lp[2] - aabb[2] < -hd { lp[2] = -hd + aabb[2]; if bounce_velocity { lv[2] =  lv[2].abs() * 0.3; } }
+    if lp[2] + aabb[2] >  hd { lp[2] =  hd - aabb[2]; if bounce_velocity { lv[2] = -lv[2].abs() * 0.3; } }
 
-    // Transform back to world space (multiply by C^T)
+    // Transform back to world space (apply R, add center_y)
     rigid_body.position = [
-        cr[0][0]*lp[0] + cr[1][0]*lp[1] + cr[2][0]*lp[2],
-        cr[0][1]*lp[0] + cr[1][1]*lp[1] + cr[2][1]*lp[2],
-        cr[0][2]*lp[0] + cr[1][2]*lp[1] + cr[2][2]*lp[2],
+        fwd[0][0]*lp[0] + fwd[0][1]*lp[1] + fwd[0][2]*lp[2],
+        fwd[1][0]*lp[0] + fwd[1][1]*lp[1] + fwd[1][2]*lp[2] + center_y,
+        fwd[2][0]*lp[0] + fwd[2][1]*lp[1] + fwd[2][2]*lp[2],
     ];
     if bounce_velocity {
         rigid_body.velocity = [
-            cr[0][0]*lv[0] + cr[1][0]*lv[1] + cr[2][0]*lv[2],
-            cr[0][1]*lv[0] + cr[1][1]*lv[1] + cr[2][1]*lv[2],
-            cr[0][2]*lv[0] + cr[1][2]*lv[1] + cr[2][2]*lv[2],
+            fwd[0][0]*lv[0] + fwd[0][1]*lv[1] + fwd[0][2]*lv[2],
+            fwd[1][0]*lv[0] + fwd[1][1]*lv[1] + fwd[1][2]*lv[2],
+            fwd[2][0]*lv[0] + fwd[2][1]*lv[1] + fwd[2][2]*lv[2],
         ];
     }
 }
