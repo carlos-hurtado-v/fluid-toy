@@ -114,8 +114,7 @@ impl App {
     }
 
     fn simulation_substep_dt(&self) -> f32 {
-        // Keep existing project semantics: delta_time is per-substep.
-        self.state.simulation.delta_time
+        self.state.simulation.substep_dt()
     }
 
     fn create_initial_particles(&self) -> Vec<crate::simulation::SphParticle3D> {
@@ -273,7 +272,7 @@ impl App {
             drag: self.state.spray.drag,
             speed_multiplier: self.state.spray.speed_multiplier,
             velocity_jitter: self.state.spray.velocity_jitter,
-            dt: self.state.simulation.delta_time,
+            dt: self.state.simulation.substep_dt(),
             max_particles: self.state.spray.max_particles,
             num_sph_particles: self.state.runtime.particle_count,
             frame_count: 0,
@@ -529,7 +528,7 @@ impl App {
                     drag: self.state.spray.drag,
                     speed_multiplier: self.state.spray.speed_multiplier,
                     velocity_jitter: self.state.spray.velocity_jitter,
-                    dt: self.state.simulation.delta_time,
+                    dt: self.state.simulation.substep_dt(),
                     max_particles: self.state.spray.max_particles,
                     num_sph_particles: self.state.runtime.particle_count,
                     frame_count: 0,
@@ -1013,8 +1012,9 @@ impl App {
                 label: Some("Main Encoder"),
             });
 
-        // Smoothly interpolate container tilt toward target each frame
-        self.state.container.update_tilt(self.state.simulation.delta_time);
+        // Smoothly interpolate container tilt toward target each frame (total frame time)
+        let frame_dt = self.state.simulation.substep_dt() * self.state.simulation.substeps as f32;
+        self.state.container.update_tilt(frame_dt);
 
         // Run SPH simulation if not paused (multiple sub-steps for stability)
         // Note: Grid simulation manages its own command encoding/submission
@@ -1047,7 +1047,7 @@ impl App {
                         drag: self.state.spray.drag,
                         speed_multiplier: self.state.spray.speed_multiplier,
                         velocity_jitter: self.state.spray.velocity_jitter,
-                        dt: self.state.simulation.delta_time * num_substeps as f32,
+                        dt: self.state.simulation.substep_dt() * num_substeps as f32,
                         max_particles: self.state.spray.max_particles,
                         num_sph_particles: self.state.runtime.particle_count,
                         frame_count: self.state.runtime.frame_count,

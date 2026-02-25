@@ -89,6 +89,7 @@ pub struct SphSimulation3DGrid {
     pcisph_finalize_pipeline: wgpu::ComputePipeline,
     _sorted_predicted_a_buffer: wgpu::Buffer,
     _sorted_predicted_b_buffer: wgpu::Buffer,
+    _pressure_buffer: wgpu::Buffer,
     pcisph_predict_bind_group: wgpu::BindGroup,
     pcisph_solve_bind_group_a: wgpu::BindGroup, // read A, write B
     pcisph_solve_bind_group_b: wgpu::BindGroup, // read B, write A
@@ -1032,6 +1033,14 @@ impl SphSimulation3DGrid {
 
         // === PCISPH Buffers and Pipelines ===
 
+        // Per-particle pressure buffer for warm-starting (persists across frames)
+        let pressure_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Pressure Buffer"),
+            size: (max_particles as u64) * 4, // f32 per particle
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // PredictedState: 32 bytes per particle (8 x f32)
         let predicted_buf_size = (max_particles as u64) * 32;
         let sorted_predicted_a_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1059,6 +1068,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
         let pcisph_predict_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1081,6 +1091,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: sorted_predicted_a_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: particle_cell_indices_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: pressure_buffer.as_entire_binding() },
             ],
         });
 
@@ -1157,6 +1168,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
         let pcisph_finalize_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1180,6 +1192,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: sorted_predicted_a_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: particle_cell_indices_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: pressure_buffer.as_entire_binding() },
             ],
         });
         // Finalize bind group B: read from sorted_predicted_b
@@ -1191,6 +1204,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: sorted_predicted_b_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: particle_cell_indices_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: pressure_buffer.as_entire_binding() },
             ],
         });
 
@@ -1234,6 +1248,7 @@ impl SphSimulation3DGrid {
             pcisph_finalize_pipeline,
             _sorted_predicted_a_buffer: sorted_predicted_a_buffer,
             _sorted_predicted_b_buffer: sorted_predicted_b_buffer,
+            _pressure_buffer: pressure_buffer,
             pcisph_predict_bind_group,
             pcisph_solve_bind_group_a,
             pcisph_solve_bind_group_b,

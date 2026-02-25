@@ -34,14 +34,14 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         .text("Bounce")
                 );
                 ui.add(
-                    egui::Slider::new(&mut state.simulation.delta_time, 0.001..=0.05)
-                        .text("Time Step")
+                    egui::Slider::new(&mut state.simulation.simulation_speed, 0.25..=2.0)
+                        .text("Sim Speed")
                 );
 
                 let mut substeps = state.simulation.substeps as i32;
                 ui.add(
                     egui::Slider::new(&mut substeps, 1..=8)
-                        .text("Substeps")
+                        .text("Substeps (quality)")
                 );
                 state.simulation.substeps = substeps as u32;
 

@@ -174,6 +174,18 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let density_error = max(0.0, pred_density - params.rest_density);
     let new_pressure = old_pressure + params.pcisph_delta * density_error;
 
+    // CFL condition for frozen-grid PCISPH: predicted displacement must stay within
+    // the kernel radius so the current-position neighbor grid remains accurate.
+    // Without this, external perturbations (container resize/tilt, mouse forces)
+    // create pressure that references stale neighbors, causing explosive feedback.
+    // Factor 0.25 is the standard CFL number for explicit SPH schemes.
+    let max_accel = 0.25 * params.kernel_radius / (params.dt * params.dt);
+    let accel_mag_sq = dot(a_pressure, a_pressure);
+    let max_accel_sq = max_accel * max_accel;
+    if (accel_mag_sq > max_accel_sq) {
+        a_pressure = a_pressure * (max_accel / sqrt(accel_mag_sq));
+    }
+
     // Recompute predicted state from scratch using original velocity + total acceleration
     let original_vel = particles[i].velocity;
     let original_pos = particles[i].position;

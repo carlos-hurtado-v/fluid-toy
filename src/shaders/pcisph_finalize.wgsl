@@ -45,6 +45,7 @@ struct PredictedState {
 @group(0) @binding(1) var<storage, read_write> particles: array<SphParticle3D>;
 @group(0) @binding(2) var<storage, read> sorted_predicted: array<PredictedState>;
 @group(0) @binding(3) var<storage, read> sorted_index: array<u32>;
+@group(0) @binding(4) var<storage, read_write> pressure_out: array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -69,4 +70,5 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Write corrected velocity (includes both non-pressure and pressure acceleration)
     particles[i].velocity = corrected_vel;
+
 }

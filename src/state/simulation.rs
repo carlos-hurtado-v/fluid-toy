@@ -3,8 +3,8 @@
 /// Simulation parameters - physics configuration
 #[derive(Debug, Clone)]
 pub struct SimulationConfig {
-    /// Time step per frame (seconds)
-    pub delta_time: f32,
+    /// Simulation speed multiplier (1.0 = real-time at 60fps)
+    pub simulation_speed: f32,
     /// Gravity acceleration magnitude
     pub gravity: f32,
     /// Energy retained on bounce (0 = no bounce, 1 = perfect elastic)
@@ -15,7 +15,7 @@ pub struct SimulationConfig {
     pub max_particles: u32,
     /// Initial particle cube dimension (N×N×N particles on reset)
     pub initial_cube_size: u32,
-    /// Number of simulation substeps per frame (each runs at full dt)
+    /// Number of simulation substeps per frame (more = smaller dt = better accuracy)
     pub substeps: u32,
     /// Number of PCISPH pressure solver iterations per substep
     pub pcisph_iterations: u32,
@@ -24,19 +24,26 @@ pub struct SimulationConfig {
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            delta_time: 0.0070,
+            simulation_speed: 1.0,
             gravity: 9.8,
             damping: 0.55,        // Energy retained on wall bounce
             paused: false,
             max_particles: 100_000,
             initial_cube_size: 25, // 25×25×25 = 15,625 particles
-            substeps: 2,
+            substeps: 4,
             pcisph_iterations: 5,
         }
     }
 }
 
 impl SimulationConfig {
+    /// Compute the per-substep dt from speed and substep count.
+    /// At speed=1.0 and 60fps, total simulated time per frame = 1/60 second.
+    pub fn substep_dt(&self) -> f32 {
+        const TARGET_FRAME_TIME: f32 = 1.0 / 60.0;
+        self.simulation_speed * TARGET_FRAME_TIME / self.substeps as f32
+    }
+
     /// Gravity always points down - container rotates, not gravity
     pub fn gravity_vector(&self) -> [f32; 3] {
         [0.0, -self.gravity, 0.0]
@@ -464,6 +471,5 @@ fn compute_pcisph_delta(h: f32, mass: f32, rest_density: f32, dt: f32) -> f32 {
     } else {
         0.0
     };
-    log::debug!("PCISPH delta={delta:.6} (omega={omega}, h={h}, m={mass}, rho0={rest_density}, dt={dt}, sum_grad_sq={sum_grad_sq:.2})");
     delta
 }
