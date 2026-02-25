@@ -33,6 +33,7 @@ pub struct App {
     rigid_body_depth_view: Option<wgpu::TextureView>,  // Fallback depth for modes without shared depth
     spray_system: Option<SpraySystem>,
     spray_renderer: Option<SprayRenderer>,
+    spray_prev_enabled: bool,
     post_process_renderer: Option<PostProcessRenderer>,
     gtao_renderer: Option<GtaoRenderer>,
     prev_camera_params: Option<crate::render::GpuCameraParams>,
@@ -82,6 +83,7 @@ impl App {
             rigid_body_depth_view: None,
             spray_system: None,
             spray_renderer: None,
+            spray_prev_enabled: true, // default: enabled
             post_process_renderer: None,
             gtao_renderer: None,
             prev_camera_params: None,
@@ -517,9 +519,45 @@ impl App {
                 gpu.config.height,
             ));
 
-            // Reset spray particles
-            if let Some(spray_sys) = &self.spray_system {
-                spray_sys.reset(&gpu.queue);
+            // Recreate spray system with new simulation's buffers
+            if let Some(sph_sim) = &self.sph_simulation {
+                let spray_params = GpuSprayParams {
+                    emission_threshold: self.state.spray.emission_threshold,
+                    spray_count: self.state.spray.spray_count,
+                    lifetime: self.state.spray.lifetime,
+                    lifetime_variation: self.state.spray.lifetime_variation,
+                    drag: self.state.spray.drag,
+                    speed_multiplier: self.state.spray.speed_multiplier,
+                    velocity_jitter: self.state.spray.velocity_jitter,
+                    dt: self.state.simulation.delta_time,
+                    max_particles: self.state.spray.max_particles,
+                    num_sph_particles: self.state.runtime.particle_count,
+                    frame_count: 0,
+                    gravity_y: -self.state.simulation.gravity,
+                };
+                let spray_system = SpraySystem::new(
+                    &gpu.device,
+                    sph_sim.particle_buffer(),
+                    &sph_sim.sph_params_buffer(),
+                    &sph_sim.container_geom_buffer(),
+                    self.state.spray.max_particles,
+                    &spray_params,
+                );
+                let spray_render_params = GpuSprayRenderParams {
+                    particle_size: self.state.spray.particle_size,
+                    max_particles: self.state.spray.max_particles,
+                    _pad: [0.0; 2],
+                };
+                let camera_params = self.camera.to_gpu_params();
+                self.spray_renderer = Some(SprayRenderer::new(
+                    &gpu.device,
+                    gpu.config.format,
+                    &camera_params,
+                    spray_system.spray_buffer(),
+                    &spray_render_params,
+                    self.state.quality.msaa.as_u32(),
+                ));
+                self.spray_system = Some(spray_system);
             }
             self.state.runtime.frame_count = 0;
         }
@@ -996,6 +1034,10 @@ impl App {
             // Run spray system after SPH completes
             if self.state.spray.enabled {
                 if let Some(spray_sys) = &self.spray_system {
+                    // Reset spray on re-enable to clear stale frozen particles
+                    if !self.spray_prev_enabled {
+                        spray_sys.reset(&gpu.queue);
+                    }
                     self.state.runtime.frame_count = self.state.runtime.frame_count.wrapping_add(1);
                     let spray_params = GpuSprayParams {
                         emission_threshold: self.state.spray.emission_threshold,
@@ -1016,6 +1058,7 @@ impl App {
                 }
             }
         }
+        self.spray_prev_enabled = self.state.spray.enabled;
 
         // Integrate rigid body on CPU
         if self.state.rigid_body.enabled && !self.state.rigid_body.held && !self.state.simulation.paused {
