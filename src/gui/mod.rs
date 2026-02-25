@@ -83,13 +83,25 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 if state.container.style == ContainerStyle::OpaquePool {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.label("Wall Color:");
-                        egui::color_picker::color_edit_button_rgb(ui, &mut state.container.wall_color);
+                        ui.label("Tile Color:");
+                        egui::color_picker::color_edit_button_rgb(ui, &mut state.container.tile_color);
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Floor Color:");
-                        egui::color_picker::color_edit_button_rgb(ui, &mut state.container.floor_color);
+                        ui.label("Grout Color:");
+                        egui::color_picker::color_edit_button_rgb(ui, &mut state.container.grout_color);
                     });
+                    ui.add(
+                        egui::Slider::new(&mut state.container.tile_scale, 5.0..=50.0)
+                            .text("Tile Scale")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.container.grout_width, 0.01..=0.10)
+                            .text("Grout Width")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.container.specular_strength, 0.0..=1.0)
+                            .text("Specular")
+                    );
                 }
 
                 ui.add_space(4.0);

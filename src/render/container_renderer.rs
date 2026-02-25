@@ -3,7 +3,7 @@
 use wgpu::util::DeviceExt;
 
 use crate::render::camera::GpuCameraParams;
-use crate::state::{ContainerConfig, GpuContainerRenderParams};
+use crate::state::{ContainerConfig, GpuContainerRenderParams, GpuShCoefficients};
 
 /// Vertex layout matching the WGSL VertexInput (32 bytes)
 #[repr(C)]
@@ -22,6 +22,7 @@ pub struct ContainerRenderer {
     bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
+    sh_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
@@ -42,6 +43,7 @@ impl ContainerRenderer {
         config: &ContainerConfig,
         msaa_sample_count: u32,
         kernel_radius: f32,
+        sh_coefficients: &GpuShCoefficients,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Container Shader"),
@@ -57,6 +59,12 @@ impl ContainerRenderer {
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Container Params Buffer"),
             contents: bytemuck::bytes_of(render_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let sh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Container SH Buffer"),
+            contents: bytemuck::bytes_of(sh_coefficients),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -83,6 +91,16 @@ impl ContainerRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -97,6 +115,10 @@ impl ContainerRenderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: sh_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -251,6 +273,7 @@ impl ContainerRenderer {
             bind_group,
             camera_buffer,
             params_buffer,
+            sh_buffer,
             vertex_buffer,
             index_buffer,
             index_count,
@@ -268,6 +291,10 @@ impl ContainerRenderer {
 
     pub fn update_params(&self, queue: &wgpu::Queue, params: &GpuContainerRenderParams) {
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn update_sh_coefficients(&self, queue: &wgpu::Queue, coeffs: &GpuShCoefficients) {
+        queue.write_buffer(&self.sh_buffer, 0, bytemuck::bytes_of(coeffs));
     }
 
     /// Rebuild mesh if container dimensions or kernel radius changed
@@ -354,98 +381,98 @@ fn generate_container_mesh(config: &ContainerConfig, _kernel_radius: f32) -> (Ve
     let mut vertices = Vec::with_capacity(80);
     let mut indices = Vec::with_capacity(120);
 
-    // Helper to push a quad (2 triangles) with given normal and face_id
-    let mut push_quad = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3], face_id: f32| {
+    // Helper to push a quad (2 triangles) with given normal, face_id, and is_inner flag
+    let mut push_quad = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3], face_id: f32, is_inner: f32| {
         let base = vertices.len() as u32;
         for &pos in &[p0, p1, p2, p3] {
             vertices.push(ContainerVertex {
                 position: pos,
                 normal,
                 face_id,
-                _pad: 0.0,
+                _pad: is_inner,
             });
         }
         // CCW winding: 0-1-2, 0-2-3
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     };
 
-    // === Inner faces (facing into cavity) ===
+    // === Inner faces (facing into cavity) — is_inner = 1.0 ===
 
     // Inner floor (normal up)
     push_quad(
         [-hw, y0, -hd], [ hw, y0, -hd], [ hw, y0,  hd], [-hw, y0,  hd],
-        [0.0, 1.0, 0.0], 0.0,
+        [0.0, 1.0, 0.0], 0.0, 1.0,
     );
     // Inner front wall (Z = -hd, normal +Z)
     push_quad(
         [-hw, y0, -hd], [ hw, y0, -hd], [ hw, y1, -hd], [-hw, y1, -hd],
-        [0.0, 0.0, 1.0], 1.0,
+        [0.0, 0.0, 1.0], 1.0, 1.0,
     );
     // Inner back wall (Z = +hd, normal -Z)
     push_quad(
         [ hw, y0, hd], [-hw, y0, hd], [-hw, y1, hd], [ hw, y1, hd],
-        [0.0, 0.0, -1.0], 1.0,
+        [0.0, 0.0, -1.0], 1.0, 1.0,
     );
     // Inner left wall (X = -hw, normal +X)
     push_quad(
         [-hw, y0,  hd], [-hw, y0, -hd], [-hw, y1, -hd], [-hw, y1,  hd],
-        [1.0, 0.0, 0.0], 1.0,
+        [1.0, 0.0, 0.0], 1.0, 1.0,
     );
     // Inner right wall (X = +hw, normal -X)
     push_quad(
         [ hw, y0, -hd], [ hw, y0,  hd], [ hw, y1,  hd], [ hw, y1, -hd],
-        [-1.0, 0.0, 0.0], 1.0,
+        [-1.0, 0.0, 0.0], 1.0, 1.0,
     );
 
-    // === Outer faces (facing outward) ===
+    // === Outer faces (facing outward) — is_inner = 0.0 ===
 
     // Outer bottom (normal down)
     push_quad(
         [-ohw, oy0,  ohd], [ ohw, oy0,  ohd], [ ohw, oy0, -ohd], [-ohw, oy0, -ohd],
-        [0.0, -1.0, 0.0], 0.0,
+        [0.0, -1.0, 0.0], 0.0, 0.0,
     );
     // Outer front wall (Z = -ohd, normal -Z)
     push_quad(
         [ ohw, oy0, -ohd], [-ohw, oy0, -ohd], [-ohw, y1, -ohd], [ ohw, y1, -ohd],
-        [0.0, 0.0, -1.0], 1.0,
+        [0.0, 0.0, -1.0], 1.0, 0.0,
     );
     // Outer back wall (Z = +ohd, normal +Z)
     push_quad(
         [-ohw, oy0, ohd], [ ohw, oy0, ohd], [ ohw, y1, ohd], [-ohw, y1, ohd],
-        [0.0, 0.0, 1.0], 1.0,
+        [0.0, 0.0, 1.0], 1.0, 0.0,
     );
     // Outer left wall (X = -ohw, normal -X)
     push_quad(
         [-ohw, oy0, -ohd], [-ohw, oy0,  ohd], [-ohw, y1,  ohd], [-ohw, y1, -ohd],
-        [-1.0, 0.0, 0.0], 1.0,
+        [-1.0, 0.0, 0.0], 1.0, 0.0,
     );
     // Outer right wall (X = +ohw, normal +X)
     push_quad(
         [ ohw, oy0,  ohd], [ ohw, oy0, -ohd], [ ohw, y1, -ohd], [ ohw, y1,  ohd],
-        [1.0, 0.0, 0.0], 1.0,
+        [1.0, 0.0, 0.0], 1.0, 0.0,
     );
 
-    // === Top rim (connects inner wall top edge to outer wall top edge, normal up) ===
+    // === Top rim (connects inner wall top edge to outer wall top edge, normal up) — is_inner = 0.0 ===
 
     // Front rim
     push_quad(
         [-ohw, y1, -ohd], [ ohw, y1, -ohd], [ hw, y1, -hd], [-hw, y1, -hd],
-        [0.0, 1.0, 0.0], 1.0,
+        [0.0, 1.0, 0.0], 1.0, 0.0,
     );
     // Back rim
     push_quad(
         [ ohw, y1, ohd], [-ohw, y1, ohd], [-hw, y1, hd], [ hw, y1, hd],
-        [0.0, 1.0, 0.0], 1.0,
+        [0.0, 1.0, 0.0], 1.0, 0.0,
     );
     // Left rim
     push_quad(
         [-ohw, y1,  ohd], [-ohw, y1, -ohd], [-hw, y1, -hd], [-hw, y1,  hd],
-        [0.0, 1.0, 0.0], 1.0,
+        [0.0, 1.0, 0.0], 1.0, 0.0,
     );
     // Right rim
     push_quad(
         [ ohw, y1, -ohd], [ ohw, y1,  ohd], [ hw, y1,  hd], [ hw, y1, -hd],
-        [0.0, 1.0, 0.0], 1.0,
+        [0.0, 1.0, 0.0], 1.0, 0.0,
     );
 
     (vertices, indices)

@@ -232,6 +232,7 @@ impl App {
         let container_render_params = self.state.container.to_gpu_render_params(
             self.state.lighting.sun_direction_normalized(),
         );
+        let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
         let container_renderer = ContainerRenderer::new(
             &gpu.device,
             gpu.config.format,
@@ -240,6 +241,7 @@ impl App {
             &self.state.container,
             self.state.quality.msaa.as_u32(),
             self.state.sph.kernel_radius,
+            &gpu_sh,
         );
 
         // Create rigid body renderer + fallback depth texture
@@ -443,7 +445,6 @@ impl App {
         );
 
         // Upload SH coefficients to MC renderer before moving locals
-        let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
         mc_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
 
         self.gpu = Some(gpu);
@@ -715,6 +716,12 @@ impl App {
             mc_renderer.rebuild_env_bind_groups(&gpu.device, &env_view, &env_sampler);
             let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
             mc_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
+        }
+
+        // Update container renderer SH coefficients
+        if let Some(container_r) = &self.container_renderer {
+            let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
+            container_r.update_sh_coefficients(&gpu.queue, &gpu_sh);
         }
 
         self.sh_coefficients = Some(sh_coefficients);

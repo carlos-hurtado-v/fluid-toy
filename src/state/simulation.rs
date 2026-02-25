@@ -85,10 +85,16 @@ pub struct ContainerConfig {
     pub tilt_z_target: f32,
     /// Visual rendering style
     pub style: ContainerStyle,
-    /// Wall color (RGB, linear)
-    pub wall_color: [f32; 3],
-    /// Floor color (RGB, linear)
-    pub floor_color: [f32; 3],
+    /// Tile color (RGB, linear) — pool blue ceramic
+    pub tile_color: [f32; 3],
+    /// Grout color (RGB, linear) — dark grout lines
+    pub grout_color: [f32; 3],
+    /// Tile grid scale (tiles per world unit)
+    pub tile_scale: f32,
+    /// Grout line width (fraction of tile, 0.01–0.10)
+    pub grout_width: f32,
+    /// Specular highlight strength
+    pub specular_strength: f32,
 }
 
 impl Default for ContainerConfig {
@@ -103,8 +109,11 @@ impl Default for ContainerConfig {
             tilt_x_target: 0.0,
             tilt_z_target: 0.0,
             style: ContainerStyle::default(),
-            wall_color: [0.75, 0.78, 0.82],
-            floor_color: [0.6, 0.63, 0.67],
+            tile_color: [0.15, 0.35, 0.55],
+            grout_color: [0.08, 0.10, 0.14],
+            tile_scale: 20.0,
+            grout_width: 0.04,
+            specular_strength: 0.5,
         }
     }
 }
@@ -203,15 +212,19 @@ impl ContainerConfig {
         let rotation_row2 = [sin_z * sin_x, -cos_z * sin_x, cos_x, 0.0];
 
         GpuContainerRenderParams {
-            wall_color: self.wall_color,
-            roughness: 0.85,
-            floor_color: self.floor_color,
-            specular_strength: 0.15,
+            tile_color: self.tile_color,
+            tile_scale: self.tile_scale,
+            grout_color: self.grout_color,
+            specular_strength: self.specular_strength,
             light_dir,
-            _pad0: 0.0,
+            grout_width: self.grout_width,
             rotation_row0,
             rotation_row1,
             rotation_row2,
+            ibl_strength: 0.6,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
         }
     }
 
@@ -251,19 +264,23 @@ impl ContainerConfig {
     }
 }
 
-/// GPU-compatible container render parameters for opaque pool rendering
+/// GPU-compatible container render parameters for opaque pool rendering (112 bytes)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuContainerRenderParams {
-    pub wall_color: [f32; 3],
-    pub roughness: f32,
-    pub floor_color: [f32; 3],
+    pub tile_color: [f32; 3],
+    pub tile_scale: f32,
+    pub grout_color: [f32; 3],
     pub specular_strength: f32,
     pub light_dir: [f32; 3],
-    pub _pad0: f32,
+    pub grout_width: f32,
     pub rotation_row0: [f32; 4],
     pub rotation_row1: [f32; 4],
     pub rotation_row2: [f32; 4],
+    pub ibl_strength: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
 }
 
 /// SPH physics configuration
