@@ -107,7 +107,8 @@ pub struct GpuContainerClipParams {
     pub sin_z: f32,
     pub cos_z: f32,
     pub clip_enabled: u32,
-    pub _pad: [u32; 3],
+    pub clip_margin: f32,  // MC cell_size: allows boundary vertices slightly outside container
+    pub _pad: [u32; 2],
 }
 
 impl Default for GpuContainerClipParams {
@@ -122,7 +123,8 @@ impl Default for GpuContainerClipParams {
             sin_z: 0.0,
             cos_z: 1.0,
             clip_enabled: 0,
-            _pad: [0; 3],
+            clip_margin: 0.0,
+            _pad: [0; 2],
         }
     }
 }
@@ -386,7 +388,10 @@ impl MarchingCubesRenderer {
         // Grid bounds (matching simulation domain)
         let grid_min = [-1.0f32, -1.0, -1.0];
         let grid_max = [1.0f32, 1.0, 1.0];
-        let cell_size = (grid_max[0] - grid_min[0]) / GRID_SIZE as f32;
+        let extent_x = grid_max[0] - grid_min[0];
+        let extent_y = grid_max[1] - grid_min[1];
+        let extent_z = grid_max[2] - grid_min[2];
+        let cell_size = extent_x.max(extent_y).max(extent_z) / GRID_SIZE as f32;
 
         // Create 3D density texture
         let density_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -1863,7 +1868,10 @@ impl MarchingCubesRenderer {
     }
 
     pub fn update_params(&self, queue: &wgpu::Queue, kernel_radius: f32, iso_value: f32, num_particles: u32, blur_radius: u32) {
-        let cell_size = (self.grid_max[0] - self.grid_min[0]) / GRID_SIZE as f32;
+        let extent_x = self.grid_max[0] - self.grid_min[0];
+        let extent_y = self.grid_max[1] - self.grid_min[1];
+        let extent_z = self.grid_max[2] - self.grid_min[2];
+        let cell_size = extent_x.max(extent_y).max(extent_z) / GRID_SIZE as f32;
         let params = GpuGridParams {
             grid_min: self.grid_min,
             grid_size: GRID_SIZE,

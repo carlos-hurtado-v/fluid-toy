@@ -32,11 +32,11 @@ impl GpuContainerParams {
         let (sin_x, cos_x) = config.tilt_x.sin_cos();
         let (sin_z, cos_z) = config.tilt_z.sin_cos();
 
-        // This is the INVERSE rotation (transpose) - transforms container-local to world space
-        // We want to rotate the wireframe corners FROM local TO world
-        let rotation_row0 = [cos_z, sin_z, 0.0, 0.0];
-        let rotation_row1 = [-sin_z * cos_x, cos_z * cos_x, sin_x, 0.0];
-        let rotation_row2 = [sin_z * sin_x, -cos_z * sin_x, cos_x, 0.0];
+        // Forward rotation R = Rz * Rx: transforms local → world.
+        // Shader does M*v with these as rows, giving R*local = world.
+        let rotation_row0 = [cos_z, -sin_z * cos_x, sin_z * sin_x, 0.0];
+        let rotation_row1 = [sin_z, cos_z * cos_x, -cos_z * sin_x, 0.0];
+        let rotation_row2 = [0.0, sin_x, cos_x, 0.0];
 
         Self {
             min_x: -config.half_width(),

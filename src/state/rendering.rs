@@ -200,10 +200,9 @@ impl RenderConfig {
     /// Calculate the visual margin for boundary compensation
     /// Screen-space rendering expands particles significantly (4.5x), particles mode does not
     pub fn visual_margin(&self) -> f32 {
-        match self.render_mode {
-            FluidRenderMode::MarchingCubes => self.particle_radius,
-            FluidRenderMode::Particles => self.particle_radius,
-        }
+        // No margin — hard backstop clamps at the visual wall.
+        // MC clips the mesh to the container. Particle billboards may overflow slightly.
+        0.0
     }
 
     /// Convert to GPU-compatible uniform struct

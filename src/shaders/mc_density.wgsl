@@ -35,7 +35,7 @@ struct ContainerClipParams {
     sin_z: f32,
     cos_z: f32,
     clip_enabled: u32,
-    _pad0: u32,
+    clip_margin: f32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -191,6 +191,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 }
             }
         }
+    }
+
+    // Mark voxels outside the container with a sentinel (-1).
+    // The blur shader skips sentinels, preventing density bleed across walls.
+    let local = world_to_local(world_pos);
+    if (clip.clip_enabled != 0u &&
+        (local.x < -clip.half_width || local.x > clip.half_width ||
+         local.y < -clip.half_height || local.y > clip.half_height ||
+         local.z < -clip.half_depth || local.z > clip.half_depth)) {
+        textureStore(density_field, vec3<i32>(global_id), vec4<f32>(-1.0, 0.0, 0.0, 0.0));
+        return;
     }
 
     // Boundary gamma correction: near container walls, the kernel support

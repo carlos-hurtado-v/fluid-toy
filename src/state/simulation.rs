@@ -206,10 +206,12 @@ impl ContainerConfig {
         let (sin_x, cos_x) = self.tilt_x.sin_cos();
         let (sin_z, cos_z) = self.tilt_z.sin_cos();
 
-        // Forward rotation: local → world (same as wireframe)
-        let rotation_row0 = [cos_z, sin_z, 0.0, 0.0];
-        let rotation_row1 = [-sin_z * cos_x, cos_z * cos_x, sin_x, 0.0];
-        let rotation_row2 = [sin_z * sin_x, -cos_z * sin_x, cos_x, 0.0];
+        // Forward rotation R = Rz * Rx: transforms local → world.
+        // The shader does vec3(dot(row0,v), dot(row1,v), dot(row2,v)) = M*v,
+        // so storing R rows gives R*local = world (correct forward rotation).
+        let rotation_row0 = [cos_z, -sin_z * cos_x, sin_z * sin_x, 0.0];
+        let rotation_row1 = [sin_z, cos_z * cos_x, -cos_z * sin_x, 0.0];
+        let rotation_row2 = [0.0, sin_x, cos_x, 0.0];
 
         GpuContainerRenderParams {
             tile_color: self.tile_color,
@@ -239,12 +241,12 @@ impl ContainerConfig {
         let (sin_x, cos_x) = self.tilt_x.sin_cos();
         let (sin_z, cos_z) = self.tilt_z.sin_cos();
 
-        // Combined rotation matrix: Rz * Rx
-        // This rotates the container, so we use the transpose (inverse) to transform
-        // particle positions INTO container space
-        let rotation_row0 = [cos_z, -sin_z * cos_x, sin_z * sin_x, 0.0];
-        let rotation_row1 = [sin_z, cos_z * cos_x, -cos_z * sin_x, 0.0];
-        let rotation_row2 = [0.0, sin_x, cos_x, 0.0];
+        // Inverse rotation (R^T): transforms world positions INTO container-local space.
+        // Forward rotation R = Rz * Rx. Inverse = R^T = Rx^T * Rz^T.
+        // Must match the world_to_local transform in mc_density.wgsl.
+        let rotation_row0 = [cos_z, sin_z, 0.0, 0.0];
+        let rotation_row1 = [-sin_z * cos_x, cos_z * cos_x, sin_x, 0.0];
+        let rotation_row2 = [sin_z * sin_x, -cos_z * sin_x, cos_x, 0.0];
 
         // Shrink physics bounds by visual radius so rendered surface fits inside wireframe
         let margin = particle_visual_radius;

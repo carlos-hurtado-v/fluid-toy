@@ -71,7 +71,7 @@ struct ContainerClipParams {
     sin_z: f32,
     cos_z: f32,
     clip_enabled: u32,
-    _pad0: u32,
+    clip_margin: f32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -236,12 +236,14 @@ fn ripple_normal(world_pos: vec3<f32>, t: f32) -> vec3<f32> {
 
 @fragment
 fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
-    // Clip to container bounds when enabled
+    // Clip to container bounds with margin (MC interpolation can place vertices
+    // slightly outside the container; clip_margin ≈ 1.5× MC cell_size).
     if (clip.clip_enabled != 0u) {
         let local = world_to_container(input.world_position);
-        if (local.x < -clip.half_width || local.x > clip.half_width ||
-            local.y < -clip.half_height || local.y > clip.half_height ||
-            local.z < -clip.half_depth || local.z > clip.half_depth) {
+        let m = clip.clip_margin;
+        if (local.x < -(clip.half_width + m) || local.x > (clip.half_width + m) ||
+            local.y < -(clip.half_height + m) || local.y > (clip.half_height + m) ||
+            local.z < -(clip.half_depth + m) || local.z > (clip.half_depth + m)) {
             discard;
         }
     }

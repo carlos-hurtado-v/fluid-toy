@@ -118,20 +118,26 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var accel = vec3<f32>(0.0, 0.0, 0.0);
 
     // === SOFT WALL PENALTY FORCES ===
-    // Repulsive force within one kernel radius of each wall.
-    // Quadratic ramp: zero at boundary_layer distance, wall_stiffness at wall surface.
+    // Repulsive force + wall-normal velocity damping within the penalty zone.
+    // The damping prevents oscillation between penalty forces and PCISPH pressure correction.
     let rot_row0 = bounds.rotation_row0.xyz;
     let rot_row1 = bounds.rotation_row1.xyz;
     let rot_row2 = bounds.rotation_row2.xyz;
 
-    // Transform position to container-local space
+    // Transform position and velocity to container-local space
     let local_pos = vec3<f32>(
         dot(rot_row0, pos),
         dot(rot_row1, pos),
         dot(rot_row2, pos)
     );
+    let local_vel = vec3<f32>(
+        dot(rot_row0, vel),
+        dot(rot_row1, vel),
+        dot(rot_row2, vel)
+    );
 
-    let boundary_layer = params.kernel_radius;
+    let boundary_layer = params.kernel_radius * 0.4;
+    let wall_damping = 8.0;  // Wall-normal velocity damping coefficient
     var wall_accel = vec3<f32>(0.0, 0.0, 0.0);
 
     // X axis (symmetric: -bound_x to +bound_x)
@@ -139,11 +145,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (dist_neg_x < boundary_layer) {
         let t = 1.0 - dist_neg_x / boundary_layer;
         wall_accel.x += bounds.wall_stiffness * t * t;
+        if (local_vel.x < 0.0) { wall_accel.x -= local_vel.x * wall_damping * t; }
     }
     let dist_pos_x = bounds.bound_x - local_pos.x;
     if (dist_pos_x < boundary_layer) {
         let t = 1.0 - dist_pos_x / boundary_layer;
         wall_accel.x -= bounds.wall_stiffness * t * t;
+        if (local_vel.x > 0.0) { wall_accel.x -= local_vel.x * wall_damping * t; }
     }
 
     // Y axis (asymmetric: floor_y to ceiling_y)
@@ -151,11 +159,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (dist_floor < boundary_layer) {
         let t = 1.0 - dist_floor / boundary_layer;
         wall_accel.y += bounds.wall_stiffness * t * t;
+        if (local_vel.y < 0.0) { wall_accel.y -= local_vel.y * wall_damping * t; }
     }
     let dist_ceiling = bounds.ceiling_y - local_pos.y;
     if (dist_ceiling < boundary_layer) {
         let t = 1.0 - dist_ceiling / boundary_layer;
         wall_accel.y -= bounds.wall_stiffness * t * t;
+        if (local_vel.y > 0.0) { wall_accel.y -= local_vel.y * wall_damping * t; }
     }
 
     // Z axis (symmetric: -bound_z to +bound_z)
@@ -163,11 +173,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (dist_neg_z < boundary_layer) {
         let t = 1.0 - dist_neg_z / boundary_layer;
         wall_accel.z += bounds.wall_stiffness * t * t;
+        if (local_vel.z < 0.0) { wall_accel.z -= local_vel.z * wall_damping * t; }
     }
     let dist_pos_z = bounds.bound_z - local_pos.z;
     if (dist_pos_z < boundary_layer) {
         let t = 1.0 - dist_pos_z / boundary_layer;
         wall_accel.z -= bounds.wall_stiffness * t * t;
+        if (local_vel.z > 0.0) { wall_accel.z -= local_vel.z * wall_damping * t; }
     }
 
     // Transform wall acceleration from local to world space (multiply by R^T)

@@ -1110,16 +1110,6 @@ impl App {
                 FluidRenderMode::MarchingCubes => {
                     // Marching cubes surface mesh rendering
                     if let Some(mc_renderer) = &mut self.mc_renderer {
-                        // MC grid extends beyond container by kernel margin so the density
-                        // field isn't truncated at the boundary. In pool mode, fragment-shader
-                        // clipping (GpuContainerClipParams) hides any surface outside the walls.
-                        let margin = self.state.sph.kernel_radius * 2.0;
-                        let (aabb_min, aabb_max) = self.state.container.tilted_aabb();
-                        mc_renderer.set_bounds(
-                            [aabb_min[0] - margin, aabb_min[1] - margin, aabb_min[2] - margin],
-                            [aabb_max[0] + margin, aabb_max[1] + margin, aabb_max[2] + margin],
-                        );
-
                         let camera_params = self.camera.to_gpu_params();
                         mc_renderer.update_camera(&gpu.queue, &camera_params);
                         mc_renderer.update_light_params(&gpu.queue, &self.state.lighting.to_gpu_params());
@@ -1141,13 +1131,26 @@ impl App {
                         mc_renderer.update_env_params(&gpu.queue, &env_params);
                         mc_renderer.set_ssr_enabled(&gpu.queue, self.state.rendering.ssr_enabled);
 
-                        // Update container clipping params
+                        // Update MC grid bounds to cover the full container + margin
+                        let (aabb_min, aabb_max) = self.state.container.tilted_aabb();
+                        let mc_margin = self.state.sph.kernel_radius * self.state.rendering.mc_density_radius_scale + 0.05;
+                        mc_renderer.set_bounds(
+                            [aabb_min[0] - mc_margin, aabb_min[1] - mc_margin, aabb_min[2] - mc_margin],
+                            [aabb_max[0] + mc_margin, aabb_max[1] + mc_margin, aabb_max[2] + mc_margin],
+                        );
+
+                        // Update container clipping params (after set_bounds so we can compute cell_size)
                         {
                             let c = &self.state.container;
                             let is_pool = c.style == ContainerStyle::OpaquePool;
                             let (sin_x, cos_x) = c.tilt_x.sin_cos();
                             let (sin_z, cos_z) = c.tilt_z.sin_cos();
                             let center_y = c.floor_y + c.height / 2.0;
+                            // MC cell_size: boundary vertices can overshoot by up to ~1 cell
+                            let grid_extent = (aabb_max[0] - aabb_min[0] + 2.0 * mc_margin)
+                                .max(aabb_max[1] - aabb_min[1] + 2.0 * mc_margin)
+                                .max(aabb_max[2] - aabb_min[2] + 2.0 * mc_margin);
+                            let mc_cell_size = grid_extent / 100.0; // GRID_SIZE = 100
                             let clip_params = GpuContainerClipParams {
                                 half_width: c.width / 2.0,
                                 half_depth: c.depth / 2.0,
@@ -1158,7 +1161,8 @@ impl App {
                                 sin_z,
                                 cos_z,
                                 clip_enabled: if is_pool { 1 } else { 0 },
-                                _pad: [0; 3],
+                                clip_margin: mc_cell_size * 1.5,
+                                _pad: [0; 2],
                             };
                             mc_renderer.update_container_clip_params(&gpu.queue, &clip_params);
                         }

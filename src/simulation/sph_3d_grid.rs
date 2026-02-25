@@ -116,13 +116,15 @@ impl SphSimulation3DGrid {
         let num_particles = particles.len() as u32;
         let max_particles = max_particles.max(num_particles); // Ensure at least enough for initial particles
 
-        // Calculate grid dimensions based on bounds and kernel radius
-        // Use sqrt(3) multiplier to handle tilted containers (diagonal extends further)
+        // Calculate grid dimensions based on bounds and kernel radius.
+        // Pre-allocate for the maximum possible container configuration:
+        // sliders allow up to 3.0 per axis (half-extent 1.5), full tilt (±π),
+        // and asymmetric floor_y. The diagonal of a 1.5×1.5×1.5 half-box is
+        // 1.5*sqrt(3) ≈ 2.6. With center_y offset and margin, 4.0 covers all cases.
         let cell_size = sph_params.kernel_radius;
-        // For Y extent, use max of |floor| and |ceiling| since container can be asymmetric
         let y_extent = bounds_params.floor_y.abs().max(bounds_params.ceiling_y.abs());
         let base_extent = bounds_params.bound_x.max(y_extent).max(bounds_params.bound_z);
-        let bounds_extent = base_extent * 1.8 + 0.2;  // ~sqrt(3) for worst-case tilt + margin
+        let bounds_extent = (base_extent * 1.8 + 0.2).max(4.0);
         let grid_size = ((2.0 * bounds_extent) / cell_size).ceil() as u32 + 2;
         let total_cells = grid_size * grid_size * grid_size;
 
