@@ -1173,7 +1173,10 @@ impl App {
                         mc_renderer.generate(
                             &mut encoder,
                             &gpu.device,
-                            sph_sim.particle_buffer(),
+                            sph_sim.sorted_particle_buffer(),
+                            sph_sim.cell_starts_buffer(),
+                            sph_sim.cell_counts_buffer(),
+                            sph_sim.grid_params_buffer(),
                             blur_radius,
                         );
                         // Pass rigid body renderer into MC pass for proper MSAA depth testing

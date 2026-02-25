@@ -298,7 +298,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 if state.spray.enabled {
                     ui.add_space(4.0);
                     ui.add(
-                        egui::Slider::new(&mut state.spray.emission_threshold, 1.0..=200.0)
+                        egui::Slider::new(&mut state.spray.emission_threshold, 0.01..=2.0)
                             .text("Emission Threshold")
                             .logarithmic(true)
                     );
@@ -368,7 +368,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                             .text("Density Radius Scale")
                     );
                     ui.add(
-                        egui::Slider::new(&mut state.rendering.mc_threshold, 0.5..=10.0)
+                        egui::Slider::new(&mut state.rendering.mc_threshold, 0.1..=1.5)
                             .text("Surface Threshold")
                     );
                     ui.add(

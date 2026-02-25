@@ -113,7 +113,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var pos = particles[i].position;
     var vel = particles[i].velocity;
 
-    // PCISPH already corrected velocity — force field stores total accel for spray readback.
+    // PCISPH already corrected velocity — force field stores velocity delta for spray readback.
     // Integrate only applies wall/mouse/rigid body corrections on top.
     var accel = vec3<f32>(0.0, 0.0, 0.0);
 

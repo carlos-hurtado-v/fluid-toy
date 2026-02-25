@@ -1233,7 +1233,7 @@ impl SphSimulation3DGrid {
             pcisph_solve_bind_group_b,
             pcisph_finalize_bind_group_a,
             pcisph_finalize_bind_group_b,
-            pcisph_iterations: 4,
+            pcisph_iterations: 5,
             grid_params,
             num_particles,
             max_particles,
@@ -1484,6 +1484,22 @@ impl SphSimulation3DGrid {
 
     pub fn particle_buffer(&self) -> &wgpu::Buffer {
         &self.particle_buffer
+    }
+
+    pub fn sorted_particle_buffer(&self) -> &wgpu::Buffer {
+        &self._sorted_particle_buffer
+    }
+
+    pub fn cell_starts_buffer(&self) -> &wgpu::Buffer {
+        &self.cell_starts_buffer
+    }
+
+    pub fn cell_counts_buffer(&self) -> &wgpu::Buffer {
+        &self.cell_counts_buffer
+    }
+
+    pub fn grid_params_buffer(&self) -> &wgpu::Buffer {
+        &self.grid_params_buffer
     }
 
     pub fn sph_params_buffer(&self) -> &wgpu::Buffer {

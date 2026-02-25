@@ -87,15 +87,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let p = sph_particles[idx];
-    let accel = p.force;  // force shader outputs acceleration
-    let accel_mag = length(accel);
+    let vel_delta = p.force;  // pcisph_finalize stores velocity delta (not /dt)
+    let delta_mag = length(vel_delta);
     let speed = length(p.velocity);
 
     // Surface detection: density below rest density (surface particles have ~60-90% of rest)
     let is_surface = p.density < sph_params.rest_density * 0.85;
 
-    // Require both: high acceleration AND meaningful velocity (not just static pressure)
-    if (!is_surface || accel_mag < params.emission_threshold || speed < 0.5) {
+    // Require both: large velocity correction AND meaningful velocity (not just static pressure)
+    if (!is_surface || delta_mag < params.emission_threshold || speed < 0.5) {
         return;
     }
 

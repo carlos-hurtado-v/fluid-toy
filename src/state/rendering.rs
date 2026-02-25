@@ -164,12 +164,12 @@ impl Default for RenderConfig {
             particle_color: [0.08, 0.22, 0.34],
             color_by_velocity: true,
             render_mode: FluidRenderMode::MarchingCubes,
-            mc_threshold: 3.8,
-            mc_density_radius_scale: 2.5,
-            refraction_strength: 0.12,
+            mc_threshold: 0.65,
+            mc_density_radius_scale: 2.0,
+            refraction_strength: 0.14,
             deep_water_color: [0.005, 0.03, 0.08],
-            mc_blur_radius: 3,
-            water_roughness: 0.04,
+            mc_blur_radius: 2,
+            water_roughness: 0.090,
             ssr_enabled: true,
         }
     }

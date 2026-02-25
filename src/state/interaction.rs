@@ -47,7 +47,7 @@ impl Default for SprayConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            emission_threshold: 10.0,
+            emission_threshold: 0.10,
             spray_count: 5,
             lifetime: 0.4,
             lifetime_variation: 0.4,

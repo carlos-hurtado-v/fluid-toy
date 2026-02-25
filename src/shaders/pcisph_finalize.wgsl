@@ -62,10 +62,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         final_pred.pred_vel_z,
     );
 
-    // Store total acceleration (for spray emission to read)
-    // a_total = (corrected_vel - original_vel) / dt
+    // Store velocity delta for spray emission to read.
+    // NOT divided by dt — keeps the threshold dt-independent.
     let original_vel = particles[i].velocity;
-    particles[i].force = (corrected_vel - original_vel) / params.dt;
+    particles[i].force = corrected_vel - original_vel;
 
     // Write corrected velocity (includes both non-pressure and pressure acceleration)
     particles[i].velocity = corrected_vel;

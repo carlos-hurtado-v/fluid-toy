@@ -173,6 +173,26 @@ fn create_samplable_depth_texture(device: &wgpu::Device, width: u32, height: u32
     (texture, view)
 }
 
+/// Create a normal G-buffer texture for SSR (smooth world-space normals, Rgba16Float)
+fn create_normal_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("MC Normal G-Buffer"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
 /// Create a color texture for rendering the background (for screen-space refraction)
 fn create_background_texture(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -254,7 +274,10 @@ pub struct MarchingCubesRenderer {
     // Front face depth for GTAO (single-sampled, samplable)
     front_depth_texture: wgpu::Texture,
     front_depth_view: wgpu::TextureView,
-    // Front face depth pipeline (cull back faces, depth-only, 1x)
+    // Front face normal G-buffer for SSR (smooth interpolated normals)
+    normal_texture: wgpu::Texture,
+    normal_view: wgpu::TextureView,
+    // Front face depth+normal pipeline (cull none, writes depth + normals)
     front_face_pipeline: wgpu::RenderPipeline,
 
     // Back face depth for thickness calculation
@@ -408,6 +431,9 @@ impl MarchingCubesRenderer {
 
         // Create front-face depth texture for GTAO (samplable, always single-sampled)
         let (front_depth_texture, front_depth_view) = create_samplable_depth_texture(device, width, height);
+
+        // Create normal G-buffer for SSR (smooth interpolated world normals)
+        let (normal_texture, normal_view) = create_normal_texture(device, width, height);
 
         // Create back-face depth texture for thickness calculation (samplable, always single-sampled)
         let (back_depth_texture, back_depth_view) = create_samplable_depth_texture(device, width, height);
@@ -618,7 +644,7 @@ impl MarchingCubesRenderer {
         let density_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("MC Density BGL"),
             entries: &[
-                // Particles (storage buffer, will be bound dynamically)
+                // Sorted particles (storage buffer, bound dynamically from SPH sim)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -629,7 +655,7 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
-                // Grid params
+                // MC grid params
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -651,9 +677,42 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
-                // Container clip params (for wall mirror density)
+                // Container clip params (for boundary gamma correction)
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // SPH cell_starts (storage buffer, from SPH spatial hash grid)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // SPH cell_counts (storage buffer, from SPH spatial hash grid)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // SPH grid params (uniform)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -1192,20 +1251,24 @@ impl MarchingCubesRenderer {
             cache: None,
         });
 
-        // === Front Face Pipeline (for GTAO depth prepass) ===
+        // === Front Face Pipeline (depth + normal G-buffer for GTAO + SSR) ===
         let front_face_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("MC Front Face Pipeline"),
             layout: Some(&back_face_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &back_depth_shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some("vs_normal"),
                 buffers: &[],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &back_depth_shader,
-                entry_point: Some("fs_main"),
-                targets: &[],
+                entry_point: Some("fs_normal"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -1390,6 +1453,17 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Normal G-buffer (smooth world normals from front face pass)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1452,6 +1526,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&ssr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&normal_view),
                 },
             ],
         });
@@ -1603,11 +1681,11 @@ impl MarchingCubesRenderer {
             ],
         });
 
-        // Placeholder density bind group (will be recreated with particle buffer)
+        // Placeholder density bind group (will be recreated each frame with SPH grid buffers)
         let placeholder_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Placeholder"),
             size: 64,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM,
             mapped_at_creation: false,
         });
         let density_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1630,6 +1708,18 @@ impl MarchingCubesRenderer {
                     binding: 3,
                     resource: clip_params_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: placeholder_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: placeholder_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: placeholder_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -1647,6 +1737,8 @@ impl MarchingCubesRenderer {
             background_depth_view,
             front_depth_texture,
             front_depth_view,
+            normal_texture,
+            normal_view,
             front_face_pipeline,
             back_depth_texture,
             back_depth_view,
@@ -1699,8 +1791,15 @@ impl MarchingCubesRenderer {
         }
     }
 
-    /// Create density bind group with actual particle buffer
-    pub fn create_density_bind_group(&self, device: &wgpu::Device, particle_buffer: &wgpu::Buffer) -> wgpu::BindGroup {
+    /// Create density bind group with SPH grid buffers for accelerated neighbor search
+    pub fn create_density_bind_group(
+        &self,
+        device: &wgpu::Device,
+        sorted_particle_buffer: &wgpu::Buffer,
+        cell_starts_buffer: &wgpu::Buffer,
+        cell_counts_buffer: &wgpu::Buffer,
+        sph_grid_params_buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
         let layout = self.density_pipeline.get_bind_group_layout(0);
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MC Density BG"),
@@ -1708,7 +1807,7 @@ impl MarchingCubesRenderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: particle_buffer.as_entire_binding(),
+                    resource: sorted_particle_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1721,6 +1820,18 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: self.clip_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: cell_starts_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: cell_counts_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: sph_grid_params_buffer.as_entire_binding(),
                 },
             ],
         })
@@ -1828,19 +1939,28 @@ impl MarchingCubesRenderer {
         queue.write_buffer(&self.ssr_params_buffer, 0, bytemuck::bytes_of(&params));
     }
 
-    /// Generate mesh from particles
+    /// Generate mesh from particles using SPH grid-accelerated density computation
     pub fn generate(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
-        particle_buffer: &wgpu::Buffer,
+        sorted_particle_buffer: &wgpu::Buffer,
+        cell_starts_buffer: &wgpu::Buffer,
+        cell_counts_buffer: &wgpu::Buffer,
+        sph_grid_params_buffer: &wgpu::Buffer,
         blur_radius: u32,
     ) {
         // Reset counter
         encoder.clear_buffer(&self.counter_buffer, 0, None);
 
-        // Create density bind group with particle buffer
-        let density_bind_group = self.create_density_bind_group(device, particle_buffer);
+        // Create density bind group with SPH grid buffers
+        let density_bind_group = self.create_density_bind_group(
+            device,
+            sorted_particle_buffer,
+            cell_starts_buffer,
+            cell_counts_buffer,
+            sph_grid_params_buffer,
+        );
 
         // Pass 1: Generate density field (splat particles into texture A)
         {
@@ -1936,11 +2056,19 @@ impl MarchingCubesRenderer {
         spray: Option<&SprayRenderer>,
         container: Option<&ContainerRenderer>,
     ) {
-        // Pass 0: Render front faces to front_depth_texture (for GTAO)
+        // Pass 0a: Render water front faces to depth + normal G-buffer (for GTAO + SSR)
         {
             let mut front_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("MC Front Face Pass"),
-                color_attachments: &[],
+                label: Some("MC Front Face + Normal Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.normal_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.front_depth_view,
                     depth_ops: Some(wgpu::Operations {
@@ -1955,14 +2083,29 @@ impl MarchingCubesRenderer {
             front_pass.set_pipeline(&self.front_face_pipeline);
             front_pass.set_bind_group(0, &self.back_face_bind_group, &[]);
             front_pass.draw_indirect(&self.indirect_buffer, 0);
+        }
 
-            // Also render rigid body into front depth
+        // Pass 0b: Render rigid body + container into front depth (depth-only, no color targets)
+        if rigid_body.is_some() || container.is_some() {
+            let mut depth_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MC Front Depth (RB+Container)"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.front_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
             if let Some(rb) = rigid_body {
-                rb.render_depth_only(&mut front_pass);
+                rb.render_depth_only(&mut depth_pass);
             }
-            // Render container into front depth (for GTAO)
             if let Some(ct) = container {
-                ct.render_depth_only(&mut front_pass);
+                ct.render_depth_only(&mut depth_pass);
             }
         }
 
@@ -2135,6 +2278,11 @@ impl MarchingCubesRenderer {
         self.front_depth_texture = front_depth_texture;
         self.front_depth_view = front_depth_view;
 
+        // Recreate normal G-buffer (for SSR)
+        let (normal_texture, normal_view) = create_normal_texture(device, width, height);
+        self.normal_texture = normal_texture;
+        self.normal_view = normal_view;
+
         // Recreate back depth texture (always single-sampled for sampling)
         let (back_depth_texture, back_depth_view) = create_samplable_depth_texture(device, width, height);
         self.back_depth_texture = back_depth_texture;
@@ -2204,6 +2352,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&self.ssr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&self.normal_view),
                 },
             ],
         });
