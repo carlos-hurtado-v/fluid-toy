@@ -7,11 +7,50 @@ pub enum FluidRenderMode {
     Particles,
     /// Marching cubes mesh generation (true surface)
     MarchingCubes,
+    /// Screen-space fluid rendering (depth smoothing + narrow-range filter)
+    ScreenSpace,
 }
 
 impl Default for FluidRenderMode {
     fn default() -> Self {
         Self::MarchingCubes
+    }
+}
+
+/// Marching cubes grid resolution presets
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McGridResolution {
+    /// 80³ voxels — fast, lower surface detail
+    Low,
+    /// 128³ voxels — balanced
+    Medium,
+    /// 200³ voxels — high detail, smooth surfaces
+    High,
+}
+
+impl McGridResolution {
+    pub fn grid_size(self) -> u32 {
+        match self {
+            Self::Low => 80,
+            Self::Medium => 128,
+            Self::High => 200,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low (80³)",
+            Self::Medium => "Medium (128³)",
+            Self::High => "High (200³)",
+        }
+    }
+
+    pub const ALL: [McGridResolution; 3] = [Self::Low, Self::Medium, Self::High];
+}
+
+impl Default for McGridResolution {
+    fn default() -> Self {
+        Self::High
     }
 }
 
@@ -159,6 +198,16 @@ pub struct RenderConfig {
     pub water_clarity: f32,
     /// Screen-space reflections enabled
     pub ssr_enabled: bool,
+    /// Marching cubes grid resolution
+    pub mc_grid_resolution: McGridResolution,
+    /// Screen-space billboard radius scale (multiplied by kernel_radius)
+    pub ss_radius_scale: f32,
+    /// Screen-space filter base radius (pixels, perspective-corrected at runtime)
+    pub ss_filter_size: u32,
+    /// Screen-space 1D filter iterations (each = H + V pass). Plus 2D refinement.
+    pub ss_filter_iterations: u32,
+    /// Screen-space debug view (0=off, 1=depth, 2=filtered depth, 3=normals, 4=thickness)
+    pub ss_debug_view: u32,
 }
 
 impl Default for RenderConfig {
@@ -177,6 +226,11 @@ impl Default for RenderConfig {
             ripple_strength: 0.015,
             water_clarity: 0.65,
             ssr_enabled: true,
+            mc_grid_resolution: McGridResolution::default(),
+            ss_radius_scale: 3.0,
+            ss_filter_size: 40,
+            ss_filter_iterations: 2,
+            ss_debug_view: 0,
         }
     }
 }

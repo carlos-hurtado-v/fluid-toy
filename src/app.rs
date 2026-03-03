@@ -14,7 +14,7 @@ use wgpu::util::DeviceExt;
 
 use crate::gpu::GpuContext;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, ContainerRenderer, GpuPoolStyle, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, SprayRenderer, WireframeRenderer};
+use crate::render::{Camera, ContainerRenderer, GpuPoolStyle, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, ScreenSpaceFluidRenderer, SprayRenderer, WireframeRenderer};
 use crate::state::ContainerStyle;
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
@@ -27,6 +27,7 @@ pub struct App {
     gpu: Option<GpuContext>,
     renderer: Option<ParticleRenderer3D>,
     mc_renderer: Option<MarchingCubesRenderer>,
+    ss_renderer: Option<ScreenSpaceFluidRenderer>,
     wireframe_renderer: Option<WireframeRenderer>,
     container_renderer: Option<ContainerRenderer>,
     rigid_body_renderer: Option<RigidBodyRenderer>,
@@ -77,6 +78,7 @@ impl App {
             gpu: None,
             renderer: None,
             mc_renderer: None,
+            ss_renderer: None,
             wireframe_renderer: None,
             container_renderer: None,
             rigid_body_renderer: None,
@@ -219,6 +221,7 @@ impl App {
             gpu.config.width,
             gpu.config.height,
             self.state.quality.msaa.as_u32(),
+            self.state.rendering.mc_grid_resolution.grid_size(),
         );
 
         // Create wireframe renderer for container visualization
@@ -450,9 +453,24 @@ impl App {
         // Upload SH coefficients to MC renderer before moving locals
         mc_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
 
+        // Create screen-space fluid renderer
+        let ss_renderer = ScreenSpaceFluidRenderer::new(
+            &gpu.device,
+            gpu.config.format,
+            &env_view,
+            &env_sampler,
+            &camera_params,
+            &self.state.lighting.to_gpu_params(),
+            &crate::render::marching_cubes::GpuWaterParams::default(),
+            &gpu_sh,
+            gpu.config.width,
+            gpu.config.height,
+        );
+
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
         self.mc_renderer = Some(mc_renderer);
+        self.ss_renderer = Some(ss_renderer);
         self.wireframe_renderer = Some(wireframe_renderer);
         self.container_renderer = Some(container_renderer);
         self.rigid_body_renderer = Some(rigid_body_renderer);
@@ -628,6 +646,9 @@ impl ApplicationHandler for App {
                     if let Some(mc_renderer) = &mut self.mc_renderer {
                         mc_renderer.resize(&gpu.device, env_view, env_sampler, new_size.width, new_size.height);
                     }
+                    if let Some(ss_renderer) = &mut self.ss_renderer {
+                        ss_renderer.resize(&gpu.device, env_view, env_sampler, new_size.width, new_size.height);
+                    }
                     self.rigid_body_depth_view = Some(create_depth_texture(
                         &gpu.device, new_size.width, new_size.height,
                     ));
@@ -756,6 +777,13 @@ impl App {
             mc_renderer.rebuild_env_bind_groups(&gpu.device, &env_view, &env_sampler);
             let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
             mc_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
+        }
+
+        // Rebuild SS renderer bind groups and update SH coefficients
+        if let Some(ss_renderer) = &mut self.ss_renderer {
+            ss_renderer.rebuild_env_bind_groups(&gpu.device, &env_view, &env_sampler);
+            let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
+            ss_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
         }
 
         // Update container renderer SH coefficients
@@ -1156,6 +1184,53 @@ impl App {
                         fluid_depth_view = Some(renderer.depth_view());
                     }
                 }
+                FluidRenderMode::ScreenSpace => {
+                    // Screen-space fluid rendering with narrow-range depth filter
+                    if let Some(ss_renderer) = &self.ss_renderer {
+                        let camera_params = self.camera.to_gpu_params();
+                        ss_renderer.update_camera(&gpu.queue, &camera_params);
+                        ss_renderer.update_light_params(&gpu.queue, &self.state.lighting.to_gpu_params());
+                        let use_env = self.state.environment.background_mode == BackgroundMode::Environment;
+                        let water_params = crate::render::marching_cubes::GpuWaterParams {
+                            water_color: self.state.rendering.particle_color,
+                            roughness: self.state.rendering.water_roughness,
+                            ior: 1.333,
+                            env_intensity: self.state.environment.environment_intensity,
+                            use_env_background: if use_env { 1 } else { 0 },
+                            background_r: self.state.environment.background_color[0],
+                            background_g: self.state.environment.background_color[1],
+                            background_b: self.state.environment.background_color[2],
+                            time: self.state.runtime.time_elapsed,
+                            refraction_strength: self.state.rendering.refraction_strength,
+                            deep_color_r: self.state.rendering.deep_water_color[0],
+                            deep_color_g: self.state.rendering.deep_water_color[1],
+                            deep_color_b: self.state.rendering.deep_water_color[2],
+                            ripple_strength: self.state.rendering.ripple_strength,
+                            clarity: self.state.rendering.water_clarity,
+                            _pad1: self.state.rendering.ss_debug_view as f32,
+                            _pad2: 0.0, _pad3: 0.0,
+                        };
+                        ss_renderer.update_water_params(&gpu.queue, &water_params);
+                        let env_params = self.state.environment.to_gpu_params();
+                        ss_renderer.update_env_params(&gpu.queue, &env_params);
+
+                        let ss_radius = self.state.sph.kernel_radius * self.state.rendering.ss_radius_scale;
+                        ss_renderer.render(
+                            &gpu.device,
+                            &gpu.queue,
+                            &mut encoder,
+                            render_target,
+                            sph_sim.particle_buffer(),
+                            sph_sim.num_particles(),
+                            &camera_params,
+                            ss_radius,
+                            self.state.rendering.ss_filter_size,
+                            self.state.rendering.ss_filter_iterations,
+                            self.camera.fov,
+                        );
+                        fluid_depth_view = Some(ss_renderer.depth_view());
+                    }
+                }
                 FluidRenderMode::MarchingCubes => {
                     // Marching cubes surface mesh rendering
                     if let Some(mc_renderer) = &mut self.mc_renderer {
@@ -1195,7 +1270,7 @@ impl App {
                             let grid_extent = (aabb_max[0] - aabb_min[0] + 2.0 * mc_margin)
                                 .max(aabb_max[1] - aabb_min[1] + 2.0 * mc_margin)
                                 .max(aabb_max[2] - aabb_min[2] + 2.0 * mc_margin);
-                            let mc_cell_size = grid_extent / 100.0; // GRID_SIZE = 100
+                            let mc_cell_size = grid_extent / mc_renderer.grid_size() as f32;
                             let geom = c.to_gpu_geometry(
                                 self.state.sph.wall_stiffness,
                                 self.state.simulation.damping,
@@ -1336,6 +1411,9 @@ impl App {
                     FluidRenderMode::MarchingCubes => {
                         self.mc_renderer.as_ref().map(|mc| mc.front_depth_view())
                     }
+                    FluidRenderMode::ScreenSpace => {
+                        self.ss_renderer.as_ref().map(|ss| ss.front_depth_view())
+                    }
                     FluidRenderMode::Particles => {
                         self.renderer.as_ref().map(|r| r.depth_view())
                     }
@@ -1463,6 +1541,15 @@ impl App {
         match gui_action {
             GuiAction::ResetSimulation => self.reset_simulation(),
             GuiAction::ResetDefaults => self.reset_defaults(),
+            GuiAction::RebuildMcGrid => {
+                if let Some(mc_renderer) = self.mc_renderer.as_mut() {
+                    let gpu = self.gpu.as_ref().unwrap();
+                    mc_renderer.rebuild_grid(
+                        &gpu.device,
+                        self.state.rendering.mc_grid_resolution.grid_size(),
+                    );
+                }
+            }
             GuiAction::None => {}
         }
     }

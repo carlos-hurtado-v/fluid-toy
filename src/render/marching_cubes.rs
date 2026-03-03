@@ -12,12 +12,10 @@ use super::SprayRenderer;
 use crate::render::GpuCameraParams;
 use crate::state::{GpuContainerGeometry, GpuEnvironmentParams, GpuLightParams, GpuShCoefficients, GpuSsrParams};
 
-/// Grid resolution for marching cubes (cells per dimension)
-const GRID_SIZE: u32 = 100;
-
-/// Maximum vertices (5 triangles * 3 verts * grid_size^3 cells)
-/// In practice, only ~10-30% of cells are active
-const MAX_VERTICES: u32 = GRID_SIZE * GRID_SIZE * GRID_SIZE * 15;
+/// Maximum vertices for the output mesh buffer.
+/// Capped at 4M to avoid absurd VRAM allocation (96 MB at 24 bytes/vertex).
+/// The atomic counter in the generate shader handles overflow gracefully.
+const MAX_VERTICES: u32 = 4_000_000;
 
 /// Grid parameters for compute shaders
 #[repr(C)]
@@ -328,6 +326,8 @@ pub struct MarchingCubesRenderer {
     height: u32,
     surface_format: wgpu::TextureFormat,
 
+    // MC grid resolution (cells per dimension)
+    grid_size: u32,
 }
 
 impl MarchingCubesRenderer {
@@ -339,6 +339,7 @@ impl MarchingCubesRenderer {
         width: u32,
         height: u32,
         sample_count: u32,
+        grid_size: u32,
     ) -> Self {
         // Clamp sample count to valid values (1, 2, 4, 8)
         // Note: Not all GPUs support 8x MSAA - wgpu will validate this
@@ -356,15 +357,15 @@ impl MarchingCubesRenderer {
         let extent_x = grid_max[0] - grid_min[0];
         let extent_y = grid_max[1] - grid_min[1];
         let extent_z = grid_max[2] - grid_min[2];
-        let cell_size = extent_x.max(extent_y).max(extent_z) / GRID_SIZE as f32;
+        let cell_size = extent_x.max(extent_y).max(extent_z) / grid_size as f32;
 
         // Create 3D density texture
         let density_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("MC Density Field"),
             size: wgpu::Extent3d {
-                width: GRID_SIZE,
-                height: GRID_SIZE,
-                depth_or_array_layers: GRID_SIZE,
+                width: grid_size,
+                height: grid_size,
+                depth_or_array_layers: grid_size,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -379,9 +380,9 @@ impl MarchingCubesRenderer {
         let density_texture_b = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("MC Density Field B"),
             size: wgpu::Extent3d {
-                width: GRID_SIZE,
-                height: GRID_SIZE,
-                depth_or_array_layers: GRID_SIZE,
+                width: grid_size,
+                height: grid_size,
+                depth_or_array_layers: grid_size,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -433,7 +434,7 @@ impl MarchingCubesRenderer {
         // Create buffers
         let grid_params = GpuGridParams {
             grid_min,
-            grid_size: GRID_SIZE,
+            grid_size,
             grid_max,
             cell_size,
             kernel_radius: 0.1,
@@ -940,7 +941,7 @@ impl MarchingCubesRenderer {
                 dir_y: directions[i][1],
                 dir_z: directions[i][2],
                 radius: 2, // default
-                grid_size: GRID_SIZE,
+                grid_size,
                 _pad: [0; 3],
             };
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1774,6 +1775,7 @@ impl MarchingCubesRenderer {
             ssr_color_sampler: color_sampler,
 
             container_geom_buffer,
+            grid_size,
         }
     }
 
@@ -1844,10 +1846,10 @@ impl MarchingCubesRenderer {
         let extent_x = self.grid_max[0] - self.grid_min[0];
         let extent_y = self.grid_max[1] - self.grid_min[1];
         let extent_z = self.grid_max[2] - self.grid_min[2];
-        let cell_size = extent_x.max(extent_y).max(extent_z) / GRID_SIZE as f32;
+        let cell_size = extent_x.max(extent_y).max(extent_z) / self.grid_size as f32;
         let params = GpuGridParams {
             grid_min: self.grid_min,
-            grid_size: GRID_SIZE,
+            grid_size: self.grid_size,
             grid_max: self.grid_max,
             cell_size,
             kernel_radius,
@@ -1865,7 +1867,7 @@ impl MarchingCubesRenderer {
                 dir_y: directions[i][1],
                 dir_z: directions[i][2],
                 radius: blur_radius as i32,
-                grid_size: GRID_SIZE,
+                grid_size: self.grid_size,
                 _pad: [0; 3],
             };
             queue.write_buffer(&self.blur_params_buffers[i], 0, bytemuck::bytes_of(&blur_params));
@@ -1881,6 +1883,110 @@ impl MarchingCubesRenderer {
     pub fn set_bounds(&mut self, min: [f32; 3], max: [f32; 3]) {
         self.grid_min = min;
         self.grid_max = max;
+    }
+
+    /// Current grid resolution (cells per dimension)
+    pub fn grid_size(&self) -> u32 {
+        self.grid_size
+    }
+
+    /// Rebuild 3D density textures and dependent bind groups for a new grid resolution.
+    /// Call when the user changes the MC grid resolution preset.
+    pub fn rebuild_grid(&mut self, device: &wgpu::Device, new_grid_size: u32) {
+        self.grid_size = new_grid_size;
+
+        // Recreate density textures at new resolution
+        let density_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MC Density Field"),
+            size: wgpu::Extent3d {
+                width: new_grid_size,
+                height: new_grid_size,
+                depth_or_array_layers: new_grid_size,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let density_view = density_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let density_texture_b = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MC Density Field B"),
+            size: wgpu::Extent3d {
+                width: new_grid_size,
+                height: new_grid_size,
+                depth_or_array_layers: new_grid_size,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let density_view_b = density_texture_b.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Rebuild generate bind groups (reference density texture views)
+        let gen_layout = self.generate_pipeline.get_bind_group_layout(0);
+        self.generate_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MC Generate BG"),
+            layout: &gen_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: self.grid_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self._edge_table_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self._tri_table_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.counter_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.vertex_buffer.as_entire_binding() },
+            ],
+        });
+        self.generate_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MC Generate BG B"),
+            layout: &gen_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view_b) },
+                wgpu::BindGroupEntry { binding: 1, resource: self.grid_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self._edge_table_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self._tri_table_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.counter_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.vertex_buffer.as_entire_binding() },
+            ],
+        });
+
+        // Rebuild blur bind groups (6 total: 3 directions × 2 ping-pong)
+        let blur_layout = self.blur_pipeline.get_bind_group_layout(0);
+        self.blur_bind_groups = std::array::from_fn(|dir| {
+            [
+                // a -> b
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("MC Blur BG {} A->B", ["X", "Y", "Z"][dir])),
+                    layout: &blur_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&density_view_b) },
+                        wgpu::BindGroupEntry { binding: 2, resource: self.blur_params_buffers[dir].as_entire_binding() },
+                    ],
+                }),
+                // b -> a
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("MC Blur BG {} B->A", ["X", "Y", "Z"][dir])),
+                    layout: &blur_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view_b) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&density_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: self.blur_params_buffers[dir].as_entire_binding() },
+                    ],
+                }),
+            ]
+        });
+
+        // Store new textures and views (old ones are dropped automatically)
+        self._density_texture = density_texture;
+        self.density_view = density_view;
+        self._density_texture_b = density_texture_b;
+        self._density_view_b = density_view_b;
     }
 
     /// Update container geometry (shared struct: geometry, rotation, physics, clip)
@@ -1966,14 +2072,14 @@ impl MarchingCubesRenderer {
             });
             pass.set_pipeline(&self.density_pipeline);
             pass.set_bind_group(0, &density_bind_group, &[]);
-            let workgroups = (GRID_SIZE + 3) / 4;
+            let workgroups = (self.grid_size + 3) / 4;
             pass.dispatch_workgroups(workgroups, workgroups, workgroups);
         }
 
         // Pass 1.5: Blur density field (3 separable passes: X, Y, Z)
         // After blur: result is in texture B (odd number of passes: a->b, b->a, a->b)
         let result_in_b = if blur_radius > 0 {
-            let workgroups = (GRID_SIZE + 3) / 4;
+            let workgroups = (self.grid_size + 3) / 4;
             // Pass order: X(a->b), Y(b->a), Z(a->b)
             // a_to_b = 0, b_to_a = 1
             let pass_sources = [0usize, 1, 0]; // which bind group variant per pass
@@ -2003,7 +2109,7 @@ impl MarchingCubesRenderer {
             } else {
                 pass.set_bind_group(0, &self.generate_bind_group, &[]);
             }
-            let workgroups = (GRID_SIZE + 3) / 4;
+            let workgroups = (self.grid_size + 3) / 4;
             pass.dispatch_workgroups(workgroups, workgroups, workgroups);
         }
 

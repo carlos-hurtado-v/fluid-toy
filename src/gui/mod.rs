@@ -1,6 +1,6 @@
 //! GUI module - egui integration for parameter control
 
-use crate::state::{AoDebugMode, AppState, BackgroundMode, ContainerStyle, FluidRenderMode, ForceMode, HdrEnvironment, RigidBodyShape, SimulationConfig};
+use crate::state::{AoDebugMode, AppState, BackgroundMode, ContainerStyle, FluidRenderMode, ForceMode, HdrEnvironment, McGridResolution, RigidBodyShape, SimulationConfig};
 
 /// Renders the control panel and returns any triggered action
 pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAction {
@@ -341,6 +341,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.label("Render Mode:");
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::MarchingCubes, "Marching Cubes");
+                    ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::ScreenSpace, "Screen Space");
                     ui.selectable_value(&mut state.rendering.render_mode, FluidRenderMode::Particles, "Particles");
                 });
                 ui.add_space(4.0);
@@ -357,6 +358,17 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 if state.rendering.render_mode == FluidRenderMode::MarchingCubes {
                     ui.add_space(8.0);
                     ui.separator();
+                    let prev_resolution = state.rendering.mc_grid_resolution;
+                    egui::ComboBox::from_label("Grid Resolution")
+                        .selected_text(state.rendering.mc_grid_resolution.label())
+                        .show_ui(ui, |ui| {
+                            for res in McGridResolution::ALL {
+                                ui.selectable_value(&mut state.rendering.mc_grid_resolution, res, res.label());
+                            }
+                        });
+                    if state.rendering.mc_grid_resolution != prev_resolution {
+                        action = GuiAction::RebuildMcGrid;
+                    }
                     let mut blur_val = state.rendering.mc_blur_radius as i32;
                     ui.add(
                         egui::Slider::new(&mut blur_val, 0..=5)
@@ -390,6 +402,60 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     ui.checkbox(&mut state.rendering.ssr_enabled, "Screen-Space Reflections");
                     ui.label("Deep Water Color:");
                     egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.deep_water_color);
+                }
+
+                if state.rendering.render_mode == FluidRenderMode::ScreenSpace {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.ss_radius_scale, 0.5..=2.0)
+                            .text("Radius Scale")
+                    );
+                    let mut filter_size = state.rendering.ss_filter_size as i32;
+                    ui.add(
+                        egui::Slider::new(&mut filter_size, 5..=100)
+                            .text("Filter Size")
+                    );
+                    state.rendering.ss_filter_size = filter_size as u32;
+                    let mut filter_iters = state.rendering.ss_filter_iterations as i32;
+                    ui.add(
+                        egui::Slider::new(&mut filter_iters, 0..=5)
+                            .text("Filter Passes")
+                    );
+                    state.rendering.ss_filter_iterations = filter_iters as u32;
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.water_roughness, 0.01..=0.5)
+                            .text("Roughness")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.water_clarity, 0.0..=1.0)
+                            .text("Clarity")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.refraction_strength, 0.0..=0.10)
+                            .text("Refraction")
+                    );
+                    ui.label("Deep Water Color:");
+                    egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.deep_water_color);
+
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.label("Debug View:");
+                    egui::ComboBox::from_id_salt("ss_debug")
+                        .selected_text(match state.rendering.ss_debug_view {
+                            1 => "Depth",
+                            2 => "Normals",
+                            3 => "Thickness",
+                            4 => "Coverage",
+                            _ => "Off",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut state.rendering.ss_debug_view, 0, "Off");
+                            ui.selectable_value(&mut state.rendering.ss_debug_view, 1, "Depth");
+                            ui.selectable_value(&mut state.rendering.ss_debug_view, 2, "Normals");
+                            ui.selectable_value(&mut state.rendering.ss_debug_view, 3, "Thickness");
+                            ui.selectable_value(&mut state.rendering.ss_debug_view, 4, "Coverage");
+                        });
                 }
 
                 ui.add_space(4.0);
@@ -635,6 +701,7 @@ pub enum GuiAction {
     None,
     ResetSimulation,
     ResetDefaults,
+    RebuildMcGrid,
 }
 
 /// Default configs for reset functionality
