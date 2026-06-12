@@ -3,7 +3,7 @@
 use super::simulation::ContainerConfig;
 
 /// Rigid body shape types (repr matches GPU constants)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RigidBodyShape {
     Cube = 0,
     Sphere = 1,
@@ -81,7 +81,8 @@ impl RigidBodyShape {
 }
 
 /// Rigid body configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RigidBodyConfig {
     /// Whether the rigid body is active in the scene
     pub enabled: bool,

@@ -291,46 +291,85 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
 
             ui.add_space(8.0);
 
-            // Spray Particles controls
-            ui.collapsing("Spray Particles", |ui| {
+            // Whitewater (spray / foam / bubbles) controls
+            ui.collapsing("Whitewater (Spray & Foam)", |ui| {
                 ui.checkbox(&mut state.spray.enabled, "Enable");
 
                 if state.spray.enabled {
                     ui.add_space(4.0);
                     ui.add(
-                        egui::Slider::new(&mut state.spray.emission_threshold, 0.01..=2.0)
-                            .text("Emission Threshold")
-                            .logarithmic(true)
-                    );
+                        egui::Slider::new(&mut state.spray.k_trapped_air, 0.0..=3.0)
+                            .text("Trapped Air")
+                    ).on_hover_text("Emission from converging flow (impacts, churning)");
                     ui.add(
-                        egui::Slider::new(&mut state.spray.spray_count, 1..=16)
-                            .text("Spray Count")
-                    );
+                        egui::Slider::new(&mut state.spray.k_wave_crest, 0.0..=3.0)
+                            .text("Wave Crest")
+                    ).on_hover_text("Emission from fast-moving convex surface curvature");
                     ui.add(
-                        egui::Slider::new(&mut state.spray.lifetime, 0.1..=3.0)
-                            .text("Lifetime")
+                        egui::Slider::new(&mut state.spray.emission_rate, 1.0..=60.0)
+                            .text("Emission Rate")
+                            .suffix("/s")
+                    ).on_hover_text("Diffuse particles per second per fluid particle at full potential");
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.min_speed, 0.2..=3.0)
+                            .text("Min Speed")
+                            .suffix(" m/s")
+                    ).on_hover_text("Fluid slower than this never emits");
+                    ui.label(format!(
+                        "Auto limits - TA {:.2}, WC {:.2}",
+                        state.runtime.spray_ta_limit, state.runtime.spray_wc_limit
+                    )).on_hover_text(
+                        "Self-calibrated potential ceilings (EMA of per-frame maxima); \
+                         emission saturates at these values",
+                    );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.lifetime, 0.5..=8.0)
+                            .text("Foam Lifetime")
                             .suffix("s")
+                    ).on_hover_text(
+                        "Only foam ages out (energy-scaled per particle at birth); \
+                         spray persists until it lands, bubbles until they surface",
                     );
                     ui.add(
                         egui::Slider::new(&mut state.spray.lifetime_variation, 0.0..=1.0)
                             .text("Lifetime Variation")
-                    );
+                    ).on_hover_text("Energy-scaled spread of per-particle foam lifetimes (staggers fade-out)");
                     ui.add(
                         egui::Slider::new(&mut state.spray.drag, 0.0..=5.0)
                             .text("Air Drag")
+                    ).on_hover_text("Deceleration of airborne spray (foam and bubbles follow the fluid instead)");
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.bubble_buoyancy, 0.0..=8.0)
+                            .text("Bubble Buoyancy")
                     );
                     ui.add(
-                        egui::Slider::new(&mut state.spray.speed_multiplier, 0.5..=5.0)
-                            .text("Speed Multiplier")
-                    );
+                        egui::Slider::new(&mut state.spray.bubble_drag, 0.0..=1.0)
+                            .text("Bubble Drag")
+                    ).on_hover_text("How strongly bubbles follow the surrounding fluid");
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.speed_multiplier, 0.2..=2.0)
+                            .text("Velocity Inherit")
+                    ).on_hover_text("Fraction of the emitter's velocity newborns launch with");
                     ui.add(
                         egui::Slider::new(&mut state.spray.velocity_jitter, 0.0..=3.0)
                             .text("Velocity Jitter")
-                    );
+                    ).on_hover_text("Random velocity added at spawn (m/s), spreads the launch cone");
+                    ui.add_space(4.0);
                     ui.add(
                         egui::Slider::new(&mut state.spray.particle_size, 0.001..=0.05)
-                            .text("Spray Size")
+                            .text("Particle Size")
                     );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.foam_coverage, 0.0..=3.0)
+                            .text("Foam Coverage")
+                    ).on_hover_text("Surface foam response: lower = sparser lace, higher = denser carpet (1 = calibrated)");
+                    ui.add(
+                        egui::Slider::new(&mut state.spray.aeration_strength, 0.0..=3.0)
+                            .text("Aeration")
+                    ).on_hover_text("Entrained-air milkiness inside the water (vortex cores, plunge plumes); 1 = calibrated");
+                    ui.checkbox(&mut state.spray.bubbles_visible, "Show Bubbles");
                 }
             });
 
@@ -700,8 +739,19 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
             ui.add_space(16.0);
             ui.separator();
 
-            if ui.button("Reset to Defaults").clicked() {
-                action = GuiAction::ResetDefaults;
+            ui.horizontal(|ui| {
+                if ui.button("Reset to Defaults").clicked() {
+                    action = GuiAction::ResetDefaults;
+                }
+                if ui.button("Export Config")
+                    .on_hover_text("Save all current settings + camera to configs/export_NNN.json\n(reload with: fluid-toy --config <file>)")
+                    .clicked()
+                {
+                    action = GuiAction::ExportConfig;
+                }
+            });
+            if let Some(path) = &state.runtime.last_export {
+                ui.label(format!("Saved: {path}"));
             }
 
             ui.add_space(8.0);
@@ -719,6 +769,7 @@ pub enum GuiAction {
     ResetSimulation,
     ResetDefaults,
     RebuildMcGrid,
+    ExportConfig,
 }
 
 /// Default configs for reset functionality

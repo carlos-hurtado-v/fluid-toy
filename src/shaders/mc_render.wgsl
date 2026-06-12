@@ -31,8 +31,8 @@ struct WaterParams {
     ripple_strength: f32,
     clarity: f32,
     _pad1: f32,
-    _pad2: f32,
-    _pad3: f32,
+    foam_coverage: f32,
+    aeration_strength: f32,
 }
 
 struct LightParams {
@@ -60,6 +60,7 @@ struct Vertex {
 @group(0) @binding(8) var<uniform> light: LightParams;
 @group(0) @binding(9) var<uniform> sh_coeffs: array<vec4<f32>, 9>;
 @group(0) @binding(10) var ssr_tex: texture_2d<f32>;
+@group(0) @binding(12) var foam_density_tex: texture_2d<f32>;
 
 @group(0) @binding(11) var<uniform> container: ContainerGeometry;
 
@@ -145,6 +146,35 @@ fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
 fn linearize_depth(d: f32, near: f32, far: f32) -> f32 {
     return near * far / (far - d * (far - near));
 }
+
+// === Foam field compositing ===
+// Density maps to coverage through an asymptotic curve (1 - exp(-k*d)) rather
+// than a clipped smoothstep window: a hard window turns any dense carpet into
+// a single flat white slab (every pixel past the top is identical), which is
+// exactly the "soap" look. With the asymptote, density differences stay
+// visible at any thickness, and in-slab variation comes from albedo texture
+// noise, which never saturates.
+const FOAM_DENSITY_LO: f32 = 0.07;
+const FOAM_COVERAGE_K: f32 = 1.1;
+// World-anchored value-noise. Coarse octave carves patch edges into lacework
+// (coverage, dies at saturation by design); both octaves drive the in-slab
+// brightness texture (bubble clusters vs interstices, survives saturation).
+const FOAM_NOISE_SCALE: f32 = 50.0;
+const FOAM_NOISE_SCALE_FINE: f32 = 187.0;
+const FOAM_NOISE_BREAKUP: f32 = 0.9;
+const FOAM_TEX_CONTRAST: f32 = 0.22;
+const FOAM_TEX_CONTRAST_FINE: f32 = 0.13;
+// Thin foam reads as a translucent gray-blue veil over the water; thick foam
+// dries toward bright white (ramped on coverage).
+const FOAM_ALBEDO: vec3<f32> = vec3<f32>(0.34, 0.36, 0.37);
+const FOAM_VEIL_ALBEDO: vec3<f32> = vec3<f32>(0.22, 0.26, 0.29);
+const FOAM_THICK_LO: f32 = 0.45;
+const FOAM_THICK_HI: f32 = 0.85;
+// Aeration (G channel): entrained-air milkiness inside the water volume —
+// vortex cores, plunge plumes. Mixed into the refraction path only, so
+// reflections and specular survive on top. Slightly bluer than surface foam.
+const AERATION_K: f32 = 0.15;
+const AERATION_ALBEDO: vec3<f32> = vec3<f32>(0.22, 0.27, 0.31);
 
 // GPU-friendly hash → pseudo-random [0,1]
 fn hash2(p: vec2<f32>) -> f32 {
@@ -366,9 +396,24 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     let ambient_subsurface = ambient_irradiance * water.water_color * transmittance * scatter_strength * 0.6;
 
     // Add sun subsurface (weighted by 1-fresnel for energy conservation) and ambient irradiance
-    let lit_interior = interior_with_scatter
+    var lit_interior = interior_with_scatter
         + sun_subsurface * (1.0 - fresnel)
         + ambient_subsurface * (1.0 - fresnel);
+
+    // === AERATION (submerged whitewater) ===
+    // Entrained-air density along this ray (G channel of the whitewater
+    // field): mix the interior toward a lit milky tone. White IN the water,
+    // as opposed to the surface foam composited after the Fresnel combine.
+    let whitewater_field = textureSampleLevel(foam_density_tex, env_sampler, screen_uv, 0.0).rg;
+    let aeration = 1.0 - exp(-AERATION_K * water.aeration_strength * whitewater_field.g);
+    if (aeration > 0.002) {
+        var aeration_light = evaluate_sh_irradiance(normal) * water.env_intensity;
+        if (light.sun_enabled == 1u) {
+            aeration_light += light.sun_color * light.sun_intensity
+                * max(dot(normal, normalize(light.sun_direction)), 0.0) * 0.6;
+        }
+        lit_interior = mix(lit_interior, AERATION_ALBEDO * aeration_light, aeration);
+    }
 
     // Combine reflection and refraction based on Fresnel
     // At grazing angles (high fresnel): more reflection
@@ -377,6 +422,37 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
 
     // Add specular on top (pure surface reflection, independent of interior)
     color += sun_specular;
+
+    // === FOAM OVERLAY ===
+    // Screen-space foam density (splatted half-res by the spray system):
+    // whiten the surface where foam accumulates. Foam is rough and diffuse,
+    // so it replaces the specular water response rather than adding to it.
+    let foam_density = whitewater_field.r;
+    if (foam_density > 0.01) {
+        let n_coarse = value_noise_grad(input.world_position.xz * FOAM_NOISE_SCALE).x;
+        let n_fine = value_noise_grad(
+            input.world_position.xz * FOAM_NOISE_SCALE_FINE + vec2<f32>(37.42, 11.18),
+        ).x;
+        // Coarse noise raggedizes patch edges into stringy breakup
+        let breakup = (n_coarse - 0.5) * FOAM_NOISE_BREAKUP;
+        let d_eff = max(foam_density * (1.0 + breakup) - FOAM_DENSITY_LO, 0.0);
+        let coverage = 1.0 - exp(-FOAM_COVERAGE_K * water.foam_coverage * d_eff);
+        if (coverage > 0.002) {
+            var foam_light = evaluate_sh_irradiance(normal) * water.env_intensity;
+            if (light.sun_enabled == 1u) {
+                foam_light += light.sun_color * light.sun_intensity
+                    * max(dot(normal, normalize(light.sun_direction)), 0.0);
+            }
+            // Thin veil -> dry white crest, plus saturation-proof brightness
+            // texture so thick carpets keep internal structure
+            let thick = smoothstep(FOAM_THICK_LO, FOAM_THICK_HI, coverage);
+            let albedo = mix(FOAM_VEIL_ALBEDO, FOAM_ALBEDO, thick);
+            let tex = 1.0 + (n_coarse - 0.5) * FOAM_TEX_CONTRAST
+                + (n_fine - 0.5) * FOAM_TEX_CONTRAST_FINE;
+            let foam_color = albedo * tex * foam_light;
+            color = mix(color, foam_color, coverage);
+        }
+    }
 
     // Output linear HDR — post-process pipeline handles tone mapping + gamma
 

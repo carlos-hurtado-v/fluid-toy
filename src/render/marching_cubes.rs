@@ -93,9 +93,12 @@ pub struct GpuWaterParams {
     pub deep_color_b: f32,
     pub ripple_strength: f32,
     pub clarity: f32,
+    /// SS path reuses this slot as the debug-view index
     pub _pad1: f32,
-    pub _pad2: f32,
-    pub _pad3: f32,
+    /// Master scale on surface foam coverage response (whitewater GUI)
+    pub foam_coverage: f32,
+    /// Master scale on entrained-air milkiness (whitewater GUI)
+    pub aeration_strength: f32,
 }
 
 impl Default for GpuWaterParams {
@@ -117,8 +120,8 @@ impl Default for GpuWaterParams {
             ripple_strength: 0.015,
             clarity: 0.65,
             _pad1: 0.0,
-            _pad2: 0.0,
-            _pad3: 0.0,
+            foam_coverage: 1.0,
+            aeration_strength: 1.0,
         }
     }
 }
@@ -291,6 +294,10 @@ pub struct MarchingCubesRenderer {
     // Background texture for screen-space refraction
     background_texture: wgpu::Texture,
     background_view: wgpu::TextureView,
+    // Half-res foam density field, splatted by SprayRenderer and composited
+    // by the water shader (foam reads as connected patches, not sprites)
+    foam_density_texture: wgpu::Texture,
+    foam_density_view: wgpu::TextureView,
 
     // Buffers
     grid_params_buffer: wgpu::Buffer,
@@ -460,6 +467,25 @@ impl MarchingCubesRenderer {
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+
+        // Foam density field (half-res: cheaper splatting + free smoothing
+        // when the water shader samples it with a linear filter)
+        let foam_density_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Foam Density Texture"),
+            size: wgpu::Extent3d {
+                width: (width / 2).max(1),
+                height: (height / 2).max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: super::spray_renderer::FOAM_DENSITY_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let foam_density_view =
+            foam_density_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Create background texture for screen-space refraction
         let (background_texture, background_view) = create_background_texture(device, surface_format, width, height);
@@ -1271,6 +1297,17 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Foam density field (half-res, splatted by SprayRenderer)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1518,6 +1555,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 11,
                     resource: container_geom_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&foam_density_view),
                 },
             ],
         });
@@ -1906,6 +1947,8 @@ impl MarchingCubesRenderer {
             back_depth_sampler,
             background_texture,
             background_view,
+            foam_density_texture,
+            foam_density_view,
             grid_params_buffer,
             _edge_table_buffer: edge_table_buffer,
             _tri_table_buffer: tri_table_buffer,
@@ -2014,6 +2057,11 @@ impl MarchingCubesRenderer {
     /// Get the front-face depth view (for GTAO input)
     pub fn front_depth_view(&self) -> &wgpu::TextureView {
         &self.front_depth_view
+    }
+
+    /// Target for the foam density splat pass (rendered by SprayRenderer)
+    pub fn foam_density_view(&self) -> &wgpu::TextureView {
+        &self.foam_density_view
     }
 
     pub fn update_camera(&self, queue: &wgpu::Queue, params: &GpuCameraParams) {
@@ -2224,6 +2272,8 @@ impl MarchingCubesRenderer {
         deep_color: &[f32; 3],
         ripple_strength: f32,
         clarity: f32,
+        foam_coverage: f32,
+        aeration_strength: f32,
     ) {
         let params = GpuWaterParams {
             water_color: *water_color,
@@ -2242,8 +2292,8 @@ impl MarchingCubesRenderer {
             ripple_strength,
             clarity,
             _pad1: 0.0,
-            _pad2: 0.0,
-            _pad3: 0.0,
+            foam_coverage,
+            aeration_strength,
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
     }
@@ -2397,6 +2447,11 @@ impl MarchingCubesRenderer {
             0,
             std::mem::size_of::<Counter>() as u64,
         );
+    }
+
+    /// Last read-back mesh vertex count (see `read_vertex_count`)
+    pub fn vertex_count(&self) -> u32 {
+        self.current_vertex_count
     }
 
     /// Read back vertex count (call after submit, before next frame)
@@ -2607,15 +2662,17 @@ impl MarchingCubesRenderer {
                 ct.render_msaa(&mut pass);
             }
 
-            // Draw spray particles before water mesh
-            if let Some(sp) = spray {
-                sp.render_msaa(&mut pass);
-            }
-
-            // Draw water mesh on top (samples background_texture for refraction)
+            // Draw water mesh (samples background_texture for refraction)
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, &self.render_bind_group, &[]);
             pass.draw_indirect(&self.indirect_buffer, 0);
+
+            // Draw whitewater after the water mesh: camera-biased foam wins the
+            // depth test at the surface, while submerged bubbles fail it and
+            // remain visible only through refraction (background pass copy)
+            if let Some(sp) = spray {
+                sp.render_msaa(&mut pass);
+            }
         }
     }
 
@@ -2666,6 +2723,25 @@ impl MarchingCubesRenderer {
         let (background_texture, background_view) = create_background_texture(device, self.surface_format, width, height);
         self.background_texture = background_texture;
         self.background_view = background_view;
+
+        // Recreate foam density field (half-res)
+        let foam_density_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Foam Density Texture"),
+            size: wgpu::Extent3d {
+                width: (width / 2).max(1),
+                height: (height / 2).max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: super::spray_renderer::FOAM_DENSITY_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.foam_density_view =
+            foam_density_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.foam_density_texture = foam_density_texture;
 
         // Recreate SSR texture
         let ssr_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -2782,6 +2858,10 @@ impl MarchingCubesRenderer {
                     binding: 11,
                     resource: self.container_geom_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&self.foam_density_view),
+                },
             ],
         });
     }
@@ -2865,6 +2945,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 11,
                     resource: self.container_geom_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&self.foam_density_view),
                 },
             ],
         });

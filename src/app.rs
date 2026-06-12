@@ -1,5 +1,7 @@
 //! Application state and event handling
 
+use std::collections::VecDeque;
+use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::{
@@ -13,6 +15,7 @@ use winit::{
 use wgpu::util::DeviceExt;
 
 use crate::gpu::GpuContext;
+use crate::launch::LaunchOptions;
 use crate::gui::{self, GuiAction};
 use crate::render::{Camera, ContainerRenderer, GpuPoolStyle, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, ScreenSpaceFluidRenderer, SprayRenderer, WireframeRenderer};
 use crate::state::ContainerStyle;
@@ -69,10 +72,52 @@ pub struct App {
     egui_ctx: egui::Context,
     egui_winit: Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
+    // Automation (--capture / --stats / --exit-after)
+    launch: LaunchOptions,
+    /// Simulation frames completed (deterministic clock for captures/stats)
+    sim_frame_index: u64,
+    /// Simulated seconds elapsed (sim_frame_index × frame_dt, dt-change aware)
+    sim_time: f64,
+    pending_captures: VecDeque<u64>,
+    had_captures: bool,
+    stats_file: Option<std::io::BufWriter<std::fs::File>>,
+    should_exit: bool,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(mut state: AppState, launch: LaunchOptions) -> Self {
+        if launch.is_automated() && state.simulation.paused {
+            println!("note: automation flags require a running simulation; ignoring paused=true");
+            state.simulation.paused = false;
+        }
+
+        let stats_file = launch.stats_path.as_ref().map(|path| {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let file = std::fs::File::create(path).unwrap_or_else(|e| {
+                eprintln!("error: cannot create stats file {}: {e}", path.display());
+                std::process::exit(1);
+            });
+            let mut writer = std::io::BufWriter::new(file);
+            let _ = writer
+                .write_all(b"frame,sim_time,particles,mc_vertices,spray_total,spray,foam,bubbles,fps,ta_limit,wc_limit\n");
+            writer
+        });
+
+        if !launch.capture_frames.is_empty() {
+            if let Err(e) = std::fs::create_dir_all(&launch.out_dir) {
+                eprintln!(
+                    "error: cannot create capture dir {}: {e}",
+                    launch.out_dir.display()
+                );
+                std::process::exit(1);
+            }
+        }
+
+        let pending_captures: VecDeque<u64> = launch.capture_frames.iter().copied().collect();
+        let had_captures = !pending_captures.is_empty();
+
         Self {
             window: None,
             gpu: None,
@@ -101,7 +146,7 @@ impl App {
             sph_simulation: None,
             sdf_data: None,
             camera: Camera::default(),
-            state: AppState::default(),
+            state,
             last_frame_time: Instant::now(),
             mouse_pressed: false,
             last_mouse_pos: None,
@@ -112,6 +157,13 @@ impl App {
             egui_ctx: egui::Context::default(),
             egui_winit: None,
             egui_renderer: None,
+            launch,
+            sim_frame_index: 0,
+            sim_time: 0.0,
+            pending_captures,
+            had_captures,
+            stats_file,
+            should_exit: false,
         }
     }
 
@@ -142,7 +194,8 @@ impl App {
     }
 
     fn initialize(&mut self, window: Arc<Window>) {
-        let gpu = pollster::block_on(GpuContext::new(window.clone()));
+        // Automation runs render uncapped (no vsync wait between frames)
+        let gpu = pollster::block_on(GpuContext::new(window.clone(), self.launch.is_automated()));
 
         // Initialize camera from state
         self.camera.distance = self.state.camera.distance;
@@ -266,40 +319,25 @@ impl App {
             &gpu.device, gpu.config.width, gpu.config.height,
         );
 
-        // Create spray system and renderer
-        let spray_params = GpuSprayParams {
-            emission_threshold: self.state.spray.emission_threshold,
-            spray_count: self.state.spray.spray_count,
-            lifetime: self.state.spray.lifetime,
-            lifetime_variation: self.state.spray.lifetime_variation,
-            drag: self.state.spray.drag,
-            speed_multiplier: self.state.spray.speed_multiplier,
-            velocity_jitter: self.state.spray.velocity_jitter,
-            dt: self.state.simulation.substep_dt(),
-            max_particles: self.state.spray.max_particles,
-            num_sph_particles: self.state.runtime.particle_count,
-            frame_count: 0,
-            gravity_y: -self.state.simulation.gravity,
-        };
+        // Create whitewater system and renderer
+        let spray_params = self.build_spray_params(0);
         let spray_system = SpraySystem::new(
             &gpu.device,
-            sph_simulation.particle_buffer(),
-            &sph_simulation.sph_params_buffer(),
-            &sph_simulation.container_geom_buffer(),
+            sph_simulation.sorted_particle_buffer(),
+            sph_simulation.sph_params_buffer(),
+            sph_simulation.container_geom_buffer(),
+            sph_simulation.cell_starts_buffer(),
+            sph_simulation.cell_counts_buffer(),
+            sph_simulation.grid_params_buffer(),
             self.state.spray.max_particles,
             &spray_params,
         );
-        let spray_render_params = GpuSprayRenderParams {
-            particle_size: self.state.spray.particle_size,
-            max_particles: self.state.spray.max_particles,
-            _pad: [0.0; 2],
-        };
         let spray_renderer = SprayRenderer::new(
             &gpu.device,
             gpu.config.format,
             &camera_params,
             spray_system.spray_buffer(),
-            &spray_render_params,
+            &self.build_spray_render_params(),
             self.state.quality.msaa.as_u32(),
         );
 
@@ -467,6 +505,17 @@ impl App {
             gpu.config.height,
         );
 
+        // Wire the MC front depth into the foam splat pass (depth-aware foam)
+        {
+            let mut spray_renderer = spray_renderer;
+            spray_renderer.set_depth_view(
+                &gpu.device,
+                spray_system.spray_buffer(),
+                mc_renderer.front_depth_view(),
+            );
+            self.spray_renderer = Some(spray_renderer);
+        }
+
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
         self.mc_renderer = Some(mc_renderer);
@@ -476,7 +525,6 @@ impl App {
         self.rigid_body_renderer = Some(rigid_body_renderer);
         self.rigid_body_depth_view = Some(rigid_body_depth_view);
         self.spray_system = Some(spray_system);
-        self.spray_renderer = Some(spray_renderer);
         self.post_process_renderer = Some(post_process_renderer);
         self.gtao_renderer = Some(gtao_renderer);
         self.prev_camera_params = Some(camera_params);
@@ -536,44 +584,37 @@ impl App {
                 gpu.config.height,
             ));
 
-            // Recreate spray system with new simulation's buffers
+            // Recreate whitewater system with new simulation's buffers
             if let Some(sph_sim) = &self.sph_simulation {
-                let spray_params = GpuSprayParams {
-                    emission_threshold: self.state.spray.emission_threshold,
-                    spray_count: self.state.spray.spray_count,
-                    lifetime: self.state.spray.lifetime,
-                    lifetime_variation: self.state.spray.lifetime_variation,
-                    drag: self.state.spray.drag,
-                    speed_multiplier: self.state.spray.speed_multiplier,
-                    velocity_jitter: self.state.spray.velocity_jitter,
-                    dt: self.state.simulation.substep_dt(),
-                    max_particles: self.state.spray.max_particles,
-                    num_sph_particles: self.state.runtime.particle_count,
-                    frame_count: 0,
-                    gravity_y: -self.state.simulation.gravity,
-                };
+                let spray_params = self.build_spray_params(0);
                 let spray_system = SpraySystem::new(
                     &gpu.device,
-                    sph_sim.particle_buffer(),
-                    &sph_sim.sph_params_buffer(),
-                    &sph_sim.container_geom_buffer(),
+                    sph_sim.sorted_particle_buffer(),
+                    sph_sim.sph_params_buffer(),
+                    sph_sim.container_geom_buffer(),
+                    sph_sim.cell_starts_buffer(),
+                    sph_sim.cell_counts_buffer(),
+                    sph_sim.grid_params_buffer(),
                     self.state.spray.max_particles,
                     &spray_params,
                 );
-                let spray_render_params = GpuSprayRenderParams {
-                    particle_size: self.state.spray.particle_size,
-                    max_particles: self.state.spray.max_particles,
-                    _pad: [0.0; 2],
-                };
                 let camera_params = self.camera.to_gpu_params();
-                self.spray_renderer = Some(SprayRenderer::new(
+                let mut spray_renderer = SprayRenderer::new(
                     &gpu.device,
                     gpu.config.format,
                     &camera_params,
                     spray_system.spray_buffer(),
-                    &spray_render_params,
+                    &self.build_spray_render_params(),
                     self.state.quality.msaa.as_u32(),
-                ));
+                );
+                if let Some(mc_renderer) = &self.mc_renderer {
+                    spray_renderer.set_depth_view(
+                        &gpu.device,
+                        spray_system.spray_buffer(),
+                        mc_renderer.front_depth_view(),
+                    );
+                }
+                self.spray_renderer = Some(spray_renderer);
                 self.spray_system = Some(spray_system);
             }
             self.state.runtime.frame_count = 0;
@@ -606,9 +647,12 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let window_attrs = Window::default_attributes()
-            .with_title("Fluid Toy")
-            .with_inner_size(winit::dpi::LogicalSize::new(1000, 700));
+        let window_attrs = Window::default_attributes().with_title("Fluid Toy");
+        // --size is in physical pixels so captures have exact dimensions
+        let window_attrs = match self.launch.window_size {
+            Some((w, h)) => window_attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h)),
+            None => window_attrs.with_inner_size(winit::dpi::LogicalSize::new(1000, 700)),
+        };
 
         let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
         self.window = Some(window.clone());
@@ -645,6 +689,19 @@ impl ApplicationHandler for App {
                     let env_sampler = self.env_sampler.as_ref().unwrap();
                     if let Some(mc_renderer) = &mut self.mc_renderer {
                         mc_renderer.resize(&gpu.device, env_view, env_sampler, new_size.width, new_size.height);
+                    }
+                    // MC resize recreated the front depth — rebind it in the
+                    // foam splat pass
+                    if let (Some(spray_renderer), Some(mc_renderer), Some(spray_system)) = (
+                        &mut self.spray_renderer,
+                        &self.mc_renderer,
+                        &self.spray_system,
+                    ) {
+                        spray_renderer.set_depth_view(
+                            &gpu.device,
+                            spray_system.spray_buffer(),
+                            mc_renderer.front_depth_view(),
+                        );
                     }
                     if let Some(ss_renderer) = &mut self.ss_renderer {
                         ss_renderer.resize(&gpu.device, env_view, env_sampler, new_size.width, new_size.height);
@@ -742,6 +799,10 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.update_and_render();
+                if self.should_exit {
+                    event_loop.exit();
+                    return;
+                }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -932,17 +993,58 @@ impl App {
             }
             if let Some(spray_renderer) = &self.spray_renderer {
                 spray_renderer.update_camera(&gpu.queue, &camera_params);
-                let spray_render_params = GpuSprayRenderParams {
-                    particle_size: self.state.spray.particle_size,
-                    max_particles: self.state.spray.max_particles,
-                    _pad: [0.0; 2],
-                };
-                spray_renderer.update_params(&gpu.queue, &spray_render_params);
+                spray_renderer.update_params(&gpu.queue, &self.build_spray_render_params());
+                spray_renderer.update_light(&gpu.queue, &self.state.lighting.to_gpu_params());
             }
 
             let render_params = self.state.rendering.to_gpu_params();
             renderer.update_params(&gpu.queue, &render_params);
             renderer.update_light_params(&gpu.queue, &self.state.lighting.to_gpu_params());
+        }
+    }
+
+    fn build_spray_params(&self, frame_count: u32) -> GpuSprayParams {
+        let spray = &self.state.spray;
+        // Auto-calibrated potential ceilings (EMA over per-frame maxima)
+        let (ta_limit, wc_limit) = self.spray_system.as_ref().map_or(
+            (
+                crate::simulation::spray::AUTO_TA_INIT,
+                crate::simulation::spray::AUTO_WC_INIT,
+            ),
+            |s| s.auto_limits(),
+        );
+        GpuSprayParams {
+            min_speed: spray.min_speed,
+            emission_rate: spray.emission_rate,
+            lifetime: spray.lifetime,
+            lifetime_variation: spray.lifetime_variation,
+            drag: spray.drag,
+            speed_multiplier: spray.speed_multiplier,
+            velocity_jitter: spray.velocity_jitter,
+            dt: self.state.simulation.substep_dt() * self.state.simulation.substeps as f32,
+            max_particles: spray.max_particles,
+            num_sph_particles: self.state.runtime.particle_count,
+            frame_count,
+            gravity_y: -self.state.simulation.gravity,
+            k_trapped_air: spray.k_trapped_air,
+            k_wave_crest: spray.k_wave_crest,
+            ta_limit,
+            bubble_buoyancy: spray.bubble_buoyancy,
+            bubble_drag: spray.bubble_drag,
+            wc_limit,
+            _pad: [0.0; 2],
+        }
+    }
+
+    fn build_spray_render_params(&self) -> GpuSprayRenderParams {
+        // In MC mode foam renders as a screen-space density field; the sprite
+        // pass then draws only spray streaks and bubbles
+        let foam_as_field = self.state.rendering.render_mode == FluidRenderMode::MarchingCubes;
+        GpuSprayRenderParams {
+            particle_size: self.state.spray.particle_size,
+            max_particles: self.state.spray.max_particles,
+            bubbles_visible: self.state.spray.bubbles_visible as u32,
+            foam_as_field: foam_as_field as u32,
         }
     }
 
@@ -987,7 +1089,17 @@ impl App {
             let instant_fps = 1.0 / delta;
             self.state.runtime.fps = self.state.runtime.fps * 0.9 + instant_fps * 0.1;
         }
-        self.state.runtime.time_elapsed += delta;
+
+        // Visual time (ripples etc.): wall clock normally; fixed sim step in
+        // automation runs so captures are reproducible across machines
+        let frame_dt = self.state.simulation.substep_dt() * self.state.simulation.substeps as f32;
+        if self.launch.is_automated() {
+            if !self.state.simulation.paused {
+                self.state.runtime.time_elapsed += frame_dt;
+            }
+        } else {
+            self.state.runtime.time_elapsed += delta;
+        }
 
         let window = self.window.as_ref().unwrap();
         let egui_winit = self.egui_winit.as_mut().unwrap();
@@ -1041,7 +1153,6 @@ impl App {
             });
 
         // Smoothly interpolate container tilt toward target each frame (total frame time)
-        let frame_dt = self.state.simulation.substep_dt() * self.state.simulation.substeps as f32;
         self.state.container.update_tilt(frame_dt);
 
         // Run SPH simulation if not paused (multiple sub-steps for stability)
@@ -1060,33 +1171,59 @@ impl App {
             }
 
             // Run spray system after SPH completes
-            if self.state.spray.enabled {
-                if let Some(spray_sys) = &self.spray_system {
-                    // Reset spray on re-enable to clear stale frozen particles
-                    if !self.spray_prev_enabled {
-                        spray_sys.reset(&gpu.queue);
-                    }
-                    self.state.runtime.frame_count = self.state.runtime.frame_count.wrapping_add(1);
-                    let spray_params = GpuSprayParams {
-                        emission_threshold: self.state.spray.emission_threshold,
-                        spray_count: self.state.spray.spray_count,
-                        lifetime: self.state.spray.lifetime,
-                        lifetime_variation: self.state.spray.lifetime_variation,
-                        drag: self.state.spray.drag,
-                        speed_multiplier: self.state.spray.speed_multiplier,
-                        velocity_jitter: self.state.spray.velocity_jitter,
-                        dt: self.state.simulation.substep_dt() * num_substeps as f32,
-                        max_particles: self.state.spray.max_particles,
-                        num_sph_particles: self.state.runtime.particle_count,
-                        frame_count: self.state.runtime.frame_count,
-                        gravity_y: -self.state.simulation.gravity,
-                    };
-                    spray_sys.update_params(&gpu.queue, &spray_params);
-                    spray_sys.step(&gpu.device, &gpu.queue, self.state.runtime.particle_count);
+            if self.state.spray.enabled && self.spray_system.is_some() {
+                let needs_reset = !self.spray_prev_enabled;
+                self.state.runtime.frame_count = self.state.runtime.frame_count.wrapping_add(1);
+                let spray_params = self.build_spray_params(self.state.runtime.frame_count);
+
+                let spray_sys = self.spray_system.as_mut().unwrap();
+                // Reset spray on re-enable to clear stale frozen particles
+                if needs_reset {
+                    spray_sys.reset(&gpu.queue);
                 }
+                spray_sys.update_params(&gpu.queue, &spray_params);
+                spray_sys.step(&gpu.device, &gpu.queue, self.state.runtime.particle_count);
+
+                // Publish the live auto-limits for the GUI readout
+                let (ta, wc) = spray_sys.auto_limits();
+                self.state.runtime.spray_ta_limit = ta;
+                self.state.runtime.spray_wc_limit = wc;
             }
         }
         self.spray_prev_enabled = self.state.spray.enabled;
+
+        // Advance the deterministic frame clock (drives captures and stats)
+        let stepped = !self.state.simulation.paused;
+        if stepped {
+            self.sim_frame_index += 1;
+            self.sim_time += frame_dt as f64;
+        }
+
+        // Prepare a swapchain readback if a capture is due this frame
+        let mut capture_due = false;
+        while self
+            .pending_captures
+            .front()
+            .is_some_and(|&f| self.sim_frame_index >= f)
+        {
+            self.pending_captures.pop_front();
+            capture_due = true;
+        }
+        let capture = if capture_due {
+            let unpadded_bytes_per_row = gpu.config.width * 4;
+            let padded_bytes_per_row = unpadded_bytes_per_row
+                .div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+                * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Capture Readback"),
+                size: padded_bytes_per_row as u64 * gpu.config.height as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            Some((buffer, padded_bytes_per_row))
+        } else {
+            None
+        };
 
         // Integrate rigid body on CPU
         if self.state.rigid_body.enabled && !self.state.rigid_body.held && !self.state.simulation.paused {
@@ -1208,7 +1345,8 @@ impl App {
                             ripple_strength: self.state.rendering.ripple_strength,
                             clarity: self.state.rendering.water_clarity,
                             _pad1: self.state.rendering.ss_debug_view as f32,
-                            _pad2: 0.0, _pad3: 0.0,
+                            foam_coverage: 1.0,
+                            aeration_strength: 1.0,
                         };
                         ss_renderer.update_water_params(&gpu.queue, &water_params);
                         let env_params = self.state.environment.to_gpu_params();
@@ -1273,6 +1411,8 @@ impl App {
                             &self.state.rendering.deep_water_color,
                             self.state.rendering.ripple_strength,
                             self.state.rendering.water_clarity,
+                            self.state.spray.foam_coverage,
+                            self.state.spray.aeration_strength,
                         );
                         let env_params = self.state.environment.to_gpu_params();
                         mc_renderer.update_env_params(&gpu.queue, &env_params);
@@ -1336,6 +1476,16 @@ impl App {
                             sph_sim.num_particles(),
                             self.state.rendering.mc_anisotropy,
                         );
+                        // Splat foam into the density field the water shader
+                        // composites (cleared even when spray is off so no
+                        // stale foam lingers on the surface)
+                        if let Some(spray_renderer) = &self.spray_renderer {
+                            spray_renderer.render_foam_density(
+                                &mut encoder,
+                                mc_renderer.foam_density_view(),
+                                self.state.spray.enabled,
+                            );
+                        }
                         // Pass rigid body renderer into MC pass for proper MSAA depth testing
                         let rb_for_mc = if self.state.rigid_body.enabled {
                             self.rigid_body_renderer.as_ref()
@@ -1523,6 +1673,31 @@ impl App {
         }
         }
 
+        // Capture the scene as rendered so far (everything except the GUI)
+        if let Some((buffer, padded_bytes_per_row)) = &capture {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &output.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(*padded_bytes_per_row),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: gpu.config.width,
+                    height: gpu.config.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
         // Render egui
         let egui_renderer = self.egui_renderer.as_mut().unwrap();
         let window = self.window.as_ref().unwrap();
@@ -1576,6 +1751,63 @@ impl App {
             }
         }
 
+        // Finish any pending capture (map readback, write PNG)
+        if let Some((buffer, padded_bytes_per_row)) = capture {
+            self.save_capture(&buffer, padded_bytes_per_row);
+        }
+
+        // Append a stats row for every simulated frame
+        if stepped && self.stats_file.is_some() {
+            let spray_counts = if self.state.spray.enabled {
+                let device = &self.gpu.as_ref().unwrap().device;
+                self.spray_system
+                    .as_ref()
+                    .map_or([0; 4], |s| s.read_stats(device))
+            } else {
+                [0; 4]
+            };
+            let mc_vertices = if self.state.rendering.render_mode == FluidRenderMode::MarchingCubes
+            {
+                self.mc_renderer.as_ref().map_or(0, |mc| mc.vertex_count())
+            } else {
+                0
+            };
+            let row = format!(
+                "{},{:.4},{},{},{},{},{},{},{:.1},{:.4},{:.4}\n",
+                self.sim_frame_index,
+                self.sim_time,
+                self.state.runtime.particle_count,
+                mc_vertices,
+                spray_counts[0],
+                spray_counts[1],
+                spray_counts[2],
+                spray_counts[3],
+                self.state.runtime.fps,
+                self.state.runtime.spray_ta_limit,
+                self.state.runtime.spray_wc_limit,
+            );
+            let file = self.stats_file.as_mut().unwrap();
+            let _ = file.write_all(row.as_bytes());
+            let _ = file.flush();
+        }
+
+        // Automation exit: leave once every requested milestone is reached
+        if self.launch.is_automated() && !self.launch.stay && !self.should_exit {
+            let captures_done = self.pending_captures.is_empty();
+            let exit_frame_reached = self
+                .launch
+                .exit_after
+                .is_none_or(|n| self.sim_frame_index >= n);
+            let has_milestone = self.had_captures || self.launch.exit_after.is_some();
+            if has_milestone && captures_done && exit_frame_reached {
+                println!(
+                    "Automation milestones reached at frame {} — exiting",
+                    self.sim_frame_index
+                );
+                self.should_exit = true;
+            }
+        }
+
         // Handle GUI actions after rendering
         match gui_action {
             GuiAction::ResetSimulation => self.reset_simulation(),
@@ -1589,7 +1821,77 @@ impl App {
                     );
                 }
             }
+            GuiAction::ExportConfig => self.export_config(),
             GuiAction::None => {}
+        }
+    }
+
+    /// Map a completed swapchain readback and write it out as a PNG named
+    /// after the current simulation frame.
+    fn save_capture(&self, buffer: &wgpu::Buffer, padded_bytes_per_row: u32) {
+        let gpu = self.gpu.as_ref().unwrap();
+        let (width, height) = (gpu.config.width, gpu.config.height);
+
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        {
+            let data = slice.get_mapped_range();
+            for row in 0..height {
+                let start = (row * padded_bytes_per_row) as usize;
+                pixels.extend_from_slice(&data[start..start + (width * 4) as usize]);
+            }
+        }
+        buffer.unmap();
+
+        // Swapchain is BGRA on most Windows backends; PNG expects RGBA.
+        // Alpha is meaningless post-composite, so force opaque.
+        let swap_bgra = matches!(
+            gpu.config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        for px in pixels.chunks_exact_mut(4) {
+            if swap_bgra {
+                px.swap(0, 2);
+            }
+            px[3] = 255;
+        }
+
+        let path = self
+            .launch
+            .out_dir
+            .join(format!("frame_{:05}.png", self.sim_frame_index));
+        match image::RgbaImage::from_raw(width, height, pixels) {
+            Some(img) => match img.save(&path) {
+                Ok(()) => println!("Captured {}", path.display()),
+                Err(e) => eprintln!("error: failed to save capture {}: {e}", path.display()),
+            },
+            None => eprintln!("error: capture buffer size mismatch"),
+        }
+    }
+
+    /// Write the current state (including the live camera pose) to
+    /// configs/export_NNN.json.
+    fn export_config(&mut self) {
+        // Sync the live camera back into the serializable config
+        self.state.camera.distance = self.camera.distance;
+        self.state.camera.yaw = self.camera.yaw;
+        self.state.camera.pitch = self.camera.pitch;
+        self.state.camera.target = self.camera.target;
+        self.state.camera.fov = self.camera.fov;
+
+        match crate::launch::export_config(&self.state) {
+            Ok(path) => {
+                let display = path.display().to_string();
+                println!("Exported config to {display}");
+                self.state.runtime.last_export = Some(display);
+            }
+            Err(e) => {
+                eprintln!("error: config export failed: {e}");
+                self.state.runtime.last_export = Some(format!("export failed: {e}"));
+            }
         }
     }
 }

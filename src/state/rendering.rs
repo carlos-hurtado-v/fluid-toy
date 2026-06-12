@@ -1,7 +1,7 @@
 //! Rendering, environment, lighting, and quality configuration
 
 /// Fluid render mode selection
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FluidRenderMode {
     /// Simple particle spheres (fast, debug-friendly)
     Particles,
@@ -18,7 +18,7 @@ impl Default for FluidRenderMode {
 }
 
 /// Marching cubes grid resolution presets
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum McGridResolution {
     /// 80³ voxels — fast, lower surface detail
     Low,
@@ -55,21 +55,22 @@ impl Default for McGridResolution {
 }
 
 /// Which HDR environment map to use
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HdrEnvironment {
     Farmland,
     PureSky,
 }
 
 /// Whether background shows solid color or HDR environment
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackgroundMode {
     SolidColor,
     Environment,
 }
 
 /// Environment/background configuration (unified for all modes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct EnvironmentConfig {
     /// Whether to show solid color or HDR environment as background
     pub background_mode: BackgroundMode,
@@ -84,9 +85,11 @@ pub struct EnvironmentConfig {
 impl Default for EnvironmentConfig {
     fn default() -> Self {
         Self {
-            background_mode: BackgroundMode::Environment,
-            background_color: [0.02, 0.02, 0.05],
-            hdr_selection: HdrEnvironment::Farmland,
+            background_mode: BackgroundMode::SolidColor,
+            // Neutral gray (sRGB 102/109/106) — reads foam/water contrast
+            // better than black or a sky backdrop
+            background_color: [0.132, 0.153, 0.143],
+            hdr_selection: HdrEnvironment::PureSky,
             environment_intensity: 1.0,
         }
     }
@@ -113,7 +116,8 @@ impl EnvironmentConfig {
 }
 
 /// Lighting configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct LightingConfig {
     /// Enable directional light (sun)
     pub sun_enabled: bool,
@@ -130,7 +134,7 @@ impl Default for LightingConfig {
         // Default sun position: upper-right-front, warm sunlight color
         Self {
             sun_enabled: true,
-            sun_direction: [0.4, 0.8, 0.3],  // ~55° elevation, visible specular highlights
+            sun_direction: [0.6, 0.5, 0.3],  // lower sun, longer specular streaks
             sun_color: [0.98, 0.82, 0.6],    // Warm white sunlight
             sun_intensity: 2.0,
         }
@@ -168,7 +172,8 @@ impl LightingConfig {
 }
 
 /// Rendering configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RenderConfig {
     /// Particle radius in normalized coordinates
     pub particle_radius: f32,
@@ -232,16 +237,16 @@ impl Default for RenderConfig {
             particle_color: [0.08, 0.22, 0.34],
             color_by_velocity: true,
             render_mode: FluidRenderMode::MarchingCubes,
-            mc_threshold: 0.75,
+            mc_threshold: 0.9,
             mc_density_radius_scale: 1.0,
             mc_anisotropy: true,
             mc_anisotropy_strength: 1.0,
-            refraction_strength: 0.050,
+            refraction_strength: 0.045,
             deep_water_color: [0.005, 0.03, 0.08],
             mc_blur_radius: 1,
-            water_roughness: 0.090,
-            ripple_strength: 0.015,
-            water_clarity: 0.5,
+            water_roughness: 0.1,
+            ripple_strength: 0.011,
+            water_clarity: 0.25,
             ssr_enabled: true,
             mc_grid_resolution: McGridResolution::default(),
             ss_radius_scale: 0.6,
@@ -293,7 +298,7 @@ impl RenderConfig {
 }
 
 /// MSAA sample count options
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MsaaSamples {
     Off = 1,
     X2 = 2,
@@ -317,7 +322,8 @@ impl MsaaSamples {
 }
 
 /// Quality settings for rendering
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct QualityConfig {
     /// MSAA sample count
     pub msaa: MsaaSamples,
@@ -328,8 +334,8 @@ pub struct QualityConfig {
 impl Default for QualityConfig {
     fn default() -> Self {
         Self {
-            msaa: MsaaSamples::X4,  // 4x MSAA by default
-            fxaa_enabled: true,     // FXAA enabled by default
+            msaa: MsaaSamples::X4, // 4x MSAA by default
+            fxaa_enabled: true,    // calms fine-grained foam shimmer in motion
         }
     }
 }

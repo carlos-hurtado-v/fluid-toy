@@ -1,7 +1,8 @@
 //! Simulation physics configuration — SPH, container, and time stepping
 
 /// Simulation parameters - physics configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SimulationConfig {
     /// Simulation speed multiplier (1.0 = real-time at 60fps)
     pub simulation_speed: f32,
@@ -29,9 +30,15 @@ impl Default for SimulationConfig {
             damping: 0.55,        // Energy retained on wall bounce
             paused: false,
             max_particles: 200_000,
-            initial_cube_size: 40, // 40×40×40 = 64,000 particles
+            initial_cube_size: 58, // 58×58×58 = 195,112 particles
             substeps: 6,
-            pcisph_iterations: 5,
+            // 5 iterations never settles in a tilted tank: the predictor has
+            // no walls, so contact pressure overshoots and the surplus kick
+            // along the tilted floor normal pumps a tangential slosh mode
+            // (measured: i5 = 45% MC-vertex spread + 72k whitewater at f900;
+            // i4 = 3.3% + 69). Until prediction is wall-aware, 4 is the
+            // stable operating point.
+            pcisph_iterations: 4,
         }
     }
 }
@@ -59,7 +66,7 @@ impl SimulationConfig {
 }
 
 /// Container visual style
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContainerStyle {
     Wireframe,
     OpaquePool,
@@ -72,7 +79,8 @@ impl Default for ContainerStyle {
 }
 
 /// Container configuration - defines the fluid container
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ContainerConfig {
     /// Container width (X axis, centered at 0)
     pub width: f32,
@@ -107,7 +115,7 @@ pub struct ContainerConfig {
 impl Default for ContainerConfig {
     fn default() -> Self {
         Self {
-            width: 1.8,          // Full X dimension (-0.9 to +0.9)
+            width: 2.22,         // Full X dimension (-1.11 to +1.11)
             depth: 1.8,          // Full Z dimension (-0.9 to +0.9)
             floor_y: -0.9,       // Floor at bottom
             height: 1.8,         // Extends to +0.9
@@ -259,7 +267,8 @@ impl ContainerConfig {
 }
 
 /// SPH physics configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SphConfig {
     /// Kernel support radius
     pub kernel_radius: f32,
@@ -282,14 +291,14 @@ pub struct SphConfig {
 impl Default for SphConfig {
     fn default() -> Self {
         Self {
-            kernel_radius: 0.045,
+            kernel_radius: 0.035,
             stiffness: 35.0,
-            near_stiffness: 1.10,
+            near_stiffness: 0.7,
             viscosity: 0.70,
             mass: 1.0,
-            surface_tension: 0.003,
-            wall_stiffness: 225.0,
-            xsph_epsilon: 0.300,
+            surface_tension: 0.005,
+            wall_stiffness: 200.0,
+            xsph_epsilon: 0.305,
         }
     }
 }

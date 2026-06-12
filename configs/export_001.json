@@ -1,0 +1,201 @@
+{
+  "simulation": {
+    "simulation_speed": 1.0,
+    "gravity": 9.8,
+    "damping": 0.55,
+    "paused": false,
+    "max_particles": 200000,
+    "initial_cube_size": 58,
+    "substeps": 6,
+    "pcisph_iterations": 4
+  },
+  "container": {
+    "width": 2.22,
+    "depth": 1.8,
+    "floor_y": -0.9,
+    "height": 1.8,
+    "tilt_x": 0.0,
+    "tilt_z": 0.0,
+    "tilt_x_target": 0.0,
+    "tilt_z_target": 0.0,
+    "style": "Wireframe",
+    "tile_color": [
+      0.15,
+      0.35,
+      0.55
+    ],
+    "grout_color": [
+      0.08,
+      0.1,
+      0.14
+    ],
+    "tile_scale": 20.0,
+    "grout_width": 0.04,
+    "specular_strength": 0.5
+  },
+  "sph": {
+    "kernel_radius": 0.035,
+    "stiffness": 35.0,
+    "near_stiffness": 0.7,
+    "viscosity": 0.7,
+    "mass": 1.0,
+    "surface_tension": 0.005,
+    "wall_stiffness": 200.0,
+    "xsph_epsilon": 0.305
+  },
+  "rendering": {
+    "particle_radius": 0.02,
+    "particle_color": [
+      0.08,
+      0.21999992,
+      0.34
+    ],
+    "color_by_velocity": true,
+    "render_mode": "MarchingCubes",
+    "mc_threshold": 0.9,
+    "mc_density_radius_scale": 1.0,
+    "mc_anisotropy": true,
+    "mc_anisotropy_strength": 1.0,
+    "refraction_strength": 0.045,
+    "deep_water_color": [
+      0.005,
+      0.029999975,
+      0.08
+    ],
+    "mc_blur_radius": 1,
+    "water_roughness": 0.1,
+    "ripple_strength": 0.011,
+    "water_clarity": 0.25,
+    "ssr_enabled": true,
+    "mc_grid_resolution": "High",
+    "ss_radius_scale": 0.6,
+    "ss_filter_size": 12,
+    "ss_filter_iterations": 3,
+    "ss_debug_view": 0
+  },
+  "environment": {
+    "background_mode": "SolidColor",
+    "background_color": [
+      0.132,
+      0.153,
+      0.143
+    ],
+    "hdr_selection": "PureSky",
+    "environment_intensity": 1.0
+  },
+  "lighting": {
+    "sun_enabled": true,
+    "sun_direction": [
+      0.6,
+      0.5,
+      0.3
+    ],
+    "sun_color": [
+      0.98,
+      0.82,
+      0.6
+    ],
+    "sun_intensity": 2.0
+  },
+  "quality": {
+    "msaa": "X4",
+    "fxaa_enabled": true
+  },
+  "post_process": {
+    "enabled": true,
+    "exposure": 1.15,
+    "tonemapping_enabled": true,
+    "saturation": 1.15,
+    "contrast": 1.05,
+    "brightness": 0.0,
+    "temperature": 0.0,
+    "vignette_enabled": true,
+    "vignette_intensity": 0.3,
+    "vignette_smoothness": 0.35,
+    "bloom_enabled": true,
+    "bloom_intensity": 0.4,
+    "bloom_threshold": 0.85,
+    "chromatic_aberration_enabled": true,
+    "chromatic_aberration_intensity": 0.006,
+    "streaks_enabled": true,
+    "streaks_intensity": 0.15,
+    "streaks_threshold": 0.75,
+    "streaks_tint": [
+      0.099999994,
+      0.17,
+      0.25
+    ],
+    "ao_enabled": true,
+    "ao_intensity": 0.8,
+    "ao_radius": 0.2,
+    "ao_debug_mode": "Off"
+  },
+  "camera": {
+    "distance": 3.0,
+    "yaw": 15.60988,
+    "pitch": 1.400796,
+    "target": [
+      0.0,
+      -0.3,
+      0.0
+    ],
+    "fov": 0.7853982
+  },
+  "rigid_body": {
+    "enabled": true,
+    "held": false,
+    "shape": "Sphere",
+    "position": [
+      0.14985573,
+      -0.31655404,
+      0.4271199
+    ],
+    "velocity": [
+      -0.021309596,
+      -0.0077909366,
+      -0.00083879975
+    ],
+    "orientation": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "angular_velocity": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "half_extent": 0.24,
+    "density": 10000.0,
+    "color": [
+      0.9,
+      0.7000001,
+      0.19999999
+    ]
+  },
+  "spray": {
+    "enabled": true,
+    "min_speed": 0.8,
+    "emission_rate": 30.0,
+    "lifetime": 2.5,
+    "lifetime_variation": 0.5,
+    "drag": 3.3,
+    "speed_multiplier": 0.85,
+    "velocity_jitter": 0.9,
+    "particle_size": 0.0015,
+    "max_particles": 100000,
+    "k_trapped_air": 1.3,
+    "k_wave_crest": 1.1,
+    "bubble_buoyancy": 2.5,
+    "bubble_drag": 0.7,
+    "bubbles_visible": true,
+    "foam_coverage": 0.45,
+    "aeration_strength": 1.25
+  },
+  "mouse_force": {
+    "mode": "Vortex",
+    "radius": 0.35,
+    "strength": 50.0
+  }
+}

@@ -1,6 +1,6 @@
 //! Post-processing configuration
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AoDebugMode {
     Off,
     RawAo,
@@ -26,7 +26,8 @@ impl AoDebugMode {
 }
 
 /// Post-processing settings
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PostProcessConfig {
     /// Master enable for all post-processing
     pub enabled: bool,
@@ -81,7 +82,7 @@ impl Default for PostProcessConfig {
             tonemapping_enabled: true,
 
             // Color grading
-            saturation: 1.2,
+            saturation: 1.15,
             contrast: 1.05,
             brightness: 0.0,
             temperature: 0.0,
@@ -108,7 +109,7 @@ impl Default for PostProcessConfig {
 
             // Ambient Occlusion
             ao_enabled: true,
-            ao_intensity: 1.5,
+            ao_intensity: 0.8,
             ao_radius: 0.2,
             ao_debug_mode: AoDebugMode::Off,
         }

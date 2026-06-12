@@ -12,8 +12,11 @@ pub use rendering::*;
 pub use rigid_body::*;
 pub use interaction::*;
 
-/// Complete application state - GUI binds to this
-#[derive(Debug, Clone)]
+/// Complete application state - GUI binds to this.
+/// Serializes to the JSON config format (`--config` / Export Config);
+/// runtime values are skipped. Missing sections/fields fall back to defaults.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct AppState {
     pub simulation: SimulationConfig,
     pub container: ContainerConfig,
@@ -27,6 +30,7 @@ pub struct AppState {
     pub rigid_body: RigidBodyConfig,
     pub spray: SprayConfig,
     pub mouse_force: MouseForceConfig,
+    #[serde(skip)]
     pub runtime: RuntimeState,
 }
 
@@ -51,7 +55,8 @@ impl Default for AppState {
 }
 
 /// Camera configuration for 3D viewing
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CameraConfig {
     /// Distance from target
     pub distance: f32,
@@ -94,6 +99,11 @@ pub struct RuntimeState {
     pub time_elapsed: f32,
     /// Frame counter for spray RNG seed
     pub frame_count: u32,
+    /// Path of the last Export Config write (GUI feedback)
+    pub last_export: Option<String>,
+    /// Live auto-calibrated whitewater potential ceilings (GUI readout)
+    pub spray_ta_limit: f32,
+    pub spray_wc_limit: f32,
 }
 
 impl Default for RuntimeState {
@@ -103,6 +113,9 @@ impl Default for RuntimeState {
             fps: 0.0,
             time_elapsed: 0.0,
             frame_count: 0,
+            last_export: None,
+            spray_ta_limit: 0.0,
+            spray_wc_limit: 0.0,
         }
     }
 }
