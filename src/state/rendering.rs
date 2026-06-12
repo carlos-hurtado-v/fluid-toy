@@ -200,9 +200,13 @@ pub struct RenderConfig {
     pub ssr_enabled: bool,
     /// Marching cubes grid resolution
     pub mc_grid_resolution: McGridResolution,
-    /// Screen-space billboard radius scale (multiplied by kernel_radius)
+    /// Screen-space billboard radius scale (multiplied by kernel_radius).
+    /// Particles sit at 0.6×kernel_radius spacing: 0.4 ≈ Splash's 0.67× spacing
+    /// (max splash detail, granular silhouettes), 0.6 ≈ 1× spacing (smoother,
+    /// fuller body — empirically reads more liquid at coarse particle counts).
     pub ss_radius_scale: f32,
-    /// Screen-space filter base radius (pixels, perspective-corrected at runtime)
+    /// Narrow-range filter size constant (Splash "blurFilterSize").
+    /// Filter pixel radius ≈ this × projected particle diameter × 0.05.
     pub ss_filter_size: u32,
     /// Screen-space 1D filter iterations (each = H + V pass). Plus 2D refinement.
     pub ss_filter_iterations: u32,
@@ -217,8 +221,8 @@ impl Default for RenderConfig {
             particle_color: [0.08, 0.22, 0.34],
             color_by_velocity: true,
             render_mode: FluidRenderMode::MarchingCubes,
-            mc_threshold: 0.65,
-            mc_density_radius_scale: 2.0,
+            mc_threshold: 0.75,
+            mc_density_radius_scale: 1.2,
             refraction_strength: 0.050,
             deep_water_color: [0.005, 0.03, 0.08],
             mc_blur_radius: 2,
@@ -227,9 +231,9 @@ impl Default for RenderConfig {
             water_clarity: 0.65,
             ssr_enabled: true,
             mc_grid_resolution: McGridResolution::default(),
-            ss_radius_scale: 3.0,
-            ss_filter_size: 40,
-            ss_filter_iterations: 2,
+            ss_radius_scale: 0.6,
+            ss_filter_size: 12,
+            ss_filter_iterations: 3,
             ss_debug_view: 0,
         }
     }

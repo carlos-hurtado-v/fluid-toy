@@ -6,6 +6,11 @@ use crate::state::{GpuContainerGeometry, GpuGravity, GpuMouseForce, GpuRigidBody
 use wgpu::util::DeviceExt;
 
 const WORKGROUP_SIZE: u32 = 64;
+/// Workgroup size for cell-indexed passes (grid_clear, prefix_sum). Larger than
+/// the particle passes because cell counts scale with 1/h³ and a 1D dispatch is
+/// capped at 65,535 workgroups — must match @workgroup_size in grid_clear.wgsl
+/// and prefix_sum.wgsl.
+const CELL_WORKGROUP_SIZE: u32 = 256;
 
 /// Grid parameters for spatial hashing
 #[repr(C)]
@@ -123,7 +128,12 @@ impl SphSimulation3DGrid {
         // The diagonal of a 1.5×1.5×1.5 half-box is 1.5*sqrt(3) ≈ 2.6.
         // With center_y offset and margin, 4.0 covers all cases.
         let cell_size = sph_params.kernel_radius;
-        let bounds_extent = 4.0f32;
+        // Grid coverage: container sliders max at 3.0 per dimension → half-extent
+        // 1.5, ~1.9 with tilt; ceiling reaches 2.1 at max height (floor −0.9).
+        // Keep this tight — cell count scales with (bounds/h)³, and out-of-grid
+        // particles (splash above the open top, max-height ceiling sliver) clamp
+        // into the boundary cell layer harmlessly (grid_build cell_to_index).
+        let bounds_extent = 2.0f32;
         let grid_size = ((2.0 * bounds_extent) / cell_size).ceil() as u32 + 2;
         let total_cells = grid_size * grid_size * grid_size;
 
@@ -1265,7 +1275,7 @@ impl SphSimulation3DGrid {
     /// Run one simulation step (single encoder, single submit).
     pub fn step(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let particle_workgroups = self.num_particles.div_ceil(WORKGROUP_SIZE);
-        let cell_workgroups = self.grid_params.total_cells.div_ceil(WORKGROUP_SIZE);
+        let cell_workgroups = self.grid_params.total_cells.div_ceil(CELL_WORKGROUP_SIZE);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("SPH Step Encoder"),

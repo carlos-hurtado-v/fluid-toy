@@ -11,7 +11,9 @@ struct PrefixSumParams {
 @group(0) @binding(1) var<storage, read_write> output: array<u32>;
 @group(0) @binding(2) var<uniform> params: PrefixSumParams;
 
-@compute @workgroup_size(64)
+// 256 = CELL_WORKGROUP_SIZE in sph_3d_grid.rs (cell counts scale with 1/h³;
+// keeps the 1D dispatch under the 65,535-workgroup limit at small kernel radii)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let i = global_id.x;
     if (i >= params.count) {

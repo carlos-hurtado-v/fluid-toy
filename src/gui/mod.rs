@@ -57,14 +57,14 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.label("Particle Settings (requires reset):");
 
                 ui.add(
-                    egui::Slider::new(&mut state.simulation.initial_cube_size, 5..=30)
+                    egui::Slider::new(&mut state.simulation.initial_cube_size, 5..=64)
                         .text("Initial Cube Size")
                 );
                 ui.label(format!("  = {} particles",
                     state.simulation.initial_cube_size.pow(3)));
 
                 ui.add(
-                    egui::Slider::new(&mut state.simulation.max_particles, 1000..=100_000)
+                    egui::Slider::new(&mut state.simulation.max_particles, 1000..=500_000)
                         .text("Max Particles")
                         .logarithmic(true)
                 );
@@ -376,7 +376,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     );
                     state.rendering.mc_blur_radius = blur_val as u32;
                     ui.add(
-                        egui::Slider::new(&mut state.rendering.mc_density_radius_scale, 1.2..=3.0)
+                        egui::Slider::new(&mut state.rendering.mc_density_radius_scale, 1.0..=3.0)
                             .text("Density Radius Scale")
                     );
                     ui.add(
@@ -408,12 +408,12 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add(
-                        egui::Slider::new(&mut state.rendering.ss_radius_scale, 0.5..=2.0)
+                        egui::Slider::new(&mut state.rendering.ss_radius_scale, 0.25..=1.0)
                             .text("Radius Scale")
                     );
                     let mut filter_size = state.rendering.ss_filter_size as i32;
                     ui.add(
-                        egui::Slider::new(&mut filter_size, 5..=100)
+                        egui::Slider::new(&mut filter_size, 4..=30)
                             .text("Filter Size")
                     );
                     state.rendering.ss_filter_size = filter_size as u32;

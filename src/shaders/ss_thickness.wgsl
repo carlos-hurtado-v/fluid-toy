@@ -20,6 +20,10 @@ struct SsParams {
     num_particles: u32,
     screen_width: f32,
     screen_height: f32,
+    thickness_scale: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 struct SphParticle3D {
@@ -81,8 +85,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Hemispherical thickness profile: full sphere diameter at center, zero at edge
-    // thickness = 2 * R * sqrt(1 - r²), normalized by factor for plausible accumulation
-    let thickness = 2.0 * ss_params.particle_radius * sqrt(1.0 - r_sq) / 8.0;
+    // Spherical thickness profile: the chord length through the sphere at this
+    // impact parameter, scaled by 1/volume-fraction (CPU-computed) so the ray's
+    // accumulated total ≈ true water depth in world units regardless of splat
+    // radius — matching the thickness scale MC derives from back-minus-front depth.
+    let thickness = 2.0 * ss_params.particle_radius * sqrt(1.0 - r_sq) * ss_params.thickness_scale;
     return vec4<f32>(thickness, 0.0, 0.0, 0.0);
 }

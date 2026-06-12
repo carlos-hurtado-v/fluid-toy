@@ -3,13 +3,18 @@
 //! Renders SPH particles as billboard quads, smooths depth via narrow-range filter
 //! (Truong & Yuksel i3D 2018), reconstructs normals, then composites with PBR water shading.
 //!
-//! Pipeline: depth splat → thickness splat → thickness blur → narrow-range filter → normals → composite
+//! Pipeline: depth splat → thickness splat (half-res) → thickness blur →
+//! narrow-range filter → normals → opaque scene to background (env + container +
+//! rigid body + spray, with depth) → depth-aware composite (water or scene per pixel)
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::render::camera::GpuCameraParams;
+use crate::render::container_renderer::ContainerRenderer;
 use crate::render::marching_cubes::GpuWaterParams;
+use crate::render::rigid_body_renderer::RigidBodyRenderer;
+use crate::render::spray_renderer::SprayRenderer;
 use crate::state::{GpuLightParams, GpuShCoefficients};
 
 // ─── GPU uniform structs ───────────────────────────────────────────────────
@@ -21,6 +26,10 @@ struct GpuSsParams {
     num_particles: u32,
     screen_width: f32,
     screen_height: f32,
+    thickness_scale: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 #[repr(C)]
@@ -104,6 +113,8 @@ pub struct ScreenSpaceFluidRenderer {
     normal_view: wgpu::TextureView,
     background_texture: wgpu::Texture,
     background_view: wgpu::TextureView,
+    background_depth_texture: wgpu::Texture,
+    background_depth_view: wgpu::TextureView,
 
     // Uniform buffers
     ss_params_buffer: wgpu::Buffer,
@@ -187,15 +198,18 @@ impl ScreenSpaceFluidRenderer {
             wgpu::TextureFormat::R32Float, storage_tex_usage | wgpu::TextureUsages::RENDER_ATTACHMENT);
         let filtered_depth_view = filtered_depth_texture.create_view(&Default::default());
 
-        let thickness_texture = create_texture(device, "SS Thickness", width, height,
+        // Thickness is splatted and blurred at half resolution (Splash parity) —
+        // it's naturally low-frequency, and this quarters the splat fill cost.
+        let (thick_w, thick_h) = ((width / 2).max(1), (height / 2).max(1));
+        let thickness_texture = create_texture(device, "SS Thickness", thick_w, thick_h,
             wgpu::TextureFormat::Rgba16Float, tex_usage);
         let thickness_view = thickness_texture.create_view(&Default::default());
 
-        let filtered_thickness_a = create_texture(device, "SS Filt Thick A", width, height,
+        let filtered_thickness_a = create_texture(device, "SS Filt Thick A", thick_w, thick_h,
             wgpu::TextureFormat::Rgba16Float, storage_tex_usage);
         let filtered_thickness_a_view = filtered_thickness_a.create_view(&Default::default());
 
-        let filtered_thickness_b = create_texture(device, "SS Filt Thick B", width, height,
+        let filtered_thickness_b = create_texture(device, "SS Filt Thick B", thick_w, thick_h,
             wgpu::TextureFormat::Rgba16Float, storage_tex_usage);
         let filtered_thickness_b_view = filtered_thickness_b.create_view(&Default::default());
 
@@ -206,6 +220,11 @@ impl ScreenSpaceFluidRenderer {
         let background_texture = create_texture(device, "SS Background", width, height,
             surface_format, tex_usage);
         let background_view = background_texture.create_view(&Default::default());
+
+        let background_depth_texture = create_texture(device, "SS Background Depth", width, height,
+            wgpu::TextureFormat::Depth32Float,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
+        let background_depth_view = background_depth_texture.create_view(&Default::default());
 
         // ── Sampler ───────────────────────────────────────────────────────
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -223,6 +242,8 @@ impl ScreenSpaceFluidRenderer {
                 num_particles: 0,
                 screen_width: width as f32,
                 screen_height: height as f32,
+                thickness_scale: 1.0,
+                _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -290,14 +311,14 @@ impl ScreenSpaceFluidRenderer {
         let thickness_blur_h_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SS Thick Blur H"),
             contents: bytemuck::bytes_of(&GpuThicknessBlurParams {
-                screen_width: width, screen_height: height, radius: 10, direction: 0,
+                screen_width: thick_w, screen_height: thick_h, radius: 10, direction: 0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let thickness_blur_v_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SS Thick Blur V"),
             contents: bytemuck::bytes_of(&GpuThicknessBlurParams {
-                screen_width: width, screen_height: height, radius: 10, direction: 1,
+                screen_width: thick_w, screen_height: thick_h, radius: 10, direction: 1,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -530,7 +551,8 @@ impl ScreenSpaceFluidRenderer {
             ],
         });
 
-        // Composite texture BGL (group 1): filtered_depth, filtered_thickness, normals, background, env, sampler
+        // Composite texture BGL (group 1): filtered_depth, filtered_thickness (half-res,
+        // sampled), normals, background color, env, sampler, background depth
         let composite_texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("SS Composite Texture BGL"),
             entries: &[
@@ -548,7 +570,7 @@ impl ScreenSpaceFluidRenderer {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -588,6 +610,16 @@ impl ScreenSpaceFluidRenderer {
                     binding: 5,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -838,7 +870,9 @@ impl ScreenSpaceFluidRenderer {
             cache: None,
         });
 
-        // Environment background pipeline (reuses mc_environment.wgsl)
+        // Environment background pipeline (reuses mc_environment.wgsl).
+        // Draws into the background pass (color + depth) at the far plane,
+        // before container/rigid body/spray — same depth state as MC's env pass.
         let env_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("SS Env PL"),
             bind_group_layouts: &[&env_bgl],
@@ -867,7 +901,13 @@ impl ScreenSpaceFluidRenderer {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 ..Default::default()
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual, // fullscreen at far plane
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
             multisample: Default::default(),
             multiview: None,
             cache: None,
@@ -910,7 +950,7 @@ impl ScreenSpaceFluidRenderer {
 
         let composite_texture_bg = Self::create_composite_texture_bg(
             device, &composite_texture_bgl, &depth_view, &filtered_thickness_b_view,
-            &normal_view, &background_view, env_view, &sampler,
+            &normal_view, &background_view, env_view, &sampler, &background_depth_view,
         );
 
         let env_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -934,6 +974,7 @@ impl ScreenSpaceFluidRenderer {
             filtered_thickness_b, filtered_thickness_b_view,
             normal_texture, normal_view,
             background_texture, background_view,
+            background_depth_texture, background_depth_view,
             ss_params_buffer, camera_buffer, water_params_buffer,
             light_params_buffer, sh_coefficients_buffer,
             filter_params_h_buffer, filter_params_v_buffer,
@@ -1000,6 +1041,7 @@ impl ScreenSpaceFluidRenderer {
         background_view: &wgpu::TextureView,
         env_view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
+        background_depth_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SS Composite Texture BG"),
@@ -1011,6 +1053,7 @@ impl ScreenSpaceFluidRenderer {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(background_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(env_view) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(background_depth_view) },
             ],
         })
     }
@@ -1070,6 +1113,7 @@ impl ScreenSpaceFluidRenderer {
             device, &self.composite_texture_bgl,
             &self.depth_view, &self.filtered_thickness_b_view,
             &self.normal_view, &self.background_view, env_view, &self.sampler,
+            &self.background_depth_view,
         );
         self.env_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SS Env BG"),
@@ -1106,13 +1150,14 @@ impl ScreenSpaceFluidRenderer {
             storage_tex_usage | wgpu::TextureUsages::RENDER_ATTACHMENT);
         self.filtered_depth_view = self.filtered_depth_texture.create_view(&Default::default());
 
-        self.thickness_texture = create_texture(device, "SS Thickness", w, h, wgpu::TextureFormat::Rgba16Float, tex_usage);
+        let (thick_w, thick_h) = ((w / 2).max(1), (h / 2).max(1));
+        self.thickness_texture = create_texture(device, "SS Thickness", thick_w, thick_h, wgpu::TextureFormat::Rgba16Float, tex_usage);
         self.thickness_view = self.thickness_texture.create_view(&Default::default());
 
-        self.filtered_thickness_a = create_texture(device, "SS Filt Thick A", w, h, wgpu::TextureFormat::Rgba16Float, storage_tex_usage);
+        self.filtered_thickness_a = create_texture(device, "SS Filt Thick A", thick_w, thick_h, wgpu::TextureFormat::Rgba16Float, storage_tex_usage);
         self.filtered_thickness_a_view = self.filtered_thickness_a.create_view(&Default::default());
 
-        self.filtered_thickness_b = create_texture(device, "SS Filt Thick B", w, h, wgpu::TextureFormat::Rgba16Float, storage_tex_usage);
+        self.filtered_thickness_b = create_texture(device, "SS Filt Thick B", thick_w, thick_h, wgpu::TextureFormat::Rgba16Float, storage_tex_usage);
         self.filtered_thickness_b_view = self.filtered_thickness_b.create_view(&Default::default());
 
         self.normal_texture = create_texture(device, "SS Normals", w, h, wgpu::TextureFormat::Rgba16Float, storage_tex_usage);
@@ -1120,6 +1165,11 @@ impl ScreenSpaceFluidRenderer {
 
         self.background_texture = create_texture(device, "SS Background", w, h, self.surface_format, tex_usage);
         self.background_view = self.background_texture.create_view(&Default::default());
+
+        self.background_depth_texture = create_texture(device, "SS Background Depth", w, h,
+            wgpu::TextureFormat::Depth32Float,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
+        self.background_depth_view = self.background_depth_texture.create_view(&Default::default());
 
         // Rebuild all bind groups that reference textures
         self.filter_h_bg = Self::create_filter_bg(device, &self.filter_bgl, &self.filter_params_h_buffer, &self.depth_view, &self.filtered_depth_view);
@@ -1143,6 +1193,7 @@ impl ScreenSpaceFluidRenderer {
             device, &self.composite_texture_bgl,
             &self.depth_view, &self.filtered_thickness_b_view,
             &self.normal_view, &self.background_view, env_view, &self.sampler,
+            &self.background_depth_view,
         );
         self.env_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SS Env BG"),
@@ -1157,6 +1208,8 @@ impl ScreenSpaceFluidRenderer {
     }
 
     /// Main render method: runs all passes.
+    /// `rigid_body`/`spray`/`container` are drawn into the background (with depth)
+    /// so the water refracts and occludes against them, mirroring the MC renderer.
     pub fn render(
         &self,
         device: &wgpu::Device,
@@ -1167,11 +1220,23 @@ impl ScreenSpaceFluidRenderer {
         num_particles: u32,
         camera_params: &GpuCameraParams,
         particle_radius: f32,
-        _filter_size: u32,
+        particle_spacing: f32,
+        filter_size: u32,
         filter_iterations: u32,
         fov_y: f32,
+        rigid_body: Option<&RigidBodyRenderer>,
+        spray: Option<&SprayRenderer>,
+        container: Option<&ContainerRenderer>,
     ) {
         if num_particles == 0 { return; }
+
+        // Each thickness splat adds its chord length, so a ray's accumulated
+        // thickness ≈ splat volume fraction × true water depth. Dividing by that
+        // fraction ((4/3)πr³ per spacing³ cell) keeps thickness ≈ world-unit depth
+        // regardless of the radius-scale slider (absorption stays consistent).
+        let splat_volume_fraction = (4.0 / 3.0) * std::f32::consts::PI
+            * particle_radius.powi(3) / particle_spacing.powi(3).max(1e-9);
+        let thickness_scale = (1.0 / splat_volume_fraction).clamp(0.05, 4.0);
 
         // Update per-frame uniforms
         queue.write_buffer(&self.ss_params_buffer, 0, bytemuck::bytes_of(&GpuSsParams {
@@ -1179,13 +1244,15 @@ impl ScreenSpaceFluidRenderer {
             num_particles,
             screen_width: self.width as f32,
             screen_height: self.height as f32,
+            thickness_scale,
+            _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
         }));
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera_params));
 
         // Compute projectedParticleConstant (Splash formula)
         // projectedParticleConstant = (blurFilterSize * diameter * 0.05 * height/2) / tan(fov/2)
         let diameter = 2.0 * particle_radius;
-        let blur_filter_size = 12.0_f32; // Splash constant
+        let blur_filter_size = filter_size.max(1) as f32; // GUI "Filter Size" (Splash default: 12)
         let projected_particle_constant = (blur_filter_size * diameter * 0.05
             * (self.height as f32 / 2.0)) / (fov_y / 2.0).tan();
         let max_filter_size = 50.0_f32;
@@ -1217,12 +1284,13 @@ impl ScreenSpaceFluidRenderer {
         queue.write_buffer(&self.filter_params_2d_buffer, 0, bytemuck::bytes_of(&filter_2d));
         queue.write_buffer(&self.filter_params_2d_back_buffer, 0, bytemuck::bytes_of(&filter_2d));
 
-        // Update thickness blur params
+        // Update thickness blur params (thickness runs at half resolution)
+        let (thick_w, thick_h) = ((self.width / 2).max(1), (self.height / 2).max(1));
         queue.write_buffer(&self.thickness_blur_h_buffer, 0, bytemuck::bytes_of(&GpuThicknessBlurParams {
-            screen_width: self.width, screen_height: self.height, radius: 10, direction: 0,
+            screen_width: thick_w, screen_height: thick_h, radius: 10, direction: 0,
         }));
         queue.write_buffer(&self.thickness_blur_v_buffer, 0, bytemuck::bytes_of(&GpuThicknessBlurParams {
-            screen_width: self.width, screen_height: self.height, radius: 10, direction: 1,
+            screen_width: thick_w, screen_height: thick_h, radius: 10, direction: 1,
         }));
 
         // Update normal params
@@ -1243,6 +1311,8 @@ impl ScreenSpaceFluidRenderer {
 
         let wg_x = (self.width + 15) / 16;
         let wg_y = (self.height + 15) / 16;
+        let wg_tx = (thick_w + 15) / 16;
+        let wg_ty = (thick_h + 15) / 16;
 
         // ── Pass 1: Depth splatting ───────────────────────────────────────
         {
@@ -1295,7 +1365,7 @@ impl ScreenSpaceFluidRenderer {
             pass.draw(0..6, 0..num_particles);
         }
 
-        // ── Pass 3: Thickness blur (H then V) ────────────────────────────
+        // ── Pass 3: Thickness blur (H then V, half resolution) ───────────
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("SS Thick Blur H"),
@@ -1303,7 +1373,7 @@ impl ScreenSpaceFluidRenderer {
             });
             pass.set_pipeline(&self.thickness_blur_pipeline);
             pass.set_bind_group(0, &self.thickness_blur_h_bg, &[]);
-            pass.dispatch_workgroups(wg_x, wg_y, 1);
+            pass.dispatch_workgroups(wg_tx, wg_ty, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1312,7 +1382,7 @@ impl ScreenSpaceFluidRenderer {
             });
             pass.set_pipeline(&self.thickness_blur_pipeline);
             pass.set_bind_group(0, &self.thickness_blur_v_bg, &[]);
-            pass.dispatch_workgroups(wg_x, wg_y, 1);
+            pass.dispatch_workgroups(wg_tx, wg_ty, 1);
         }
 
         // ── Pass 4: Narrow-range filter (Truong & Yuksel, matching Splash) ──
@@ -1375,10 +1445,13 @@ impl ScreenSpaceFluidRenderer {
             pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
-        // ── Background pass: render environment to background_texture ─────
+        // ── Background pass: opaque scene to background_texture (+ depth) ─
+        // Environment at the far plane, then container, rigid body, and spray
+        // with depth testing — mirrors the MC renderer's background pass. The
+        // composite refracts this texture and depth-tests the water against it.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("SS Env Background"),
+                label: Some("SS Scene Background"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.background_view,
                     resolve_target: None,
@@ -1388,38 +1461,33 @@ impl ScreenSpaceFluidRenderer {
                     },
                     depth_slice: None,
                 })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.env_pipeline);
-            pass.set_bind_group(0, &self.env_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
-
-        // ── Render environment to output_view (base layer for non-water pixels) ──
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("SS Env to Output"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: output_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.background_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.env_pipeline);
             pass.set_bind_group(0, &self.env_bg, &[]);
             pass.draw(0..3, 0..1);
+
+            if let Some(rb) = rigid_body {
+                rb.render(&mut pass);
+            }
+            if let Some(ct) = container {
+                ct.render(&mut pass);
+            }
+            if let Some(sp) = spray {
+                sp.render(&mut pass);
+            }
         }
 
-        // ── Pass 6: Composite water shading ───────────────────────────────
+        // ── Pass 6: Composite (sole writer of the output view) ────────────
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("SS Composite"),
@@ -1427,7 +1495,7 @@ impl ScreenSpaceFluidRenderer {
                     view: output_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,

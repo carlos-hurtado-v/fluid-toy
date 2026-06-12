@@ -1,6 +1,10 @@
 // Screen-space fluid rendering — Composition / Water Shading
-// Fullscreen quad that reads filtered depth, thickness, and normals,
-// then applies the same PBR water shading as mc_render.wgsl.
+// Fullscreen pass that reads filtered depth, thickness, normals, and the
+// pre-rendered opaque scene (environment + container + rigid body + spray,
+// with depth), then applies the same PBR water shading as mc_render.wgsl.
+// Writes every pixel: water shading where the water surface is the nearest
+// thing, the opaque scene elsewhere. Refraction samples the scene texture,
+// so submerged objects are visible through the water.
 // Outputs linear HDR — post-process pipeline handles tonemapping.
 
 struct CameraParams {
@@ -54,11 +58,12 @@ struct LightParams {
 
 // Group 1: screen-space textures
 @group(1) @binding(0) var filtered_depth_tex: texture_2d<f32>;
-@group(1) @binding(1) var filtered_thickness_tex: texture_2d<f32>;
+@group(1) @binding(1) var filtered_thickness_tex: texture_2d<f32>;  // half resolution
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
-@group(1) @binding(3) var background_tex: texture_2d<f32>;
+@group(1) @binding(3) var background_tex: texture_2d<f32>;          // opaque scene color
 @group(1) @binding(4) var env_tex: texture_2d<f32>;
 @group(1) @binding(5) var tex_sampler: sampler;
+@group(1) @binding(6) var background_depth_tex: texture_depth_2d;   // opaque scene depth
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -149,12 +154,32 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     // Read screen-space buffers
     let normal_sample = textureLoad(normal_tex, coord, 0);
     let linear_depth = textureLoad(filtered_depth_tex, coord, 0).r;
-    let thickness = textureLoad(filtered_thickness_tex, coord, 0).r;
+    // Thickness buffer is half resolution — bilinear upsample
+    let thickness = textureSampleLevel(filtered_thickness_tex, tex_sampler, input.uv, 0.0).r;
+    // Opaque scene rendered before the water (env + container + rigid body + spray)
+    let scene_color = textureSampleLevel(background_tex, tex_sampler, input.uv, 0.0).rgb;
+    let scene_depth = textureLoad(background_depth_tex, coord, 0);
+
+    // Water surface hardware depth (for occlusion against the opaque scene)
+    let view_z = -linear_depth;
+    let water_hw_depth = clamp(
+        (camera.projection[2][2] * view_z + camera.projection[3][2]) / (-view_z),
+        0.0, 1.0);
+
+    let min_thickness = 0.001;
+    // Water shades this pixel only if it exists here and no opaque object is in front
+    let has_water = linear_depth > 0.0 && thickness >= min_thickness
+        && water_hw_depth < scene_depth;
 
     // Debug visualization modes
     let debug = u32(water.debug_mode);
     if (debug > 0u) {
-        if (linear_depth <= 0.0) { discard; }
+        var out: FragOutput;
+        if (linear_depth <= 0.0) {
+            out.color = vec4<f32>(scene_color, 1.0);
+            out.depth = scene_depth;
+            return out;
+        }
         var dbg: vec3<f32>;
         if (debug == 1u) {
             // Filtered depth: grayscale normalized to [0,1] over typical range
@@ -162,50 +187,34 @@ fn fs_main(input: VertexOutput) -> FragOutput {
             dbg = vec3<f32>(d, d, d);
         } else if (debug == 2u) {
             // Normals: view-space mapped to [0,1] RGB
-            if (normal_sample.w <= 0.0) { discard; }
-            dbg = normal_sample.xyz * 0.5 + 0.5;
+            dbg = select(vec3<f32>(0.0), normal_sample.xyz * 0.5 + 0.5, normal_sample.w > 0.0);
         } else if (debug == 3u) {
-            // Thickness: red channel scaled for visibility
-            let t = clamp(thickness * 20.0, 0.0, 1.0);
+            // Thickness: world units, red ramp (~1.5 units saturates)
+            let t = clamp(thickness * 1.5, 0.0, 1.0);
             dbg = vec3<f32>(t, t * 0.3, 0.0);
         } else {
-            // Thickness binary: shows where thickness > min_threshold
-            let has_thick = select(0.0, 1.0, thickness > 0.003);
+            // Coverage: where thickness (red) / normals (green) are valid
+            let has_thick = select(0.0, 1.0, thickness > min_thickness);
             let has_normal = select(0.0, 1.0, normal_sample.w > 0.0);
             dbg = vec3<f32>(has_thick, has_normal, 0.0);
         }
-        var out: FragOutput;
         out.color = vec4<f32>(dbg, 1.0);
         out.depth = 0.5;
         return out;
     }
 
-    // No water at this pixel — discard to reveal background behind
-    let min_thickness = 0.003;
-    if (linear_depth <= 0.0 || thickness < min_thickness) {
-        discard;
-    }
-
-    // Convert linear depth to hardware depth (needed for both paths)
-    let view_z = -linear_depth;
-    let clip_z = (camera.projection[2][2] * view_z + camera.projection[3][2]) / (-view_z);
-
-    // Boundary pixels: have depth+thickness but normals were rejected (water-air edge).
-    // Render with simplified absorption-only shading for a smooth fade-out.
-    if (normal_sample.w <= 0.0) {
-        let absorption_coeffs = vec3<f32>(0.30, 0.08, 0.02);
-        let optical_density = (1.0 - water.clarity) * 2.5 + 0.05;
-        let ct = min(thickness, 5.0);
-        let transmittance = exp(-absorption_coeffs * optical_density * ct);
-        let bg = textureSample(background_tex, tex_sampler, input.uv).rgb;
-        let deep_color = vec3<f32>(water.deep_color_r, water.deep_color_g, water.deep_color_b);
-        let depth_blend = 1.0 - exp(-ct * optical_density * 0.5);
-        let edge_color = mix(bg * transmittance, deep_color, depth_blend);
+    // No water at this pixel, or the opaque scene is in front of the water
+    // surface — output the scene as-is.
+    if (!has_water) {
         var out: FragOutput;
-        out.color = vec4<f32>(edge_color, 1.0);
-        out.depth = clamp(clip_z, 0.0, 1.0);
+        out.color = vec4<f32>(scene_color, 1.0);
+        out.depth = scene_depth;
         return out;
     }
+
+    // (Normals are valid wherever filtered depth > 0 — ss_normal.wgsl writes
+    // w=1 for every covered pixel — so no separate boundary path is needed;
+    // the thin-coverage fade at the end handles water-air edges.)
 
     // View-space normal (already normalized in ss_normal.wgsl)
     let view_normal = normal_sample.xyz;
@@ -234,23 +243,29 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     } else {
         let sharp_env = sample_environment(reflect_dir) * water.env_intensity;
         let diffuse_env = evaluate_sh_irradiance(reflect_dir) * water.env_intensity;
-        var env_reflection = mix(sharp_env, diffuse_env, roughness_sq);
+        let env_reflection = mix(sharp_env, diffuse_env, roughness_sq);
 
+        // Below-horizon reflections fall back to dim diffuse ambient rather than
+        // black. Sphere-like SS features (droplets, choppy bumps) reflect in every
+        // direction, and a hard fade-to-black paints dark rims on all of them.
         let horizon_fade = smoothstep(-0.15, 0.1, reflect_dir.y);
-        reflection_color = env_reflection * horizon_fade;
+        reflection_color = mix(diffuse_env * 0.5, env_reflection, horizon_fade);
     }
 
     // === SCREEN-SPACE REFRACTION ===
-    // Normal deviation from flat surface in view space
-    let flat_normal_view = normalize((camera.view * vec4<f32>(0.0, 1.0, 0.0, 0.0)).xyz);
+    // Classic SSF: offset by the view-space normal's screen projection. Unlike
+    // the deviation-from-flat-up variant (kept in MC for calm pool surfaces),
+    // this stays bounded on vertical faces and sphere-like droplets.
     let normal_view = normalize((camera.view * vec4<f32>(normal, 0.0)).xyz);
-    let normal_deviation = normal_view - flat_normal_view;
 
-    let refract_strength = water.refraction_strength * (1.0 + clamped_thickness * 0.5);
-    let uv_offset = normal_deviation.xy * refract_strength;
+    // Thin water barely displaces what's behind it — ramp in over ~0.1 units
+    // so droplets don't grab background samples from far across the screen.
+    let thin_atten = clamp(clamped_thickness / 0.1, 0.0, 1.0);
+    let refract_strength = water.refraction_strength * (1.0 + clamped_thickness * 0.5) * thin_atten;
+    let uv_offset = normal_view.xy * refract_strength;
 
     let refract_uv = clamp(input.uv + uv_offset, vec2<f32>(0.001), vec2<f32>(0.999));
-    var refracted_background = textureSample(background_tex, tex_sampler, refract_uv).rgb;
+    var refracted_background = textureSampleLevel(background_tex, tex_sampler, refract_uv, 0.0).rgb;
 
     // Apply Beer-Lambert absorption
     refracted_background = refracted_background * transmittance;
@@ -298,6 +313,9 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         let specular_brdf = (D * G * F_spec) / max(denom, 0.001);
 
         sun_specular = light.sun_color * light.sun_intensity * specular_brdf * NdotL;
+        // Firefly clamp: noisy reconstructed normals + sharp GGX produce
+        // pinpoint glints that bloom into white sparkle noise.
+        sun_specular = min(sun_specular, vec3<f32>(6.0));
 
         let light_entering = NdotL * (1.0 - F_spec);
         let interior_glow = water.water_color * transmittance;
@@ -319,9 +337,16 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     var color = mix(lit_interior, reflection_color, fresnel);
     color += sun_specular;
 
+    // Thin-coverage fade: the splat fringe (sub-particle thickness) carries
+    // bead-shaped normals that read as scalloped silhouettes and milky halos.
+    // Fading toward the scene over the thin fringe softens contact lines and
+    // turns isolated droplets into translucent beads instead of opaque spheres.
+    let edge_fade = smoothstep(min_thickness, 0.02, thickness);
+    color = mix(scene_color, color, edge_fade);
+
     // Output linear HDR — post-process handles tonemapping + gamma
     var output: FragOutput;
     output.color = vec4<f32>(color, 1.0);
-    output.depth = clamp(clip_z, 0.0, 1.0);
+    output.depth = water_hw_depth;
     return output;
 }

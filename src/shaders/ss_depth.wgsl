@@ -21,6 +21,10 @@ struct SsParams {
     num_particles: u32,
     screen_width: f32,
     screen_height: f32,
+    thickness_scale: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 struct SphParticle3D {

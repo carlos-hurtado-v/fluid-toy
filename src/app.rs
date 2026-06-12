@@ -1214,7 +1214,26 @@ impl App {
                         let env_params = self.state.environment.to_gpu_params();
                         ss_renderer.update_env_params(&gpu.queue, &env_params);
 
+                        // Scene objects go into the SS background pass (refraction +
+                        // depth-aware composite), mirroring the MC renderer.
+                        let rb_for_ss = if self.state.rigid_body.enabled {
+                            self.rigid_body_renderer.as_ref()
+                        } else {
+                            None
+                        };
+                        let spray_for_ss = if self.state.spray.enabled {
+                            self.spray_renderer.as_ref()
+                        } else {
+                            None
+                        };
+                        let container_for_ss = if self.state.container.style == ContainerStyle::OpaquePool {
+                            self.container_renderer.as_ref()
+                        } else {
+                            None
+                        };
+
                         let ss_radius = self.state.sph.kernel_radius * self.state.rendering.ss_radius_scale;
+                        let particle_spacing = self.state.sph.kernel_radius * 0.6;
                         ss_renderer.render(
                             &gpu.device,
                             &gpu.queue,
@@ -1224,9 +1243,13 @@ impl App {
                             sph_sim.num_particles(),
                             &camera_params,
                             ss_radius,
+                            particle_spacing,
                             self.state.rendering.ss_filter_size,
                             self.state.rendering.ss_filter_iterations,
                             self.camera.fov,
+                            rb_for_ss,
+                            spray_for_ss,
+                            container_for_ss,
                         );
                         fluid_depth_view = Some(ss_renderer.depth_view());
                     }
@@ -1327,8 +1350,9 @@ impl App {
             }
         }
 
-        // Render spray particles for non-MC modes
-        if self.state.spray.enabled && self.state.rendering.render_mode != FluidRenderMode::MarchingCubes {
+        // Render spray particles for Particles mode
+        // (MC and SS modes draw spray inside their own passes)
+        if self.state.spray.enabled && self.state.rendering.render_mode == FluidRenderMode::Particles {
             if let Some(spray_renderer) = &self.spray_renderer {
                 let depth_view = fluid_depth_view
                     .unwrap_or_else(|| self.rigid_body_depth_view.as_ref().unwrap());
@@ -1365,8 +1389,8 @@ impl App {
         }
 
         // Render rigid body cube with depth testing against fluid surface
-        // (MC mode handles this inside its own MSAA pass above)
-        if self.state.rigid_body.enabled && self.state.rendering.render_mode != FluidRenderMode::MarchingCubes {
+        // (MC and SS modes handle this inside their own passes above)
+        if self.state.rigid_body.enabled && self.state.rendering.render_mode == FluidRenderMode::Particles {
             if let Some(rb_renderer) = &self.rigid_body_renderer {
                 let depth_view = fluid_depth_view
                     .unwrap_or_else(|| self.rigid_body_depth_view.as_ref().unwrap());
