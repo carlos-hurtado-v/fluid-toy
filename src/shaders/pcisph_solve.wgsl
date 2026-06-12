@@ -63,7 +63,7 @@ struct PredictedState {
 @group(0) @binding(4) var<storage, read> cell_starts: array<u32>;
 @group(0) @binding(5) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(6) var<uniform> grid: GridParams;
-@group(0) @binding(7) var<storage, read> sorted_index: array<u32>;
+@group(0) @binding(7) var<storage, read> sorted_to_orig: array<u32>;
 
 const PI: f32 = 3.14159265359;
 
@@ -98,19 +98,23 @@ fn is_valid_cell(cell: vec3<i32>) -> bool {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= params.num_particles) {
+    // Iterate in grid-sorted order: predicted state lives in sorted order,
+    // so thread s reads/writes its own slot directly and neighbor gathers
+    // are warp-coherent. Canonical-array reads (current pos/vel, non-pressure
+    // accel) go through the sorted->orig map.
+    let s = global_id.x;
+    if (s >= params.num_particles) {
         return;
     }
+    let orig = sorted_to_orig[s];
 
-    let si = sorted_index[i];
-    let self_pred = sorted_predicted_in[si];
+    let self_pred = sorted_predicted_in[s];
 
     let pred_pos = vec3<f32>(self_pred.pred_pos_x, self_pred.pred_pos_y, self_pred.pred_pos_z);
     let old_pressure = self_pred.pressure;
 
     // Use CURRENT positions for cell lookup (grid was built on current positions)
-    let pos_i = particles[i].position;
+    let pos_i = particles[orig].position;
     let cell_i = position_to_cell(pos_i);
 
     // Accumulate predicted density and pressure acceleration
@@ -187,15 +191,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // Recompute predicted state from scratch using original velocity + total acceleration
-    let original_vel = particles[i].velocity;
-    let original_pos = particles[i].position;
-    let a_np = particles[i].force; // non-pressure acceleration
+    let original_vel = particles[orig].velocity;
+    let original_pos = particles[orig].position;
+    let a_np = particles[orig].force; // non-pressure acceleration
 
     let a_total = a_np + a_pressure;
     let v_star = original_vel + params.dt * a_total;
     let x_star = original_pos + params.dt * v_star;
 
-    sorted_predicted_out[si] = PredictedState(
+    sorted_predicted_out[s] = PredictedState(
         x_star.x, x_star.y, x_star.z,
         new_pressure,
         v_star.x, v_star.y, v_star.z,

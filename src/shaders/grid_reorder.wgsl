@@ -32,6 +32,7 @@ struct GridParams {
 @group(0) @binding(4) var<storage, read> cell_starts: array<u32>;
 @group(0) @binding(5) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(6) var<uniform> grid: GridParams;
+@group(0) @binding(7) var<storage, read_write> sorted_to_orig: array<u32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -53,6 +54,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Copy particle to sorted position
     particles_out[dest_idx] = particles_in[i];
 
-    // Store mapping so density shader can write to both buffers
+    // Store both mappings: orig -> sorted slot (for passes that iterate in
+    // original order) and sorted slot -> orig (so the neighbor sweeps can
+    // iterate in grid-sorted order and scatter writes back to the canonical
+    // array; sorted-order warps give spatially coherent neighbor reads).
     particle_cell_indices[i] = dest_idx;
+    sorted_to_orig[dest_idx] = i;
 }

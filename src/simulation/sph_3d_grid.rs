@@ -6,10 +6,10 @@ use crate::state::{GpuContainerGeometry, GpuGravity, GpuMouseForce, GpuRigidBody
 use wgpu::util::DeviceExt;
 
 const WORKGROUP_SIZE: u32 = 64;
-/// Workgroup size for cell-indexed passes (grid_clear, prefix_sum). Larger than
+/// Workgroup size for cell-indexed passes (grid_clear, prefix scan). Larger than
 /// the particle passes because cell counts scale with 1/h³ and a 1D dispatch is
 /// capped at 65,535 workgroups — must match @workgroup_size in grid_clear.wgsl
-/// and prefix_sum.wgsl.
+/// and BLOCK_SIZE in prefix_scan.wgsl.
 const CELL_WORKGROUP_SIZE: u32 = 256;
 
 /// Grid parameters for spatial hashing
@@ -29,21 +29,14 @@ pub struct GpuGridParams {
     pub _padding: [u32; 2],
 }
 
-/// Prefix sum parameters
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct PrefixSumParams {
-    pub count: u32,
-    pub offset: u32,
-    pub _padding: [u32; 2],
-}
-
 /// 3D SPH simulation with grid-accelerated neighbor search
 pub struct SphSimulation3DGrid {
     // Compute pipelines
     grid_clear_pipeline: wgpu::ComputePipeline,
     grid_build_pipeline: wgpu::ComputePipeline,
-    prefix_sum_pipeline: wgpu::ComputePipeline,
+    scan_blocks_pipeline: wgpu::ComputePipeline,
+    scan_block_sums_pipeline: wgpu::ComputePipeline,
+    scan_add_offsets_pipeline: wgpu::ComputePipeline,
     grid_reorder_pipeline: wgpu::ComputePipeline,
     density_pipeline: wgpu::ComputePipeline,
     xsph_pipeline: wgpu::ComputePipeline,
@@ -56,7 +49,6 @@ pub struct SphSimulation3DGrid {
 
     // Grid buffers
     cell_counts_buffer: wgpu::Buffer,
-    cell_counts_temp_buffer: wgpu::Buffer, // For prefix sum ping-pong
     cell_starts_buffer: wgpu::Buffer,
     cell_offsets_buffer: wgpu::Buffer, // Reset for reorder atomic counter
     _particle_cell_indices_buffer: wgpu::Buffer,
@@ -71,7 +63,7 @@ pub struct SphSimulation3DGrid {
     // Bind groups
     grid_clear_bind_group: wgpu::BindGroup,
     grid_build_bind_group: wgpu::BindGroup,
-    prefix_sum_bind_groups: Vec<(wgpu::BindGroup, wgpu::BindGroup)>, // Pairs for ping-pong
+    prefix_scan_bind_group: wgpu::BindGroup,
     grid_reorder_bind_group: wgpu::BindGroup,
     density_bind_group: wgpu::BindGroup,
     xsph_bind_group: wgpu::BindGroup,
@@ -106,7 +98,6 @@ pub struct SphSimulation3DGrid {
     grid_params: GpuGridParams,
     num_particles: u32,
     max_particles: u32,
-    num_prefix_sum_passes: u32,
 }
 
 impl SphSimulation3DGrid {
@@ -151,8 +142,8 @@ impl SphSimulation3DGrid {
             _padding: [0; 2],
         };
 
-        // Calculate number of prefix sum passes needed
-        let num_prefix_sum_passes = (total_cells as f32).log2().ceil() as u32;
+        // Hierarchical prefix scan operates on CELL_WORKGROUP_SIZE-element blocks
+        let num_scan_blocks = total_cells.div_ceil(CELL_WORKGROUP_SIZE);
 
         // Create shader modules
         let grid_clear_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -165,9 +156,9 @@ impl SphSimulation3DGrid {
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/grid_build.wgsl").into()),
         });
 
-        let prefix_sum_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Prefix Sum Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/prefix_sum.wgsl").into()),
+        let prefix_scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Prefix Scan Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/prefix_scan.wgsl").into()),
         });
 
         let grid_reorder_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -226,10 +217,11 @@ impl SphSimulation3DGrid {
             mapped_at_creation: false,
         });
 
-        let cell_counts_temp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Cell Counts Temp Buffer"),
-            size: (4 * total_cells) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        // Per-block totals for the hierarchical prefix scan
+        let scan_block_sums_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Scan Block Sums Buffer"),
+            size: (4 * num_scan_blocks) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
@@ -249,6 +241,16 @@ impl SphSimulation3DGrid {
 
         let particle_cell_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Particle Cell Indices Buffer"),
+            size: (4 * max_particles) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        // Inverse of particle_cell_indices after reorder: sorted slot -> original
+        // index. Lets the neighbor sweeps iterate in grid-sorted order (coherent
+        // warps) and scatter their few canonical-array writes.
+        let sorted_to_orig_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sorted To Orig Buffer"),
             size: (4 * max_particles) as u64,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
@@ -386,22 +388,6 @@ impl SphSimulation3DGrid {
             contents: bytemuck::bytes_of(&grid_params),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-
-        // Pre-create one uniform buffer per prefix sum pass (avoids per-pass queue.submit)
-        let prefix_sum_params_buffers: Vec<wgpu::Buffer> = (0..num_prefix_sum_passes)
-            .map(|pass_idx| {
-                let params = PrefixSumParams {
-                    count: total_cells,
-                    offset: 1u32 << pass_idx,
-                    _padding: [0; 2],
-                };
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&format!("Prefix Sum Params {}", pass_idx)),
-                    contents: bytemuck::bytes_of(&params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                })
-            })
-            .collect();
 
         // Create bind group layouts and pipelines
         // Grid Clear
@@ -542,15 +528,16 @@ impl SphSimulation3DGrid {
             ],
         });
 
-        // Prefix Sum
-        let prefix_sum_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Prefix Sum Layout"),
+        // Hierarchical prefix scan: one layout shared by the three entry points
+        // (block scan in place, single-workgroup scan of block sums, add-back)
+        let prefix_scan_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Prefix Scan Layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -579,48 +566,34 @@ impl SphSimulation3DGrid {
             ],
         });
 
-        let prefix_sum_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Prefix Sum Pipeline"),
-            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Prefix Sum Pipeline Layout"),
-                bind_group_layouts: &[&prefix_sum_layout],
-                push_constant_ranges: &[],
-            })),
-            module: &prefix_sum_shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
+        let prefix_scan_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Prefix Scan Pipeline Layout"),
+            bind_group_layouts: &[&prefix_scan_layout],
+            push_constant_ranges: &[],
         });
-
-        // Create prefix sum bind groups: one ping-pong pair per pass
-        let prefix_sum_bind_groups: Vec<(wgpu::BindGroup, wgpu::BindGroup)> = prefix_sum_params_buffers
-            .iter()
-            .enumerate()
-            .map(|(i, params_buf)| {
-                (
-                    // cell_starts -> cell_counts_temp
-                    device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("Prefix Sum starts->temp {}", i)),
-                        layout: &prefix_sum_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: cell_starts_buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: cell_counts_temp_buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
-                        ],
-                    }),
-                    // cell_counts_temp -> cell_starts
-                    device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("Prefix Sum temp->starts {}", i)),
-                        layout: &prefix_sum_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: cell_counts_temp_buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: cell_starts_buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
-                        ],
-                    }),
-                )
+        let make_scan_pipeline = |entry: &str, label: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&prefix_scan_pipeline_layout),
+                module: &prefix_scan_shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
             })
-            .collect();
+        };
+        let scan_blocks_pipeline = make_scan_pipeline("scan_blocks", "Scan Blocks Pipeline");
+        let scan_block_sums_pipeline = make_scan_pipeline("scan_block_sums", "Scan Block Sums Pipeline");
+        let scan_add_offsets_pipeline = make_scan_pipeline("add_block_offsets", "Scan Add Offsets Pipeline");
+
+        let prefix_scan_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Prefix Scan Bind Group"),
+            layout: &prefix_scan_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: cell_starts_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: scan_block_sums_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: grid_params_buffer.as_entire_binding() },
+            ],
+        });
 
         // Grid Reorder
         let grid_reorder_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -696,6 +669,16 @@ impl SphSimulation3DGrid {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -723,10 +706,12 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 4, resource: cell_starts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: cell_counts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: grid_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: sorted_to_orig_buffer.as_entire_binding() },
             ],
         });
 
-        // Density (with grid)
+        // Density (with grid) — iterates sorted order, touches only sorted-side
+        // buffers (no canonical particles binding, no index map needed)
         let density_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Density Grid Layout"),
             entries: &[
@@ -734,12 +719,6 @@ impl SphSimulation3DGrid {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
@@ -764,12 +743,6 @@ impl SphSimulation3DGrid {
                     binding: 5,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
@@ -799,12 +772,10 @@ impl SphSimulation3DGrid {
             layout: &density_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: sph_params_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: sorted_particle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: cell_starts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cell_counts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: grid_params_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: particle_cell_indices_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: container_geom_buffer.as_entire_binding() },
             ],
         });
@@ -849,6 +820,12 @@ impl SphSimulation3DGrid {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
 
@@ -875,6 +852,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 3, resource: cell_starts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: cell_counts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: grid_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: sorted_to_orig_buffer.as_entire_binding() },
             ],
         });
 
@@ -924,6 +902,12 @@ impl SphSimulation3DGrid {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
 
@@ -951,6 +935,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 4, resource: cell_counts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: grid_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: gravity_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: sorted_to_orig_buffer.as_entire_binding() },
             ],
         });
 
@@ -1147,7 +1132,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 4, resource: cell_starts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: cell_counts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: grid_params_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: particle_cell_indices_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: sorted_to_orig_buffer.as_entire_binding() },
             ],
         });
         // Bind group B: read from sorted_predicted_b, write to sorted_predicted_a
@@ -1162,7 +1147,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 4, resource: cell_starts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: cell_counts_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: grid_params_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: particle_cell_indices_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: sorted_to_orig_buffer.as_entire_binding() },
             ],
         });
 
@@ -1221,7 +1206,9 @@ impl SphSimulation3DGrid {
         Self {
             grid_clear_pipeline,
             grid_build_pipeline,
-            prefix_sum_pipeline,
+            scan_blocks_pipeline,
+            scan_block_sums_pipeline,
+            scan_add_offsets_pipeline,
             grid_reorder_pipeline,
             density_pipeline,
             xsph_pipeline,
@@ -1230,7 +1217,6 @@ impl SphSimulation3DGrid {
             particle_buffer,
             _sorted_particle_buffer: sorted_particle_buffer,
             cell_counts_buffer,
-            cell_counts_temp_buffer,
             cell_starts_buffer,
             cell_offsets_buffer,
             _particle_cell_indices_buffer: particle_cell_indices_buffer,
@@ -1241,7 +1227,7 @@ impl SphSimulation3DGrid {
             grid_params_buffer,
             grid_clear_bind_group,
             grid_build_bind_group,
-            prefix_sum_bind_groups,
+            prefix_scan_bind_group,
             grid_reorder_bind_group,
             density_bind_group,
             xsph_bind_group,
@@ -1268,7 +1254,6 @@ impl SphSimulation3DGrid {
             grid_params,
             num_particles,
             max_particles,
-            num_prefix_sum_passes,
         }
     }
 
@@ -1315,35 +1300,34 @@ impl SphSimulation3DGrid {
             (4 * self.grid_params.total_cells) as u64,
         );
 
-        // 3. Prefix sum (all passes in single encoder, separate compute passes for barriers)
-        let mut read_from_starts = true;
-        for pass_idx in 0..self.num_prefix_sum_passes as usize {
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Prefix Sum Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.prefix_sum_pipeline);
-                let bind_group = if read_from_starts {
-                    &self.prefix_sum_bind_groups[pass_idx].0 // starts -> temp
-                } else {
-                    &self.prefix_sum_bind_groups[pass_idx].1 // temp -> starts
-                };
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.dispatch_workgroups(cell_workgroups, 1, 1);
-            }
-            read_from_starts = !read_from_starts;
+        // 3. Hierarchical prefix scan over cell_starts, in place (3 dispatches;
+        // separate compute passes provide the storage barriers between levels)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Scan Blocks Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.scan_blocks_pipeline);
+            pass.set_bind_group(0, &self.prefix_scan_bind_group, &[]);
+            pass.dispatch_workgroups(cell_workgroups, 1, 1);
         }
-
-        // Copy final result to cell_starts if it ended up in temp
-        if !read_from_starts {
-            encoder.copy_buffer_to_buffer(
-                &self.cell_counts_temp_buffer,
-                0,
-                &self.cell_starts_buffer,
-                0,
-                (4 * self.grid_params.total_cells) as u64,
-            );
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Scan Block Sums Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.scan_block_sums_pipeline);
+            pass.set_bind_group(0, &self.prefix_scan_bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Scan Add Offsets Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.scan_add_offsets_pipeline);
+            pass.set_bind_group(0, &self.prefix_scan_bind_group, &[]);
+            pass.dispatch_workgroups(cell_workgroups, 1, 1);
         }
 
         // 4. Reorder particles

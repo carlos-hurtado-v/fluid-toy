@@ -53,6 +53,7 @@ struct GridParams {
 @group(0) @binding(3) var<storage, read> cell_starts: array<u32>;
 @group(0) @binding(4) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(5) var<uniform> grid: GridParams;
+@group(0) @binding(6) var<storage, read> sorted_to_orig: array<u32>;
 
 const PI: f32 = 3.14159265359;
 
@@ -79,8 +80,14 @@ fn is_valid_cell(cell: vec3<i32>) -> bool {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= params.num_particles) {
+    // Iterate in grid-sorted order for warp-coherent neighbor gathers.
+    // Self state comes from the sorted copy (identical to canonical here:
+    // this pass is the first velocity writer in the substep). The smoothed
+    // result is scatter-written to the canonical array only — the sorted
+    // copy keeps pre-XSPH velocities, which the force pass expects for its
+    // neighbor reads.
+    let s = global_id.x;
+    if (s >= params.num_particles) {
         return;
     }
 
@@ -89,8 +96,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    let pos_i = particles[i].position;
-    let vel_i = particles[i].velocity;
+    let pos_i = sorted_particles[s].position;
+    let vel_i = sorted_particles[s].velocity;
     let cell_i = position_to_cell(pos_i);
 
     var vel_correction = vec3<f32>(0.0, 0.0, 0.0);
@@ -127,5 +134,5 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
 
-    particles[i].velocity = vel_i + epsilon * vel_correction;
+    particles[sorted_to_orig[s]].velocity = vel_i + epsilon * vel_correction;
 }

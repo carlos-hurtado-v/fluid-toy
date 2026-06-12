@@ -56,6 +56,7 @@ struct Gravity {
 @group(0) @binding(4) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(5) var<uniform> grid: GridParams;
 @group(0) @binding(6) var<uniform> gravity: Gravity;
+@group(0) @binding(7) var<storage, read> sorted_to_orig: array<u32>;
 
 const PI: f32 = 3.14159265359;
 
@@ -103,18 +104,24 @@ fn is_valid_cell(cell: vec3<i32>) -> bool {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= params.num_particles) {
+    // Iterate in grid-sorted order for warp-coherent neighbor gathers.
+    // Self position/density/normals come from the sorted copy (density pass
+    // writes them there). Self velocity is the post-XSPH value, which only
+    // exists in the canonical array — neighbor velocities stay pre-XSPH from
+    // the sorted copy (matches the original pass semantics).
+    let s = global_id.x;
+    if (s >= params.num_particles) {
         return;
     }
+    let orig = sorted_to_orig[s];
 
-    let pos_i = particles[i].position;
-    let vel_i = particles[i].velocity;
+    let pos_i = sorted_particles[s].position;
+    let vel_i = particles[orig].velocity;
     let cell_i = position_to_cell(pos_i);
 
-    let density_i = max(particles[i].density, 1.0);
-    let near_density_i = max(particles[i].near_density, 1.0);
-    let n_i = vec3<f32>(particles[i].normal_x, particles[i].normal_y, particles[i].normal_z);
+    let density_i = max(sorted_particles[s].density, 1.0);
+    let near_density_i = max(sorted_particles[s].near_density, 1.0);
+    let n_i = vec3<f32>(sorted_particles[s].normal_x, sorted_particles[s].normal_y, sorted_particles[s].normal_z);
 
     // Regular pressure handled by PCISPH iterative solver (not computed here)
     let near_pressure_i = params.near_stiffness * near_density_i;
@@ -156,7 +163,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         if (r < min_dist) {
                             // Particles too close - use deterministic direction based on indices
                             // This prevents random direction due to floating point noise
-                            let idx_diff = f32(i) - f32(j);
+                            // (both s and j are sorted-slot indices)
+                            let idx_diff = f32(s) - f32(j);
                             dir = normalize(vec3<f32>(
                                 sin(idx_diff * 1.0),
                                 cos(idx_diff * 2.0),
@@ -215,5 +223,5 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let a_gravity = gravity.direction;
 
     // Store acceleration directly (integration shader uses it without dividing by density)
-    particles[i].force = a_pressure + a_viscosity + a_cohesion + a_gravity;
+    particles[orig].force = a_pressure + a_viscosity + a_cohesion + a_gravity;
 }

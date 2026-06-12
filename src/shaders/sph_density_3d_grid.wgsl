@@ -45,9 +45,7 @@ struct GridParams {
 }
 
 @group(0) @binding(0) var<uniform> params: SphParams;
-@group(0) @binding(1) var<storage, read_write> particles: array<SphParticle3D>;
 @group(0) @binding(2) var<storage, read_write> sorted_particles: array<SphParticle3D>;
-@group(0) @binding(6) var<storage, read> sorted_index: array<u32>;
 @group(0) @binding(3) var<storage, read> cell_starts: array<u32>;
 @group(0) @binding(4) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(5) var<uniform> grid: GridParams;
@@ -112,12 +110,15 @@ fn boundary_gamma(pos: vec3<f32>) -> f32 {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= params.num_particles) {
+    // Iterate in grid-sorted order: thread s processes sorted slot s, so
+    // adjacent threads handle spatially adjacent particles and their
+    // neighbor windows overlap (warp-coherent gathers, cache reuse).
+    let s = global_id.x;
+    if (s >= params.num_particles) {
         return;
     }
 
-    let pos_i = particles[i].position;
+    let pos_i = sorted_particles[s].position;
     let cell_i = position_to_cell(pos_i);
 
     var density = 0.0;
@@ -180,18 +181,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // so the full gradient points inward. We keep the outward convention by not negating.
     normal = normal * normal_scale;
 
-    particles[i].density = density;
-    particles[i].near_density = near_density;
-    particles[i].normal_x = normal.x;
-    particles[i].normal_y = normal.y;
-    particles[i].normal_z = normal.z;
-
-    // Also update sorted buffer so force shader can read neighbor data
-    // without needing a second reorder pass
-    let si = sorted_index[i];
-    sorted_particles[si].density = density;
-    sorted_particles[si].near_density = near_density;
-    sorted_particles[si].normal_x = normal.x;
-    sorted_particles[si].normal_y = normal.y;
-    sorted_particles[si].normal_z = normal.z;
+    // Sorted buffer is the only consumer of density/near/normals: the force
+    // and XSPH sweeps read them per-neighbor from sorted_particles, and
+    // spray emission / MC read sorted_particles after the last substep.
+    // The canonical array's copies of these fields are never read, so no
+    // scattered writeback is needed.
+    sorted_particles[s].density = density;
+    sorted_particles[s].near_density = near_density;
+    sorted_particles[s].normal_x = normal.x;
+    sorted_particles[s].normal_y = normal.y;
+    sorted_particles[s].normal_z = normal.z;
 }

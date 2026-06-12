@@ -1162,12 +1162,19 @@ impl App {
         if !self.state.simulation.paused {
             if let Some(sph_sim) = &mut self.sph_simulation {
                 // Clear accumulator once, then accumulate over all sub-steps
-                sph_sim.clear_rigid_body_accum(&gpu.queue);
+                let rigid_enabled = self.state.rigid_body.enabled;
+                if rigid_enabled {
+                    sph_sim.clear_rigid_body_accum(&gpu.queue);
+                }
                 for _ in 0..num_substeps {
                     sph_sim.step(&gpu.device, &gpu.queue);
                 }
-                // Read back total accumulated rigid body forces
-                sph_sim.read_rigid_body_accum(&gpu.device);
+                // Read back total accumulated rigid body forces. The readback
+                // blocks until the GPU drains, so skip it entirely when no
+                // rigid body consumes the data (saves a hard sync per frame).
+                if rigid_enabled {
+                    sph_sim.read_rigid_body_accum(&gpu.device);
+                }
             }
 
             // Run spray system after SPH completes
