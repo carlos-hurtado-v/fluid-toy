@@ -122,8 +122,8 @@ impl Default for GpuWaterParams {
             ripple_strength: 0.015,
             clarity: 0.65,
             _pad1: 0.0,
-            foam_coverage: 1.0,
-            aeration_strength: 1.0,
+            foam_coverage: 0.8,
+            aeration_strength: 0.95,
         }
     }
 }

@@ -70,23 +70,20 @@ impl Default for SprayConfig {
             enabled: true,
             min_speed: 0.8,
             emission_rate: 30.0,
-            // 1.25-3.75 s foam at full emission energy (user-tuned 2026-06-12)
-            lifetime: 2.5,
+            lifetime: 2.8,
             lifetime_variation: 0.5,
-            drag: 3.3,
+            drag: 1.5,
             speed_multiplier: 0.85,
             velocity_jitter: 0.9,
             particle_size: 0.0015,
             max_particles: 100_000,
-            k_trapped_air: 1.3,
-            k_wave_crest: 1.1,
+            k_trapped_air: 1.25,
+            k_wave_crest: 1.4,
             bubble_buoyancy: 2.5,
-            bubble_drag: 0.7,
+            bubble_drag: 0.6,
             bubbles_visible: true,
-            // Foam-light, aeration-forward balance (user live-tuned): sparse
-            // surface lace, milk carries the whitewater read
-            foam_coverage: 0.45,
-            aeration_strength: 1.25,
+            foam_coverage: 0.8,
+            aeration_strength: 0.95,
         }
     }
 }
