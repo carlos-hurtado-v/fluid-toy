@@ -39,6 +39,25 @@ struct SphGridParams {
     _padding: vec2<u32>,
 }
 
+// Anisotropic kernel data (Yu & Turk), produced by mc_anisotropy.wgsl.
+// Indexed by sorted particle index, same as sorted_particles.
+struct AnisoParams {
+    enabled: u32,
+    strength: f32,
+    support_radius: f32,
+    h_mc: f32,
+    kr: f32,
+    lambda: f32,
+    max_stretch: f32, // bounds the per-particle reach -> search radius
+    max_shift: f32,   // bounds the smoothed center offset, world units
+}
+
+struct ParticleAniso {
+    q0: vec4<f32>, // (Gxx, Gxy, Gxz, center.x)
+    q1: vec4<f32>, // (Gyy, Gyz, Gzz, center.y)
+    q2: vec4<f32>, // (center.z, reach, amplitude, 0)
+}
+
 @group(0) @binding(0) var<storage, read> sorted_particles: array<SphParticle3D>;
 @group(0) @binding(1) var<uniform> params: GridParams;
 @group(0) @binding(2) var density_field: texture_storage_3d<r32float, write>;
@@ -46,6 +65,8 @@ struct SphGridParams {
 @group(0) @binding(4) var<storage, read> cell_starts: array<u32>;
 @group(0) @binding(5) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(6) var<uniform> sph_grid: SphGridParams;
+@group(0) @binding(7) var<storage, read> aniso: array<ParticleAniso>;
+@group(0) @binding(8) var<uniform> aniso_params: AnisoParams;
 
 // Poly6 kernel for density estimation
 fn poly6_kernel(r_sq: f32, h: f32) -> f32 {
@@ -118,13 +139,20 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let world_pos = grid_to_world(global_id);
     let h = params.kernel_radius;
     let h_sq = h * h;
+    let aniso_on = aniso_params.enabled != 0u;
 
     // Map this voxel's world position to SPH grid cell
     let center_cell = position_to_sph_cell(world_pos);
 
     // Search radius in SPH grid cells
-    // MC kernel_radius may be larger than SPH cell_size (due to mc_density_radius_scale)
-    let cell_radius = i32(ceil(h * sph_grid.inv_cell_size));
+    // MC kernel_radius may be larger than SPH cell_size (due to mc_density_radius_scale).
+    // With anisotropy, ellipsoids reach up to max_stretch * h from centers shifted
+    // up to max_shift from the particle's grid position.
+    var search_reach = h;
+    if (aniso_on) {
+        search_reach = h * aniso_params.max_stretch + aniso_params.max_shift;
+    }
+    let cell_radius = i32(ceil(search_reach * sph_grid.inv_cell_size));
 
     // Sum density contributions from nearby particles using grid acceleration
     var density = 0.0;
@@ -150,12 +178,34 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
                 for (var k = 0u; k < count; k++) {
                     let j = start + k;
-                    let particle_pos = sorted_particles[j].position;
-                    let diff = world_pos - particle_pos;
-                    let r_sq = dot(diff, diff);
+                    if (aniso_on) {
+                        // Ellipsoid splat: q = ||G * (x - center)||, kernel = amplitude * (1 - q^2)^3.
+                        // Equals the isotropic poly6 exactly when the particle is unstretched.
+                        let an = aniso[j];
+                        let center = vec3<f32>(an.q0.w, an.q1.w, an.q2.x);
+                        let diff = world_pos - center;
+                        let r_sq = dot(diff, diff);
+                        let reach = an.q2.y;
+                        if (r_sq < reach * reach) {
+                            let gd = vec3<f32>(
+                                an.q0.x * diff.x + an.q0.y * diff.y + an.q0.z * diff.z,
+                                an.q0.y * diff.x + an.q1.x * diff.y + an.q1.y * diff.z,
+                                an.q0.z * diff.x + an.q1.y * diff.y + an.q1.z * diff.z,
+                            );
+                            let q_sq = dot(gd, gd);
+                            if (q_sq < 1.0) {
+                                let f = 1.0 - q_sq;
+                                density += an.q2.z * f * f * f;
+                            }
+                        }
+                    } else {
+                        let particle_pos = sorted_particles[j].position;
+                        let diff = world_pos - particle_pos;
+                        let r_sq = dot(diff, diff);
 
-                    if (r_sq < h_sq) {
-                        density += poly6_kernel(r_sq, h);
+                        if (r_sq < h_sq) {
+                            density += poly6_kernel(r_sq, h);
+                        }
                     }
                 }
             }

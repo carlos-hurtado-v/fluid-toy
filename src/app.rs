@@ -1279,8 +1279,14 @@ impl App {
                         mc_renderer.set_ssr_enabled(&gpu.queue, self.state.rendering.ssr_enabled);
 
                         // Update MC grid bounds to cover the full container + margin
+                        // (anisotropic ellipsoids can reach up to ANISO_MAX_STRETCH × the kernel radius)
                         let (aabb_min, aabb_max) = self.state.container.tilted_aabb();
-                        let mc_margin = self.state.sph.kernel_radius * self.state.rendering.mc_density_radius_scale + 0.05;
+                        let aniso_stretch = if self.state.rendering.mc_anisotropy {
+                            crate::render::marching_cubes::ANISO_MAX_STRETCH
+                        } else {
+                            1.0
+                        };
+                        let mc_margin = self.state.sph.kernel_radius * self.state.rendering.mc_density_radius_scale * aniso_stretch + 0.05;
                         mc_renderer.set_bounds(
                             [aabb_min[0] - mc_margin, aabb_min[1] - mc_margin, aabb_min[2] - mc_margin],
                             [aabb_max[0] + mc_margin, aabb_max[1] + mc_margin, aabb_max[2] + mc_margin],
@@ -1312,6 +1318,13 @@ impl App {
                             sph_sim.num_particles(),
                             blur_radius,
                         );
+                        mc_renderer.update_aniso_params(
+                            &gpu.queue,
+                            self.state.rendering.mc_anisotropy,
+                            self.state.rendering.mc_anisotropy_strength,
+                            self.state.sph.kernel_radius,
+                            self.state.sph.kernel_radius * self.state.rendering.mc_density_radius_scale,
+                        );
                         mc_renderer.generate(
                             &mut encoder,
                             &gpu.device,
@@ -1320,6 +1333,8 @@ impl App {
                             sph_sim.cell_counts_buffer(),
                             sph_sim.grid_params_buffer(),
                             blur_radius,
+                            sph_sim.num_particles(),
+                            self.state.rendering.mc_anisotropy,
                         );
                         // Pass rigid body renderer into MC pass for proper MSAA depth testing
                         let rb_for_mc = if self.state.rigid_body.enabled {

@@ -184,11 +184,22 @@ pub struct RenderConfig {
     /// Marching-cubes density kernel scale relative to SPH kernel radius.
     /// Lower values preserve smaller features and reduce "chunky" meshing.
     pub mc_density_radius_scale: f32,
+    /// Anisotropic MC kernels (Yu & Turk): per-particle ellipsoid splats fitted
+    /// to the local particle distribution. Flattens calm surfaces and thins
+    /// splash sheets; isolated droplets stay spherical.
+    pub mc_anisotropy: bool,
+    /// Anisotropy strength: 0 = isotropic spheres, 1 = full Yu & Turk
+    /// (eigenvalue stretch + center smoothing).
+    pub mc_anisotropy_strength: f32,
     /// Refraction strength - how much the background distorts through water
     pub refraction_strength: f32,
     /// Deep water color - what you see looking into deep water
     pub deep_water_color: [f32; 3],
-    /// Surface smoothing - blur radius for MC density field (0 = off, higher = smoother)
+    /// Surface smoothing - blur radius for MC density field in voxels (0 = off).
+    /// Low-pass on the density texture: smooths the bulk surface but erodes thin
+    /// features (sheets/droplets) whose field width is comparable to the window.
+    /// With anisotropic kernels on, 0-1 is plenty; higher values trade splash
+    /// detail for roundness.
     pub mc_blur_radius: u32,
     /// Water surface roughness for PBR specular (0.01 = mirror, 0.5 = rough)
     pub water_roughness: f32,
@@ -222,13 +233,15 @@ impl Default for RenderConfig {
             color_by_velocity: true,
             render_mode: FluidRenderMode::MarchingCubes,
             mc_threshold: 0.75,
-            mc_density_radius_scale: 1.2,
+            mc_density_radius_scale: 1.0,
+            mc_anisotropy: true,
+            mc_anisotropy_strength: 1.0,
             refraction_strength: 0.050,
             deep_water_color: [0.005, 0.03, 0.08],
-            mc_blur_radius: 2,
+            mc_blur_radius: 1,
             water_roughness: 0.090,
             ripple_strength: 0.015,
-            water_clarity: 0.65,
+            water_clarity: 0.5,
             ssr_enabled: true,
             mc_grid_resolution: McGridResolution::default(),
             ss_radius_scale: 0.6,

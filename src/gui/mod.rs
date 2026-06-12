@@ -373,6 +373,11 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     ui.add(
                         egui::Slider::new(&mut blur_val, 0..=5)
                             .text("Surface Smoothing")
+                    ).on_hover_text(
+                        "Post-blur of the density field (radius in voxels).\n\
+                         Rounds the bulk surface but erases thin sheets and droplets\n\
+                         — every step roughly halves the smallest surviving feature.\n\
+                         With Anisotropic Kernels on, 0-1 is recommended.",
                     );
                     state.rendering.mc_blur_radius = blur_val as u32;
                     ui.add(
@@ -383,6 +388,18 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         egui::Slider::new(&mut state.rendering.mc_threshold, 0.1..=1.5)
                             .text("Surface Threshold")
                     );
+                    ui.checkbox(&mut state.rendering.mc_anisotropy, "Anisotropic Kernels (Yu & Turk)")
+                        .on_hover_text(
+                            "Fit per-particle ellipsoids to the local particle distribution:\n\
+                             flattens calm surfaces, thins splash sheets, keeps droplets round.\n\
+                             Density Radius Scale 1.0 is recommended (and cheapest) when enabled.",
+                        );
+                    if state.rendering.mc_anisotropy {
+                        ui.add(
+                            egui::Slider::new(&mut state.rendering.mc_anisotropy_strength, 0.0..=1.0)
+                                .text("Anisotropy Strength")
+                        );
+                    }
                     ui.add(
                         egui::Slider::new(&mut state.rendering.water_roughness, 0.01..=0.5)
                             .text("Roughness")

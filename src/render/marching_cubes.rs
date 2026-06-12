@@ -17,6 +17,37 @@ use crate::state::{GpuContainerGeometry, GpuEnvironmentParams, GpuLightParams, G
 /// The atomic counter in the generate shader handles overflow gracefully.
 const MAX_VERTICES: u32 = 4_000_000;
 
+/// Hard cap on anisotropic ellipsoid axis scale. Bounds the density pass
+/// neighbor search radius (and the MC grid margin in app.rs). 1.6 covers the
+/// flat-sheet case fully (in-plane stretch kr^(1/3) ≈ 1.59 at kr = 4) while
+/// keeping the gather loop footprint small; only extreme strings get capped.
+pub const ANISO_MAX_STRETCH: f32 = 1.6;
+/// Yu & Turk k_r: max ratio between largest and smallest covariance stddev.
+const ANISO_KR: f32 = 4.0;
+/// Center smoothing factor toward the weighted neighbor mean (Yu & Turk λ).
+const ANISO_LAMBDA: f32 = 0.9;
+/// Covariance neighborhood radius as a multiple of the sim kernel radius.
+const ANISO_SUPPORT_SCALE: f32 = 2.0;
+/// Center smoothing shift cap as a multiple of the sim kernel radius.
+const ANISO_MAX_SHIFT_SCALE: f32 = 0.4;
+/// Bytes per ParticleAniso record (3 × vec4<f32>).
+const ANISO_STRIDE: u64 = 48;
+
+/// Anisotropic kernel parameters (matches AnisoParams in mc_anisotropy.wgsl
+/// and mc_density.wgsl — all scalars, no padding needed).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct GpuAnisoParams {
+    enabled: u32,
+    strength: f32,
+    support_radius: f32,
+    h_mc: f32,
+    kr: f32,
+    lambda: f32,
+    max_stretch: f32,
+    max_shift: f32,
+}
+
 /// Grid parameters for compute shaders
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -277,6 +308,11 @@ pub struct MarchingCubesRenderer {
     // Pipelines
     density_pipeline: wgpu::ComputePipeline,
     generate_pipeline: wgpu::ComputePipeline,
+    // Anisotropic kernel pass (Yu & Turk): covariance + eigensolve per particle
+    aniso_pipeline: wgpu::ComputePipeline,
+    aniso_params_buffer: wgpu::Buffer,
+    aniso_buffer: wgpu::Buffer,
+    aniso_capacity: u32,
     back_face_pipeline: wgpu::RenderPipeline,  // Renders back faces for thickness
     render_pipeline: wgpu::RenderPipeline,
     env_pipeline: wgpu::RenderPipeline,        // MSAA version for main render
@@ -593,6 +629,11 @@ impl MarchingCubesRenderer {
             ),
         });
 
+        let aniso_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("MC Anisotropy Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_anisotropy.wgsl").into()),
+        });
+
         let generate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Generate Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_generate.wgsl").into()),
@@ -708,6 +749,28 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Anisotropic kernel records (from mc_anisotropy pass)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Anisotropic kernel params (uniform)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -724,6 +787,109 @@ impl MarchingCubesRenderer {
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
+        });
+
+        // === Anisotropy Pipeline (Yu & Turk per-particle ellipsoid fit) ===
+        let aniso_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("MC Anisotropy BGL"),
+            entries: &[
+                // Sorted particles (read)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // SPH cell_starts
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // SPH cell_counts
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // SPH grid params
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Aniso params
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Output records
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let aniso_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("MC Anisotropy Pipeline Layout"),
+            bind_group_layouts: &[&aniso_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let aniso_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("MC Anisotropy Pipeline"),
+            layout: Some(&aniso_pipeline_layout),
+            module: &aniso_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        let aniso_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MC Aniso Params"),
+            contents: bytemuck::bytes_of(&GpuAnisoParams::zeroed()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Per-particle ellipsoid records; grown lazily in generate()
+        let aniso_capacity: u32 = 1024;
+        let aniso_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MC Aniso Records"),
+            size: aniso_capacity as u64 * ANISO_STRIDE,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
         });
 
         // === Generate Pipeline ===
@@ -1707,6 +1873,14 @@ impl MarchingCubesRenderer {
                     binding: 6,
                     resource: placeholder_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: aniso_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: aniso_params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -1745,6 +1919,10 @@ impl MarchingCubesRenderer {
             indirect_buffer,
             density_pipeline,
             generate_pipeline,
+            aniso_pipeline,
+            aniso_params_buffer,
+            aniso_buffer,
+            aniso_capacity,
             back_face_pipeline,
             render_pipeline,
             env_pipeline,
@@ -1821,6 +1999,14 @@ impl MarchingCubesRenderer {
                     binding: 6,
                     resource: sph_grid_params_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.aniso_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.aniso_params_buffer.as_entire_binding(),
+                },
             ],
         })
     }
@@ -1871,6 +2057,36 @@ impl MarchingCubesRenderer {
                 _pad: [0; 3],
             };
             queue.write_buffer(&self.blur_params_buffers[i], 0, bytemuck::bytes_of(&blur_params));
+        }
+    }
+
+    /// Update anisotropic kernel parameters (Yu & Turk).
+    /// `kernel_radius` is the sim h; `h_mc` the MC density kernel radius.
+    pub fn update_aniso_params(&self, queue: &wgpu::Queue, enabled: bool, strength: f32, kernel_radius: f32, h_mc: f32) {
+        let params = GpuAnisoParams {
+            enabled: if enabled { 1 } else { 0 },
+            strength: strength.clamp(0.0, 1.0),
+            support_radius: ANISO_SUPPORT_SCALE * kernel_radius,
+            h_mc,
+            kr: ANISO_KR,
+            lambda: ANISO_LAMBDA,
+            max_stretch: ANISO_MAX_STRETCH,
+            max_shift: ANISO_MAX_SHIFT_SCALE * kernel_radius,
+        };
+        queue.write_buffer(&self.aniso_params_buffer, 0, bytemuck::bytes_of(&params));
+    }
+
+    /// Grow the per-particle ellipsoid record buffer if needed.
+    fn ensure_aniso_capacity(&mut self, device: &wgpu::Device, num_particles: u32) {
+        if num_particles > self.aniso_capacity {
+            let capacity = num_particles.next_power_of_two().max(1024);
+            self.aniso_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("MC Aniso Records"),
+                size: capacity as u64 * ANISO_STRIDE,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            self.aniso_capacity = capacity;
         }
     }
 
@@ -2043,7 +2259,7 @@ impl MarchingCubesRenderer {
 
     /// Generate mesh from particles using SPH grid-accelerated density computation
     pub fn generate(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
         sorted_particle_buffer: &wgpu::Buffer,
@@ -2051,9 +2267,17 @@ impl MarchingCubesRenderer {
         cell_counts_buffer: &wgpu::Buffer,
         sph_grid_params_buffer: &wgpu::Buffer,
         blur_radius: u32,
+        num_particles: u32,
+        aniso_enabled: bool,
     ) {
         // Reset counter
         encoder.clear_buffer(&self.counter_buffer, 0, None);
+
+        let run_aniso = aniso_enabled && num_particles > 0;
+        if run_aniso {
+            // Must happen before the density bind group is created below
+            self.ensure_aniso_capacity(device, num_particles);
+        }
 
         // Create density bind group with SPH grid buffers
         let density_bind_group = self.create_density_bind_group(
@@ -2063,6 +2287,49 @@ impl MarchingCubesRenderer {
             cell_counts_buffer,
             sph_grid_params_buffer,
         );
+
+        // Pass 0: Per-particle anisotropic kernel fit (covariance + eigensolve).
+        // Separate compute pass gives an implicit barrier before the density pass.
+        if run_aniso {
+            let layout = self.aniso_pipeline.get_bind_group_layout(0);
+            let aniso_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("MC Anisotropy BG"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: sorted_particle_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: cell_starts_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: cell_counts_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: sph_grid_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.aniso_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: self.aniso_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("MC Anisotropy Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.aniso_pipeline);
+            pass.set_bind_group(0, &aniso_bind_group, &[]);
+            pass.dispatch_workgroups(num_particles.div_ceil(128), 1, 1);
+        }
 
         // Pass 1: Generate density field (splat particles into texture A)
         {

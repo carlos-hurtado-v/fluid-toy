@@ -28,9 +28,9 @@ impl Default for SimulationConfig {
             gravity: 9.8,
             damping: 0.55,        // Energy retained on wall bounce
             paused: false,
-            max_particles: 100_000,
-            initial_cube_size: 25, // 25×25×25 = 15,625 particles
-            substeps: 4,
+            max_particles: 200_000,
+            initial_cube_size: 40, // 40×40×40 = 64,000 particles
+            substeps: 6,
             pcisph_iterations: 5,
         }
     }
@@ -282,7 +282,7 @@ pub struct SphConfig {
 impl Default for SphConfig {
     fn default() -> Self {
         Self {
-            kernel_radius: 0.070,
+            kernel_radius: 0.045,
             stiffness: 35.0,
             near_stiffness: 1.10,
             viscosity: 0.70,
