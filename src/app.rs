@@ -663,7 +663,7 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Let egui handle events first
         if let Some(egui_winit) = &mut self.egui_winit {
-            let response = egui_winit.on_window_event(&self.window.as_ref().unwrap(), &event);
+            let response = egui_winit.on_window_event(self.window.as_ref().unwrap(), &event);
             if response.consumed {
                 // Reset mouse state if egui consumed the event
                 if matches!(event, WindowEvent::MouseInput { .. }) {
@@ -1176,18 +1176,19 @@ impl App {
                 self.state.runtime.frame_count = self.state.runtime.frame_count.wrapping_add(1);
                 let spray_params = self.build_spray_params(self.state.runtime.frame_count);
 
-                let spray_sys = self.spray_system.as_mut().unwrap();
-                // Reset spray on re-enable to clear stale frozen particles
-                if needs_reset {
-                    spray_sys.reset(&gpu.queue);
-                }
-                spray_sys.update_params(&gpu.queue, &spray_params);
-                spray_sys.step(&gpu.device, &gpu.queue, self.state.runtime.particle_count);
+                if let Some(spray_sys) = self.spray_system.as_mut() {
+                    // Reset spray on re-enable to clear stale frozen particles
+                    if needs_reset {
+                        spray_sys.reset(&gpu.queue);
+                    }
+                    spray_sys.update_params(&gpu.queue, &spray_params);
+                    spray_sys.step(&gpu.device, &gpu.queue, self.state.runtime.particle_count);
 
-                // Publish the live auto-limits for the GUI readout
-                let (ta, wc) = spray_sys.auto_limits();
-                self.state.runtime.spray_ta_limit = ta;
-                self.state.runtime.spray_wc_limit = wc;
+                    // Publish the live auto-limits for the GUI readout
+                    let (ta, wc) = spray_sys.auto_limits();
+                    self.state.runtime.spray_ta_limit = ta;
+                    self.state.runtime.spray_wc_limit = wc;
+                }
             }
         }
         self.spray_prev_enabled = self.state.spray.enabled;
@@ -1744,10 +1745,16 @@ impl App {
         gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
-        // Read back marching cubes vertex count for next frame
+        // Read back marching cubes vertex count for next frame. Stats runs
+        // block for an exact per-frame value (deterministic CSV rows);
+        // interactive frames poll so the CPU never stalls on the GPU.
         if self.state.rendering.render_mode == FluidRenderMode::MarchingCubes {
             if let Some(mc_renderer) = &mut self.mc_renderer {
-                mc_renderer.read_vertex_count(&gpu.device);
+                if self.stats_file.is_some() {
+                    mc_renderer.read_vertex_count(&gpu.device);
+                } else {
+                    mc_renderer.poll_vertex_count(&gpu.device);
+                }
             }
         }
 
@@ -1786,9 +1793,10 @@ impl App {
                 self.state.runtime.spray_ta_limit,
                 self.state.runtime.spray_wc_limit,
             );
-            let file = self.stats_file.as_mut().unwrap();
-            let _ = file.write_all(row.as_bytes());
-            let _ = file.flush();
+            if let Some(file) = self.stats_file.as_mut() {
+                let _ = file.write_all(row.as_bytes());
+                let _ = file.flush();
+            }
         }
 
         // Automation exit: leave once every requested milestone is reached

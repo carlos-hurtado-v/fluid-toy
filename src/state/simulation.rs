@@ -66,17 +66,13 @@ impl SimulationConfig {
 }
 
 /// Container visual style
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum ContainerStyle {
+    #[default]
     Wireframe,
     OpaquePool,
 }
 
-impl Default for ContainerStyle {
-    fn default() -> Self {
-        Self::Wireframe
-    }
-}
 
 /// Container configuration - defines the fluid container
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -475,10 +471,10 @@ fn compute_pcisph_delta(h: f32, mass: f32, rest_density: f32, dt: f32) -> f32 {
     // which overshoots for real particle distributions. 0.2 gives smooth convergence
     // over 4-6 iterations without compounding over-correction.
     let omega = 0.2;
-    let delta = if denom.abs() > 1e-10 {
+
+    if denom.abs() > 1e-10 {
         omega / denom
     } else {
         0.0
-    };
-    delta
+    }
 }

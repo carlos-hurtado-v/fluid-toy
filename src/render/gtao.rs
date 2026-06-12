@@ -73,6 +73,9 @@ pub struct GtaoRenderer {
     half_width: u32,
     half_height: u32,
     frame_counter: u32,
+    // Depth view the current bind groups were built against; rebuild only
+    // when the caller hands us a different view (mode switch / resize)
+    cached_depth_view: Option<wgpu::TextureView>,
 }
 
 impl GtaoRenderer {
@@ -503,6 +506,7 @@ impl GtaoRenderer {
             half_width,
             half_height,
             frame_counter: 0,
+            cached_depth_view: None,
         }
     }
 
@@ -635,11 +639,16 @@ impl GtaoRenderer {
             self.ao_result_textures[1].create_view(&wgpu::TextureViewDescriptor::default()),
         ];
 
-        // Bind groups will be recreated in rebuild_bind_groups
+        // Force rebuild_bind_groups to recreate (internal views changed)
+        self.cached_depth_view = None;
     }
 
-    /// Rebuild all bind groups (call after resize or when depth view changes)
+    /// Rebuild all bind groups when the input depth view changes (resize or
+    /// render-mode switch); no-op on frames where it is unchanged.
     pub fn rebuild_bind_groups(&mut self, device: &wgpu::Device, depth_view: &wgpu::TextureView) {
+        if self.cached_depth_view.as_ref() == Some(depth_view) {
+            return;
+        }
         self.prefilter_bind_group = Self::create_prefilter_bg(
             device, &self.prefilter_bgl, depth_view,
             &self.linear_depth_view, &self.params_buffer, &self.camera_buffer,
@@ -673,6 +682,8 @@ impl GtaoRenderer {
                 &self.params_buffer, &self.camera_buffer, &self.ao_working_view,
                 &self.ao_result_views[0], &self.ao_result_views[1], &self.prev_vp_buffer),
         ];
+
+        self.cached_depth_view = Some(depth_view.clone());
     }
 
     /// Run the full GTAO pipeline
@@ -708,8 +719,8 @@ impl GtaoRenderer {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera_params));
         queue.write_buffer(&self.prev_vp_buffer, 0, bytemuck::bytes_of(prev_vp));
 
-        let wg_x = (half_w + 7) / 8;
-        let wg_y = (half_h + 7) / 8;
+        let wg_x = half_w.div_ceil(8);
+        let wg_y = half_h.div_ceil(8);
 
         // Determine ping-pong indices
         let output_idx = (self.frame_counter as usize + 1) % 2;

@@ -56,6 +56,8 @@ pub struct PostProcessRenderer {
     // AO bind group (group 1 on composite pipeline)
     ao_bind_group: wgpu::BindGroup,
     ao_bind_group_layout: wgpu::BindGroupLayout,
+    // One bind group per GTAO ping-pong output view (see update_ao_bind_group)
+    ao_bg_cache: Vec<(wgpu::TextureView, wgpu::BindGroup)>,
 
     // Buffers
     params_buffer: wgpu::Buffer,
@@ -580,6 +582,7 @@ impl PostProcessRenderer {
             fxaa_bind_group,
             ao_bind_group,
             ao_bind_group_layout,
+            ao_bg_cache: Vec::new(),
             params_buffer,
             blur_h_buffer,
             blur_v_buffer,
@@ -662,9 +665,15 @@ impl PostProcessRenderer {
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
     }
 
-    /// Update the AO bind group with the GTAO output texture
+    /// Update the AO bind group with the GTAO output texture. GTAO ping-pongs
+    /// between two output views, so keep a bind group per view and only
+    /// create on first sight (or after a resize swaps the views out).
     pub fn update_ao_bind_group(&mut self, device: &wgpu::Device, ao_view: &wgpu::TextureView) {
-        self.ao_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        if let Some((_, bg)) = self.ao_bg_cache.iter().find(|(view, _)| view == ao_view) {
+            self.ao_bind_group = bg.clone();
+            return;
+        }
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("PostProcess AO BG"),
             layout: &self.ao_bind_group_layout,
             entries: &[
@@ -674,6 +683,12 @@ impl PostProcessRenderer {
                 },
             ],
         });
+        // Only the current ping-pong pair is ever live
+        if self.ao_bg_cache.len() >= 2 {
+            self.ao_bg_cache.remove(0);
+        }
+        self.ao_bg_cache.push((ao_view.clone(), bg.clone()));
+        self.ao_bind_group = bg;
     }
 
     /// Get the scene texture view for rendering the scene to

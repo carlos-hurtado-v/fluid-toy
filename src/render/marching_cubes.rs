@@ -3,6 +3,8 @@
 //! Generates a triangle mesh from particle density field using the marching cubes algorithm.
 
 use bytemuck::{Pod, Zeroable};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
@@ -356,9 +358,22 @@ pub struct MarchingCubesRenderer {
 
     // For reading back vertex count
     counter_staging_buffer: wgpu::Buffer,
+    // Some(flag) while a staging map is in flight or mapped; the flag is set
+    // by the map_async callback. While Some, the staging buffer must not be
+    // copied into (validation error), so generate() skips that copy.
+    counter_map_done: Option<Arc<AtomicBool>>,
+    // A counter copy was encoded whose result hasn't been mapped yet
+    counter_copy_in_flight: bool,
 
     // Current vertex count (updated after generate pass)
     current_vertex_count: u32,
+
+    // Per-frame bind groups cached across frames; invalidated when the sim
+    // buffers they bind are swapped out (sim rebuild), the aniso buffer
+    // grows, or the density grid is rebuilt.
+    cached_density_bg: Option<wgpu::BindGroup>,
+    cached_aniso_bg: Option<wgpu::BindGroup>,
+    cached_sim_buffers: Option<[wgpu::Buffer; 4]>,
 
     // Grid bounds
     grid_min: [f32; 3],
@@ -1981,7 +1996,12 @@ impl MarchingCubesRenderer {
             env_bind_group,
             render_bind_group_layout,
             counter_staging_buffer,
+            counter_map_done: None,
+            counter_copy_in_flight: false,
             current_vertex_count: 0,
+            cached_density_bg: None,
+            cached_aniso_bg: None,
+            cached_sim_buffers: None,
             grid_min,
             grid_max,
             width,
@@ -1991,7 +2011,7 @@ impl MarchingCubesRenderer {
             ssr_view,
             ssr_pipeline,
             ssr_bind_group,
-            ssr_bind_group_layout: ssr_bind_group_layout,
+            ssr_bind_group_layout,
             ssr_params_buffer,
             ssr_color_sampler: color_sampler,
 
@@ -2095,16 +2115,16 @@ impl MarchingCubesRenderer {
 
         // Update blur radius for all 3 direction buffers
         let directions: [[i32; 3]; 3] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-        for i in 0..3 {
+        for (dir, buffer) in directions.iter().zip(&self.blur_params_buffers) {
             let blur_params = GpuBlurParams {
-                dir_x: directions[i][0],
-                dir_y: directions[i][1],
-                dir_z: directions[i][2],
+                dir_x: dir[0],
+                dir_y: dir[1],
+                dir_z: dir[2],
                 radius: blur_radius as i32,
                 grid_size: self.grid_size,
                 _pad: [0; 3],
             };
-            queue.write_buffer(&self.blur_params_buffers[i], 0, bytemuck::bytes_of(&blur_params));
+            queue.write_buffer(buffer, 0, bytemuck::bytes_of(&blur_params));
         }
     }
 
@@ -2135,6 +2155,9 @@ impl MarchingCubesRenderer {
                 mapped_at_creation: false,
             });
             self.aniso_capacity = capacity;
+            // Both cached bind groups reference the old aniso buffer
+            self.cached_density_bg = None;
+            self.cached_aniso_bg = None;
         }
     }
 
@@ -2251,6 +2274,10 @@ impl MarchingCubesRenderer {
         self.density_view = density_view;
         self._density_texture_b = density_texture_b;
         self._density_view_b = density_view_b;
+
+        // Cached density bind group references the old density view
+        self.cached_density_bg = None;
+        self.cached_aniso_bg = None;
     }
 
     /// Update container geometry (shared struct: geometry, rotation, physics, clip)
@@ -2323,55 +2350,92 @@ impl MarchingCubesRenderer {
         // Reset counter
         encoder.clear_buffer(&self.counter_buffer, 0, None);
 
+        // Invalidate cached bind groups if the sim handed us different buffer
+        // objects (sim rebuild on respawn/container change swaps them out)
+        let sim_buffers_changed = match &self.cached_sim_buffers {
+            Some([a, b, c, d]) => {
+                a != sorted_particle_buffer
+                    || b != cell_starts_buffer
+                    || c != cell_counts_buffer
+                    || d != sph_grid_params_buffer
+            }
+            None => true,
+        };
+        if sim_buffers_changed {
+            self.cached_sim_buffers = Some([
+                sorted_particle_buffer.clone(),
+                cell_starts_buffer.clone(),
+                cell_counts_buffer.clone(),
+                sph_grid_params_buffer.clone(),
+            ]);
+            self.cached_density_bg = None;
+            self.cached_aniso_bg = None;
+        }
+
         let run_aniso = aniso_enabled && num_particles > 0;
         if run_aniso {
             // Must happen before the density bind group is created below
+            // (may recreate aniso_buffer, which both bind groups reference)
             self.ensure_aniso_capacity(device, num_particles);
         }
 
-        // Create density bind group with SPH grid buffers
-        let density_bind_group = self.create_density_bind_group(
-            device,
-            sorted_particle_buffer,
-            cell_starts_buffer,
-            cell_counts_buffer,
-            sph_grid_params_buffer,
-        );
+        // Density bind group with SPH grid buffers (cached across frames)
+        let density_bind_group = match &self.cached_density_bg {
+            Some(bg) => bg.clone(),
+            None => {
+                let bg = self.create_density_bind_group(
+                    device,
+                    sorted_particle_buffer,
+                    cell_starts_buffer,
+                    cell_counts_buffer,
+                    sph_grid_params_buffer,
+                );
+                self.cached_density_bg = Some(bg.clone());
+                bg
+            }
+        };
 
         // Pass 0: Per-particle anisotropic kernel fit (covariance + eigensolve).
         // Separate compute pass gives an implicit barrier before the density pass.
         if run_aniso {
-            let layout = self.aniso_pipeline.get_bind_group_layout(0);
-            let aniso_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("MC Anisotropy BG"),
-                layout: &layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: sorted_particle_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: cell_starts_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: cell_counts_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: sph_grid_params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: self.aniso_params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: self.aniso_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+            let aniso_bind_group = match &self.cached_aniso_bg {
+                Some(bg) => bg.clone(),
+                None => {
+                    let layout = self.aniso_pipeline.get_bind_group_layout(0);
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("MC Anisotropy BG"),
+                        layout: &layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: sorted_particle_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: cell_starts_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: cell_counts_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: sph_grid_params_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: self.aniso_params_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: self.aniso_buffer.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    self.cached_aniso_bg = Some(bg.clone());
+                    bg
+                }
+            };
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("MC Anisotropy Pass"),
                 timestamp_writes: None,
@@ -2389,14 +2453,14 @@ impl MarchingCubesRenderer {
             });
             pass.set_pipeline(&self.density_pipeline);
             pass.set_bind_group(0, &density_bind_group, &[]);
-            let workgroups = (self.grid_size + 3) / 4;
+            let workgroups = self.grid_size.div_ceil(4);
             pass.dispatch_workgroups(workgroups, workgroups, workgroups);
         }
 
         // Pass 1.5: Blur density field (3 separable passes: X, Y, Z)
         // After blur: result is in texture B (odd number of passes: a->b, b->a, a->b)
         let result_in_b = if blur_radius > 0 {
-            let workgroups = (self.grid_size + 3) / 4;
+            let workgroups = self.grid_size.div_ceil(4);
             // Pass order: X(a->b), Y(b->a), Z(a->b)
             // a_to_b = 0, b_to_a = 1
             let pass_sources = [0usize, 1, 0]; // which bind group variant per pass
@@ -2426,7 +2490,7 @@ impl MarchingCubesRenderer {
             } else {
                 pass.set_bind_group(0, &self.generate_bind_group, &[]);
             }
-            let workgroups = (self.grid_size + 3) / 4;
+            let workgroups = self.grid_size.div_ceil(4);
             pass.dispatch_workgroups(workgroups, workgroups, workgroups);
         }
 
@@ -2439,14 +2503,19 @@ impl MarchingCubesRenderer {
             std::mem::size_of::<u32>() as u64,  // Just the vertex_count
         );
 
-        // Copy counter to staging buffer for readback (for stats display)
-        encoder.copy_buffer_to_buffer(
-            &self.counter_buffer,
-            0,
-            &self.counter_staging_buffer,
-            0,
-            std::mem::size_of::<Counter>() as u64,
-        );
+        // Copy counter to staging buffer for readback (for stats display) —
+        // unless the staging buffer is still mapped/pending from an earlier
+        // frame, in which case skip and let the stat stay stale one frame
+        if self.counter_map_done.is_none() {
+            encoder.copy_buffer_to_buffer(
+                &self.counter_buffer,
+                0,
+                &self.counter_staging_buffer,
+                0,
+                std::mem::size_of::<Counter>() as u64,
+            );
+            self.counter_copy_in_flight = true;
+        }
     }
 
     /// Last read-back mesh vertex count (see `read_vertex_count`)
@@ -2454,18 +2523,59 @@ impl MarchingCubesRenderer {
         self.current_vertex_count
     }
 
-    /// Read back vertex count (call after submit, before next frame)
+    /// Read back vertex count, blocking until the GPU finishes (call after
+    /// submit). Exact for the frame just submitted — automation/stats runs
+    /// use this so CSV rows stay deterministic.
     pub fn read_vertex_count(&mut self, device: &wgpu::Device) {
-        let slice = self.counter_staging_buffer.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.arm_counter_map();
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        self.harvest_counter_map();
+    }
 
+    /// Non-blocking variant for interactive frames: harvests a previously
+    /// issued readback if the GPU has finished it, then arms the next one.
+    /// The count lags a frame or two, which only affects the GUI stat —
+    /// rendering uses the GPU-side indirect buffer.
+    pub fn poll_vertex_count(&mut self, device: &wgpu::Device) {
+        device.poll(wgpu::PollType::Poll).ok();
+        self.harvest_counter_map();
+        self.arm_counter_map();
+    }
+
+    /// If a counter copy was submitted and no map is outstanding, start one.
+    fn arm_counter_map(&mut self) {
+        if self.counter_map_done.is_some() || !self.counter_copy_in_flight {
+            return;
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        let done = flag.clone();
+        self.counter_staging_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                if result.is_ok() {
+                    done.store(true, Ordering::Release);
+                }
+            });
+        self.counter_map_done = Some(flag);
+        self.counter_copy_in_flight = false;
+    }
+
+    /// If the outstanding map has completed, read the count and unmap.
+    fn harvest_counter_map(&mut self) {
+        let done = self
+            .counter_map_done
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
+        if !done {
+            return;
+        }
         {
-            let data = slice.get_mapped_range();
+            let data = self.counter_staging_buffer.slice(..).get_mapped_range();
             let counter: &Counter = bytemuck::from_bytes(&data);
             self.current_vertex_count = counter.vertex_count.min(MAX_VERTICES);
         }
         self.counter_staging_buffer.unmap();
+        self.counter_map_done = None;
     }
 
     /// Render the generated mesh with environment background.
@@ -2610,8 +2720,8 @@ impl MarchingCubesRenderer {
             });
             ssr_pass.set_pipeline(&self.ssr_pipeline);
             ssr_pass.set_bind_group(0, &self.ssr_bind_group, &[]);
-            let wg_x = (self.width + 7) / 8;
-            let wg_y = (self.height + 7) / 8;
+            let wg_x = self.width.div_ceil(8);
+            let wg_y = self.height.div_ceil(8);
             ssr_pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 

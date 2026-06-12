@@ -1,5 +1,9 @@
 //! Fluid Toy - A framework for GPU-accelerated particle simulations
 
+// Renderer constructors/entry points legitimately take many GPU resource refs
+// (device, queue, views, samplers, formats); bundling them adds no clarity.
+#![allow(clippy::too_many_arguments)]
+
 mod app;
 mod gpu;
 mod gui;

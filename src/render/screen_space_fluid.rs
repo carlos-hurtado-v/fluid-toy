@@ -144,7 +144,6 @@ pub struct ScreenSpaceFluidRenderer {
     filter_bgl: wgpu::BindGroupLayout,
     thickness_blur_bgl: wgpu::BindGroupLayout,
     normal_bgl: wgpu::BindGroupLayout,
-    composite_uniform_bgl: wgpu::BindGroupLayout,
     composite_texture_bgl: wgpu::BindGroupLayout,
     env_bgl: wgpu::BindGroupLayout,
 
@@ -985,7 +984,7 @@ impl ScreenSpaceFluidRenderer {
             filter_pipeline, thickness_blur_pipeline,
             normal_pipeline, composite_pipeline, env_pipeline,
             splat_bgl, filter_bgl, thickness_blur_bgl, normal_bgl,
-            composite_uniform_bgl, composite_texture_bgl, env_bgl,
+            composite_texture_bgl, env_bgl,
             filter_h_bg, filter_v_bg,
             filter_2d_bg, filter_2d_back_bg,
             thickness_blur_h_bg, thickness_blur_v_bg,
@@ -1060,6 +1059,9 @@ impl ScreenSpaceFluidRenderer {
 
     // ── Public API ────────────────────────────────────────────────────────
 
+    // The hardware splat depth IS this renderer's public depth output (the
+    // R32Float `depth_view` field is the internal linear-depth working texture).
+    #[allow(clippy::misnamed_getters)]
     pub fn depth_view(&self) -> &wgpu::TextureView {
         &self.hw_depth_view
     }
@@ -1309,10 +1311,10 @@ impl ScreenSpaceFluidRenderer {
             ],
         });
 
-        let wg_x = (self.width + 15) / 16;
-        let wg_y = (self.height + 15) / 16;
-        let wg_tx = (thick_w + 15) / 16;
-        let wg_ty = (thick_h + 15) / 16;
+        let wg_x = self.width.div_ceil(16);
+        let wg_y = self.height.div_ceil(16);
+        let wg_tx = thick_w.div_ceil(16);
+        let wg_ty = thick_h.div_ceil(16);
 
         // ── Pass 1: Depth splatting ───────────────────────────────────────
         {

@@ -15,7 +15,7 @@ pub use interaction::*;
 /// Complete application state - GUI binds to this.
 /// Serializes to the JSON config format (`--config` / Export Config);
 /// runtime values are skipped. Missing sections/fields fall back to defaults.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(default)]
 pub struct AppState {
     pub simulation: SimulationConfig,
@@ -32,26 +32,6 @@ pub struct AppState {
     pub mouse_force: MouseForceConfig,
     #[serde(skip)]
     pub runtime: RuntimeState,
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self {
-            simulation: SimulationConfig::default(),
-            container: ContainerConfig::default(),
-            sph: SphConfig::default(),
-            rendering: RenderConfig::default(),
-            environment: EnvironmentConfig::default(),
-            lighting: LightingConfig::default(),
-            quality: QualityConfig::default(),
-            post_process: PostProcessConfig::default(),
-            camera: CameraConfig::default(),
-            rigid_body: RigidBodyConfig::default(),
-            spray: SprayConfig::default(),
-            mouse_force: MouseForceConfig::default(),
-            runtime: RuntimeState::default(),
-        }
-    }
 }
 
 /// Camera configuration for 3D viewing

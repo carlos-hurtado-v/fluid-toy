@@ -1,30 +1,27 @@
 //! Rendering, environment, lighting, and quality configuration
 
 /// Fluid render mode selection
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum FluidRenderMode {
     /// Simple particle spheres (fast, debug-friendly)
     Particles,
     /// Marching cubes mesh generation (true surface)
+    #[default]
     MarchingCubes,
     /// Screen-space fluid rendering (depth smoothing + narrow-range filter)
     ScreenSpace,
 }
 
-impl Default for FluidRenderMode {
-    fn default() -> Self {
-        Self::MarchingCubes
-    }
-}
 
 /// Marching cubes grid resolution presets
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum McGridResolution {
     /// 80³ voxels — fast, lower surface detail
     Low,
     /// 128³ voxels — balanced
     Medium,
     /// 200³ voxels — high detail, smooth surfaces
+    #[default]
     High,
 }
 
@@ -48,11 +45,6 @@ impl McGridResolution {
     pub const ALL: [McGridResolution; 3] = [Self::Low, Self::Medium, Self::High];
 }
 
-impl Default for McGridResolution {
-    fn default() -> Self {
-        Self::High
-    }
-}
 
 /// Which HDR environment map to use
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

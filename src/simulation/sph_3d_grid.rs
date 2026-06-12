@@ -1422,7 +1422,7 @@ impl SphSimulation3DGrid {
             // After N iterations: if N is even, last write went to A (via solve_b reading B, writing A)
             // Wait — predict writes to A. Solve iter 0 reads A, writes B. Iter 1 reads B, writes A.
             // So for N iters: if N is even, final result is in A. If N is odd, final result is in B.
-            let finalize_bg = if self.pcisph_iterations % 2 == 0 {
+            let finalize_bg = if self.pcisph_iterations.is_multiple_of(2) {
                 &self.pcisph_finalize_bind_group_a
             } else {
                 &self.pcisph_finalize_bind_group_b

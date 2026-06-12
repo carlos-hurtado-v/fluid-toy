@@ -266,14 +266,9 @@ fn voxelize_sdf(vertices: &[MeshVertex], indices: &[u32], resolution: u32) -> Sd
                     // Squared distance from point to triangle AABB — if this alone
                     // exceeds our current best, the triangle itself can't be closer
                     let mut aabb_dist_sq = 0.0f32;
-                    for i in 0..3 {
-                        if p[i] < tri.aabb_min[i] {
-                            let d = tri.aabb_min[i] - p[i];
-                            aabb_dist_sq += d * d;
-                        } else if p[i] > tri.aabb_max[i] {
-                            let d = p[i] - tri.aabb_max[i];
-                            aabb_dist_sq += d * d;
-                        }
+                    for ((&pc, &lo), &hi) in p.iter().zip(&tri.aabb_min).zip(&tri.aabb_max) {
+                        let d = pc - pc.clamp(lo, hi);
+                        aabb_dist_sq += d * d;
                     }
                     if aabb_dist_sq >= best_dist_sq {
                         continue;
@@ -314,7 +309,7 @@ fn ray_triangle_x(py: f32, pz: f32, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) ->
     let f = 1.0 / a;
     let s = [-v0[0], py - v0[1], pz - v0[2]];
     let u = f * dot3(s, h);
-    if u < 0.0 || u > 1.0 {
+    if !(0.0..=1.0).contains(&u) {
         return None;
     }
     let q = cross3(s, e1);

@@ -243,7 +243,7 @@ impl Default for GpuRigidBody {
 
 /// GPU rigid body force accumulator (32 bytes, atomic i32 on GPU side)
 #[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable, Default)]
 pub struct GpuRigidBodyAccum {
     pub force_x: i32,       // fixed-point × 1000
     pub force_y: i32,
@@ -255,20 +255,6 @@ pub struct GpuRigidBodyAccum {
     pub _pad: u32,
 }
 
-impl Default for GpuRigidBodyAccum {
-    fn default() -> Self {
-        Self {
-            force_x: 0,
-            force_y: 0,
-            force_z: 0,
-            contact_count: 0,
-            torque_x: 0,
-            torque_y: 0,
-            torque_z: 0,
-            _pad: 0,
-        }
-    }
-}
 
 /// GPU rigid body rendering parameters (96 bytes)
 #[repr(C)]
@@ -320,7 +306,7 @@ pub fn integrate_rigid_body(
     let dv_mag = (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]).sqrt();
     if dv_mag > max_dv {
         let scale = max_dv / dv_mag;
-        for i in 0..3 { dv[i] *= scale; }
+        for d in &mut dv { *d *= scale; }
     }
     for i in 0..3 {
         rigid_body.velocity[i] += dv[i] + total_dt * gravity[i];
@@ -347,11 +333,11 @@ pub fn integrate_rigid_body(
         let dw_mag = (dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]).sqrt();
         if dw_mag > max_dw {
             let scale = max_dw / dw_mag;
-            for i in 0..3 { dw[i] *= scale; }
+            for d in &mut dw { *d *= scale; }
         }
-        for i in 0..3 {
-            rigid_body.angular_velocity[i] += dw[i];
-            rigid_body.angular_velocity[i] *= 0.98; // Angular damping
+        for (w, &d) in rigid_body.angular_velocity.iter_mut().zip(&dw) {
+            *w += d;
+            *w *= 0.98; // Angular damping
         }
 
         // Quaternion integration: q += 0.5 * dt * [ω, 0] * q
