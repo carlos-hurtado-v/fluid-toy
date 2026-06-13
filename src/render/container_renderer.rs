@@ -3,7 +3,7 @@
 use wgpu::util::DeviceExt;
 
 use crate::render::camera::GpuCameraParams;
-use crate::state::{ContainerConfig, GpuContainerGeometry, GpuShCoefficients};
+use crate::state::{ContainerConfig, GpuContainerGeometry, GpuShCoefficients, LightingConfig};
 
 /// Pool material style parameters (tile pattern, lighting)
 #[repr(C)]
@@ -15,25 +15,47 @@ pub struct GpuPoolStyle {
     pub specular_strength: f32,
     pub light_dir: [f32; 3],
     pub grout_width: f32,
+    /// Sun color x intensity, zeroed when the sun is disabled.
+    /// Scales the pool's direct sun, specular, and caustic terms.
+    pub sun_rgb: [f32; 3],
     pub ibl_strength: f32,
+    /// Caustic irradiance multiplier on the floor (0 = caustics inactive)
+    pub caustic_strength: f32,
+    /// How strongly water shadows remove direct sun from the floor
+    pub shadow_strength: f32,
+    /// Contrast exponent on the caustic map (1 = physical; >1 sharpens
+    /// filaments and deepens lanes around the flat-water level of 1.0)
+    pub caustic_focus: f32,
     pub _pad0: f32,
-    pub _pad1: f32,
-    pub _pad2: f32,
 }
 
 impl GpuPoolStyle {
-    pub fn from_config(config: &ContainerConfig, light_dir: [f32; 3]) -> Self {
+    pub fn from_config(
+        config: &ContainerConfig,
+        lighting: &LightingConfig,
+        caustic_strength: f32,
+        shadow_strength: f32,
+        caustic_focus: f32,
+    ) -> Self {
+        let sun_on = if lighting.sun_enabled { 1.0 } else { 0.0 };
+        let sun_rgb = [
+            lighting.sun_color[0] * lighting.sun_intensity * sun_on,
+            lighting.sun_color[1] * lighting.sun_intensity * sun_on,
+            lighting.sun_color[2] * lighting.sun_intensity * sun_on,
+        ];
         Self {
             tile_color: config.tile_color,
             tile_scale: config.tile_scale,
             grout_color: config.grout_color,
             specular_strength: config.specular_strength,
-            light_dir,
+            light_dir: lighting.sun_direction_normalized(),
             grout_width: config.grout_width,
+            sun_rgb,
             ibl_strength: 0.6,
+            caustic_strength,
+            shadow_strength,
+            caustic_focus,
             _pad0: 0.0,
-            _pad1: 0.0,
-            _pad2: 0.0,
         }
     }
 }
@@ -79,6 +101,8 @@ impl ContainerRenderer {
         msaa_sample_count: u32,
         kernel_radius: f32,
         sh_coefficients: &GpuShCoefficients,
+        caustic_view: &wgpu::TextureView,
+        caustic_sampler: &wgpu::Sampler,
     ) -> Self {
         // Load shader (prepend container_common.wgsl)
         let container_common_wgsl = include_str!("../shaders/container_common.wgsl");
@@ -156,6 +180,22 @@ impl ContainerRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -178,6 +218,14 @@ impl ContainerRenderer {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: pool_style_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(caustic_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(caustic_sampler),
                 },
             ],
         });
@@ -410,6 +458,12 @@ impl ContainerRenderer {
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         render_pass.draw_indexed(0..self.index_count, 0, 0..1);
+    }
+
+    /// Pool mesh buffers for external depth-only draws (caustics light-space
+    /// occluder). Rebuilt on dimension change, so re-fetch every frame.
+    pub fn mesh_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer, u32) {
+        (&self.vertex_buffer, &self.index_buffer, self.index_count)
     }
 
     /// Render depth-only (for GTAO front depth prepass)

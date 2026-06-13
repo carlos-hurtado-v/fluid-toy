@@ -24,6 +24,7 @@ pub struct AppState {
     pub rendering: RenderConfig,
     pub environment: EnvironmentConfig,
     pub lighting: LightingConfig,
+    pub caustics: CausticsConfig,
     pub quality: QualityConfig,
     pub post_process: PostProcessConfig,
     pub camera: CameraConfig,

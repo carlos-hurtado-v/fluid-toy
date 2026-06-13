@@ -5,7 +5,8 @@
 # Requires: cargo install naga-cli --version "^27"  (major must match wgpu in Cargo.lock)
 #
 # Keep PREFIXED in sync with the format!("{}\n{}", container_common_wgsl, ...) call
-# sites: marching_cubes.rs, sph_3d_grid.rs, spray.rs, wireframe.rs, container_renderer.rs.
+# sites: marching_cubes.rs, sph_3d_grid.rs, spray.rs, wireframe.rs, container_renderer.rs,
+# caustics.rs.
 
 $ErrorActionPreference = "Stop"
 
@@ -16,6 +17,8 @@ $prefixed = @(
     "mc_density.wgsl",
     "mc_render.wgsl",
     "mc_back_depth.wgsl",
+    "mc_caustics_gbuffer.wgsl",
+    "mc_caustics_splat.wgsl",
     "sph_density_3d_grid.wgsl",
     "sph_integrate_3d.wgsl",
     "spray_simulate.wgsl",

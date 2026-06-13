@@ -2285,6 +2285,17 @@ impl MarchingCubesRenderer {
         queue.write_buffer(&self.container_geom_buffer, 0, bytemuck::bytes_of(geom));
     }
 
+    /// MC mesh vertex storage buffer (allocated once; never recreated).
+    /// Used by the caustics light-space raster pass.
+    pub fn mesh_vertex_buffer(&self) -> &wgpu::Buffer {
+        &self.vertex_buffer
+    }
+
+    /// GPU-driven indirect draw args for the MC mesh (vertex count filled by generate)
+    pub fn mesh_indirect_buffer(&self) -> &wgpu::Buffer {
+        &self.indirect_buffer
+    }
+
     /// Update water shading parameters
     pub fn update_water_params(
         &self,

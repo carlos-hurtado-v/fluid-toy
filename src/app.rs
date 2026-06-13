@@ -17,7 +17,7 @@ use wgpu::util::DeviceExt;
 use crate::gpu::GpuContext;
 use crate::launch::LaunchOptions;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, ContainerRenderer, GpuPoolStyle, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, ScreenSpaceFluidRenderer, SprayRenderer, WireframeRenderer};
+use crate::render::{Camera, CausticsRenderer, ContainerRenderer, GpuPoolStyle, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, ScreenSpaceFluidRenderer, SprayRenderer, WireframeRenderer};
 use crate::state::ContainerStyle;
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
@@ -33,6 +33,7 @@ pub struct App {
     ss_renderer: Option<ScreenSpaceFluidRenderer>,
     wireframe_renderer: Option<WireframeRenderer>,
     container_renderer: Option<ContainerRenderer>,
+    caustics_renderer: Option<CausticsRenderer>,
     rigid_body_renderer: Option<RigidBodyRenderer>,
     rigid_body_depth_view: Option<wgpu::TextureView>,  // Fallback depth for modes without shared depth
     spray_system: Option<SpraySystem>,
@@ -126,6 +127,7 @@ impl App {
             ss_renderer: None,
             wireframe_renderer: None,
             container_renderer: None,
+            caustics_renderer: None,
             rigid_body_renderer: None,
             rigid_body_depth_view: None,
             spray_system: None,
@@ -285,10 +287,21 @@ impl App {
             &container_geom,
         );
 
+        // Create caustics renderer (raster source = MC mesh; output sampled by container)
+        let caustics_renderer = CausticsRenderer::new(
+            &gpu.device,
+            mc_renderer.mesh_vertex_buffer(),
+            &container_geom,
+            &self.state.caustics,
+        );
+
         // Create opaque pool container renderer
         let pool_style = GpuPoolStyle::from_config(
             &self.state.container,
-            self.state.lighting.sun_direction_normalized(),
+            &self.state.lighting,
+            0.0,
+            0.0,
+            1.0,
         );
         let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
         let container_renderer = ContainerRenderer::new(
@@ -301,6 +314,8 @@ impl App {
             self.state.quality.msaa.as_u32(),
             self.state.sph.kernel_radius,
             &gpu_sh,
+            caustics_renderer.display_view(),
+            caustics_renderer.sampler(),
         );
 
         // Create rigid body renderer + fallback depth texture
@@ -522,6 +537,7 @@ impl App {
         self.ss_renderer = Some(ss_renderer);
         self.wireframe_renderer = Some(wireframe_renderer);
         self.container_renderer = Some(container_renderer);
+        self.caustics_renderer = Some(caustics_renderer);
         self.rigid_body_renderer = Some(rigid_body_renderer);
         self.rigid_body_depth_view = Some(rigid_body_depth_view);
         self.spray_system = Some(spray_system);
@@ -621,12 +637,22 @@ impl App {
         }
     }
 
+    /// Caustics run only for the MC water surface, in the opaque pool
+    /// (the floor is the receiver), lit by the sun.
+    fn caustics_active(&self) -> bool {
+        self.state.caustics.enabled
+            && self.state.rendering.render_mode == FluidRenderMode::MarchingCubes
+            && self.state.container.style == ContainerStyle::OpaquePool
+            && self.state.lighting.sun_enabled
+    }
+
     fn reset_defaults(&mut self) {
         self.state.simulation.reset_defaults();
         self.state.sph.reset_defaults();
         self.state.rendering.reset_defaults();
         self.state.camera.reset_defaults();
         self.state.lighting.reset_defaults();
+        self.state.caustics.reset_defaults();
         self.state.container.reset_defaults();
         self.state.rigid_body.reset_defaults();
         self.state.spray.reset_defaults();
@@ -932,6 +958,7 @@ impl App {
 
         let gpu = self.gpu.as_ref().unwrap();
         let substep_dt = self.simulation_substep_dt();
+        let caustics_on = self.caustics_active();
         if let (Some(sph_sim), Some(renderer)) = (&mut self.sph_simulation, &self.renderer) {
             let sph_params = self.state.sph.to_gpu_params_3d(
                 self.state.runtime.particle_count,
@@ -956,14 +983,29 @@ impl App {
 
             // Update opaque pool container renderer
             if let Some(container_r) = &mut self.container_renderer {
+                let (caustic_strength, shadow_strength) = if caustics_on {
+                    (self.state.caustics.intensity, self.state.caustics.shadow_strength)
+                } else {
+                    (0.0, 0.0)
+                };
                 let pool_style = GpuPoolStyle::from_config(
                     &self.state.container,
-                    self.state.lighting.sun_direction_normalized(),
+                    &self.state.lighting,
+                    caustic_strength,
+                    shadow_strength,
+                    self.state.caustics.focus.max(0.1),
                 );
                 container_r.update_container_geometry(&gpu.queue, &container_geom);
                 container_r.update_pool_style(&gpu.queue, &pool_style);
                 container_r.update_camera(&gpu.queue, &self.camera.to_gpu_params());
                 container_r.maybe_rebuild_mesh(&gpu.device, &self.state.container, self.state.sph.kernel_radius);
+            }
+            // Drop caustic temporal history while inactive so re-enabling
+            // starts from the current frame instead of stale data
+            if !caustics_on {
+                if let Some(caustics) = &mut self.caustics_renderer {
+                    caustics.invalidate_history();
+                }
             }
 
             // Update gravity (based on tilt)
@@ -1402,6 +1444,7 @@ impl App {
                 }
                 FluidRenderMode::MarchingCubes => {
                     // Marching cubes surface mesh rendering
+                    let caustics_on = self.caustics_active();
                     if let Some(mc_renderer) = &mut self.mc_renderer {
                         let camera_params = self.camera.to_gpu_params();
                         mc_renderer.update_camera(&gpu.queue, &camera_params);
@@ -1441,7 +1484,7 @@ impl App {
                         );
 
                         // Update container geometry for MC clipping (with clip_margin from MC cell_size)
-                        {
+                        let mc_geom = {
                             let c = &self.state.container;
                             let is_pool = c.style == ContainerStyle::OpaquePool;
                             let grid_extent = (aabb_max[0] - aabb_min[0] + 2.0 * mc_margin)
@@ -1455,7 +1498,8 @@ impl App {
                                 mc_cell_size * 1.5,
                             );
                             mc_renderer.update_container_geometry(&gpu.queue, &geom);
-                        }
+                            geom
+                        };
 
                         let iso_value = self.state.rendering.compute_iso_value(self.state.sph.kernel_radius);
                         let blur_radius = self.state.rendering.mc_blur_radius;
@@ -1493,6 +1537,31 @@ impl App {
                                 mc_renderer.foam_density_view(),
                                 self.state.spray.enabled,
                             );
+                        }
+                        // Caustics: raster the fresh MC mesh from the sun and
+                        // splat refracted photons onto the pool floor map. Runs
+                        // before mc_renderer.render() so the container picks up
+                        // this frame's map in both background and main passes.
+                        if caustics_on {
+                            if let Some(caustics) = &mut self.caustics_renderer {
+                                caustics.update(
+                                    &gpu.queue,
+                                    &mc_geom,
+                                    self.state.lighting.sun_direction_normalized(),
+                                    &self.state.caustics,
+                                    self.state.rendering.water_clarity,
+                                    self.state.runtime.time_elapsed,
+                                );
+                                let container_mesh = self
+                                    .container_renderer
+                                    .as_ref()
+                                    .map(|c| c.mesh_buffers());
+                                caustics.run(
+                                    &mut encoder,
+                                    mc_renderer.mesh_indirect_buffer(),
+                                    container_mesh,
+                                );
+                            }
                         }
                         // Pass rigid body renderer into MC pass for proper MSAA depth testing
                         let rb_for_mc = if self.state.rigid_body.enabled {

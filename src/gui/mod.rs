@@ -583,6 +583,50 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     );
 
                 }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.checkbox(&mut state.caustics.enabled, "Caustics (Pool Floor)");
+                if state.caustics.enabled {
+                    let active = state.lighting.sun_enabled
+                        && state.container.style == ContainerStyle::OpaquePool
+                        && state.rendering.render_mode == FluidRenderMode::MarchingCubes;
+                    if !active {
+                        ui.label("(needs Sun + Pool container + Marching Cubes)");
+                    }
+                    ui.add(
+                        egui::Slider::new(&mut state.caustics.intensity, 0.0..=3.0)
+                            .text("Intensity")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.caustics.shadow_strength, 0.0..=1.0)
+                            .text("Water Shadow")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.caustics.focus, 1.0..=4.0)
+                            .text("Focus")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.caustics.dispersion, 0.0..=1.0)
+                            .text("Dispersion")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.caustics.ripple_strength, 0.0..=0.25)
+                            .text("Ripple Detail")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.caustics.splat_size, 0.35..=2.5)
+                            .text("Splat Size")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.caustics.blur_sigma, 0.3..=3.0)
+                            .text("Blur")
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.caustics.temporal_smoothing, 0.0..=0.95)
+                            .text("Temporal Smoothing")
+                    );
+                }
             });
 
             ui.add_space(8.0);

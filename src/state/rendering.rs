@@ -163,6 +163,59 @@ impl LightingConfig {
     }
 }
 
+/// Caustics configuration (light-space forward splatting onto the pool floor).
+/// Active only in Marching Cubes mode with the OpaquePool container and sun enabled.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CausticsConfig {
+    /// Enable caustics + water shadows on the pool floor
+    pub enabled: bool,
+    /// Caustic brightness multiplier (1 = energy-conserving)
+    pub intensity: f32,
+    /// How strongly water removes direct sun from the floor (1 = physical)
+    pub shadow_strength: f32,
+    /// Contrast exponent on the caustic map (1 = physical; >1 sharpens
+    /// filaments and deepens dark lanes without raising mean brightness)
+    pub focus: f32,
+    /// Chromatic dispersion: per-channel IOR spread (0 = white caustics)
+    pub dispersion: f32,
+    /// Photon splat footprint as a multiple of photon spacing on the floor
+    pub splat_size: f32,
+    /// Gaussian blur sigma applied to the caustic map (in map texels)
+    pub blur_sigma: f32,
+    /// Temporal EMA history weight (0 = no smoothing, higher = more stable)
+    pub temporal_smoothing: f32,
+    /// Procedural micro-ripple gain for the caustics light pass. Supplies the
+    /// sub-mesh surface detail that forms fine filaments; decoupled from the
+    /// surface ripple_strength (caustic focusing needs more than specular).
+    pub ripple_strength: f32,
+    /// Light-space raster resolution (config-only, applied at startup)
+    pub light_resolution: u32,
+}
+
+impl Default for CausticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            intensity: 1.0,
+            shadow_strength: 0.6,
+            focus: 2.5,
+            dispersion: 0.0,
+            splat_size: 0.5,
+            blur_sigma: 0.3,
+            temporal_smoothing: 0.0,
+            ripple_strength: 0.13,
+            light_resolution: 768,
+        }
+    }
+}
+
+impl CausticsConfig {
+    pub fn reset_defaults(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Rendering configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]

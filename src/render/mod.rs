@@ -1,6 +1,7 @@
 //! Rendering module
 
 pub mod camera;
+pub mod caustics;
 pub mod container_renderer;
 pub mod environment;
 pub mod gtao;
@@ -15,6 +16,7 @@ pub mod spray_renderer;
 pub mod wireframe;
 
 pub use camera::{Camera, GpuCameraParams};
+pub use caustics::CausticsRenderer;
 pub use container_renderer::{ContainerRenderer, GpuPoolStyle};
 pub use gtao::GtaoRenderer;
 pub use marching_cubes::MarchingCubesRenderer;
