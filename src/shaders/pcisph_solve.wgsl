@@ -28,7 +28,7 @@ struct SphParams {
     surface_tension: f32,
     pcisph_delta: f32,
     xsph_epsilon: f32,
-    _pad_st2: f32,
+    boundary_density: f32,
 }
 
 struct GridParams {
@@ -64,6 +64,8 @@ struct PredictedState {
 @group(0) @binding(5) var<storage, read> cell_counts: array<u32>;
 @group(0) @binding(6) var<uniform> grid: GridParams;
 @group(0) @binding(7) var<storage, read> sorted_to_orig: array<u32>;
+@group(0) @binding(8) var<uniform> container: ContainerGeometry;
+@group(0) @binding(9) var<storage, read> rigid_bodies: RigidBodies;
 
 const PI: f32 = 3.14159265359;
 
@@ -174,6 +176,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
 
+    // Boundary density: fill the missing-neighbor deficit near container
+    // walls and rigid bodies (solids treated as rest-density fluid) so
+    // compression against a boundary produces pressure pushback instead of
+    // free densification up to the penalty layer. Solve-only — the main
+    // density pass (surface tension, spray potentials, near-pressure) is
+    // deliberately untouched.
+    if (params.boundary_density > 0.0) {
+        pred_density += params.boundary_density * params.rest_density
+            * boundary_density_fraction(pred_pos, params.kernel_radius);
+    }
+
     // Update pressure: only correct compression (density > rest)
     let density_error = max(0.0, pred_density - params.rest_density);
     let new_pressure = old_pressure + params.pcisph_delta * density_error;
@@ -197,7 +210,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let a_total = a_np + a_pressure;
     let v_star = original_vel + params.dt * a_total;
-    let x_star = original_pos + params.dt * v_star;
+    // Boundary-aware prediction: clamp the predicted position (density
+    // signal only — v_star stays free; walls/bodies act in integrate)
+    let x_star = boundary_clamp_predicted(original_pos + params.dt * v_star);
 
     sorted_predicted_out[s] = PredictedState(
         x_star.x, x_star.y, x_star.z,

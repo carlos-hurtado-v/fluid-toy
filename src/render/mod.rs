@@ -22,7 +22,7 @@ pub use gtao::GtaoRenderer;
 pub use marching_cubes::MarchingCubesRenderer;
 pub use particle_renderer_3d::ParticleRenderer3D;
 pub use post_process::PostProcessRenderer;
-pub use rigid_body_renderer::RigidBodyRenderer;
+pub use rigid_body_renderer::{RigidBodyDraw, RigidBodyRenderer};
 pub use screen_space_fluid::ScreenSpaceFluidRenderer;
 pub use spray_renderer::SprayRenderer;
 pub use wireframe::WireframeRenderer;

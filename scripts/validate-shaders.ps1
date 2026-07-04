@@ -6,12 +6,14 @@
 #
 # Keep PREFIXED in sync with the format!("{}\n{}", container_common_wgsl, ...) call
 # sites: marching_cubes.rs, sph_3d_grid.rs, spray.rs, wireframe.rs, container_renderer.rs,
-# caustics.rs.
+# caustics.rs. RIGIDPREFIXED shaders get container_common + rigid_body_common
+# (sph_3d_grid.rs integrate/predict/solve).
 
 $ErrorActionPreference = "Stop"
 
 $shaderDir = Join-Path $PSScriptRoot "..\src\shaders"
 $common = Join-Path $shaderDir "container_common.wgsl"
+$rigidCommon = Join-Path $shaderDir "rigid_body_common.wgsl"
 
 $prefixed = @(
     "mc_density.wgsl",
@@ -20,19 +22,28 @@ $prefixed = @(
     "mc_caustics_gbuffer.wgsl",
     "mc_caustics_splat.wgsl",
     "sph_density_3d_grid.wgsl",
-    "sph_integrate_3d.wgsl",
     "spray_simulate.wgsl",
     "wireframe.wgsl",
     "container.wgsl"
 )
 
+$rigidPrefixed = @(
+    "sph_integrate_3d.wgsl",
+    "pcisph_predict.wgsl",
+    "pcisph_solve.wgsl"
+)
+
 $failures = 0
 $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "naga_validate_concat.wgsl"
 
-Get-ChildItem $shaderDir -Filter *.wgsl | Where-Object { $_.Name -ne "container_common.wgsl" } | ForEach-Object {
+Get-ChildItem $shaderDir -Filter *.wgsl | Where-Object { $_.Name -notin @("container_common.wgsl", "rigid_body_common.wgsl") } | ForEach-Object {
     $target = $_.FullName
     if ($prefixed -contains $_.Name) {
         (Get-Content $common -Raw) + "`n" + (Get-Content $target -Raw) | Set-Content $tempFile -NoNewline
+        $target = $tempFile
+    }
+    elseif ($rigidPrefixed -contains $_.Name) {
+        (Get-Content $common -Raw) + "`n" + (Get-Content $rigidCommon -Raw) + "`n" + (Get-Content $target -Raw) | Set-Content $tempFile -NoNewline
         $target = $tempFile
     }
     $output = & naga $target 2>&1

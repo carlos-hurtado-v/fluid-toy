@@ -1,6 +1,20 @@
 //! Rigid body configuration, quaternion helpers, CPU integration, and GPU types
+//!
+//! Bodies come in three motion types:
+//! - `Static` — immovable obstacle: pose from GUI (position + euler), zero
+//!   velocity, ignores fluid forces, exempt from container clamp (may be
+//!   embedded in walls/floor to build scenes).
+//! - `Kinematic` — scripted motion: spins at `spin_rpm` around the body-local
+//!   Y axis (as oriented by the euler base rotation). Ignores fluid forces
+//!   but drives the fluid through its surface velocity (v + omega x r in the
+//!   integrate shader).
+//! - `Dynamic` — full physics: fluid reaction forces + gravity, CPU
+//!   integration, container collision.
 
 use super::simulation::ContainerConfig;
+
+/// Maximum number of rigid bodies (GPU buffer capacity)
+pub const MAX_RIGID_BODIES: usize = 8;
 
 /// Rigid body shape types (repr matches GPU constants)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -10,10 +24,28 @@ pub enum RigidBodyShape {
     Cylinder = 2,
     Torus = 3,
     Custom = 4,
+    Propeller = 5,
 }
 
+/// Motion type (repr matches GPU constants)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RigidBodyMotion {
+    Static = 0,
+    Kinematic = 1,
+    Dynamic = 2,
+}
+
+// Propeller proportions in units of half_extent (body-local, spin axis = Y).
+// Mesh generation (rigid_body.wgsl) and the SDF (sph_integrate_3d.wgsl) must
+// stay in sync with these.
+pub const PROP_HUB_RADIUS: f32 = 0.25;
+pub const PROP_HUB_HALF_HEIGHT: f32 = 0.30;
+pub const PROP_BLADE_CENTER: f32 = 0.55;
+pub const PROP_BLADE_HALF: [f32; 3] = [0.44, 0.18, 0.045]; // radial, chord, thickness
+
 impl RigidBodyShape {
-    /// Number of vertices for the procedural mesh
+    /// Number of vertices for the procedural mesh (propeller: hub only —
+    /// blades add 36 per blade, see `RigidBodyConfig::render_vertex_count`)
     pub fn vertex_count(self) -> u32 {
         match self {
             RigidBodyShape::Cube => 36,        // 6 faces × 2 tri × 3 verts
@@ -21,6 +53,7 @@ impl RigidBodyShape {
             RigidBodyShape::Cylinder => 384,   // 32 segments: barrel(192) + 2 caps(192)
             RigidBodyShape::Torus => 3072,     // 32 major × 16 minor × 6
             RigidBodyShape::Custom => 0,       // Uses index buffer, not vertex_count
+            RigidBodyShape::Propeller => 384,  // hub cylinder; + blades × 36
         }
     }
 
@@ -47,6 +80,39 @@ impl RigidBodyShape {
             RigidBodyShape::Custom => {
                 // Approximate as sphere
                 (4.0 / 3.0) * std::f32::consts::PI * he * he * he
+            }
+            RigidBodyShape::Propeller => {
+                // Hub cylinder + 3 blade boxes (blade count barely matters here)
+                let hub = std::f32::consts::PI
+                    * (PROP_HUB_RADIUS * he).powi(2)
+                    * (2.0 * PROP_HUB_HALF_HEIGHT * he);
+                let blade = 8.0
+                    * PROP_BLADE_HALF[0] * PROP_BLADE_HALF[1] * PROP_BLADE_HALF[2]
+                    * he * he * he;
+                hub + 3.0 * blade
+            }
+        }
+    }
+
+    /// Surface area of the shape (drives the expected wetted-shell particle
+    /// count for the submerged-fraction estimate)
+    pub fn surface_area(self, half_extent: f32, prop_blades: u32) -> f32 {
+        let he2 = half_extent * half_extent;
+        let pi = std::f32::consts::PI;
+        match self {
+            RigidBodyShape::Cube => 24.0 * he2,
+            RigidBodyShape::Sphere => 4.0 * pi * he2,
+            // barrel 2πr·h (r=he, h=2he) + two caps 2πr²
+            RigidBodyShape::Cylinder => 6.0 * pi * he2,
+            // 4π²·R·r with R=he, r=0.3he
+            RigidBodyShape::Torus => 1.2 * pi * pi * he2,
+            // Approximate as sphere
+            RigidBodyShape::Custom => 4.0 * pi * he2,
+            RigidBodyShape::Propeller => {
+                let hub = 2.0 * pi * PROP_HUB_RADIUS * (2.0 * PROP_HUB_HALF_HEIGHT)
+                    + 2.0 * pi * PROP_HUB_RADIUS * PROP_HUB_RADIUS;
+                let blade_faces = 2.0 * (2.0 * PROP_BLADE_HALF[0]) * (2.0 * PROP_BLADE_HALF[1]);
+                (hub + blade_faces * prop_blades.max(1) as f32) * he2
             }
         }
     }
@@ -76,6 +142,10 @@ impl RigidBodyShape {
                 // Approximate as sphere
                 (2.0 / 5.0) * mass * half_extent * half_extent
             }
+            RigidBodyShape::Propeller => {
+                // Mass concentrated in blades reaching half_extent
+                0.5 * mass * half_extent * half_extent
+            }
         }
     }
 }
@@ -86,46 +156,118 @@ impl RigidBodyShape {
 pub struct RigidBodyConfig {
     /// Whether the rigid body is active in the scene
     pub enabled: bool,
-    /// Whether the body is held (user-positioned) or simulated
-    pub held: bool,
+    /// Motion type: static obstacle, scripted kinematic, or full physics
+    pub motion: RigidBodyMotion,
     /// Shape type
     pub shape: RigidBodyShape,
     /// Position in world space
     pub position: [f32; 3],
-    /// Linear velocity
+    /// Linear velocity (Dynamic only; Static/Kinematic force zero)
     pub velocity: [f32; 3],
-    /// Orientation quaternion [x, y, z, w]
+    /// Live orientation quaternion [x, y, z, w]. For Static/Kinematic this is
+    /// derived from `euler_deg` (+ spin) each frame; for Dynamic it evolves.
     pub orientation: [f32; 4],
-    /// Angular velocity (world space, radians/sec)
+    /// Angular velocity (world space, radians/sec). Dynamic: integrated from
+    /// fluid torque. Kinematic: set from spin_rpm. Static: zero.
     pub angular_velocity: [f32; 3],
-    /// Half-extent (radius for sphere/cylinder/torus, half side for cube)
+    /// Base orientation as euler angles in degrees (X pitch, Y yaw, Z roll).
+    /// Drives Static/Kinematic pose; ignored while Dynamic.
+    pub euler_deg: [f32; 3],
+    /// Kinematic spin rate (RPM) around the body-local Y axis
+    pub spin_rpm: f32,
+    /// Propeller shape: blade count
+    pub prop_blades: u32,
+    /// Propeller shape: blade pitch in degrees (0 = flat paddle)
+    pub prop_pitch_deg: f32,
+    /// Half-extent (radius for sphere/cylinder/torus/propeller, half side for cube)
     pub half_extent: f32,
-    /// Body density (compared to fluid rest_density; < rest_density → floats)
-    pub density: f32,
+    /// Body density relative to the fluid rest density (specific gravity):
+    /// 1.0 = neutral buoyancy, < 1 floats, > 1 sinks. Relative semantics stay
+    /// correct when kernel_radius retunes the SPH rest density (~104k at the
+    /// 2026-07 defaults — absolute values drifted badly when h changed).
+    pub relative_density: f32,
     /// Render color (RGB)
     pub color: [f32; 3],
+    /// Accumulated kinematic spin phase (radians, runtime only)
+    #[serde(skip)]
+    pub spin_angle: f32,
 }
 
 impl Default for RigidBodyConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            held: true,
+            enabled: true,
+            motion: RigidBodyMotion::Static,
             shape: RigidBodyShape::Cube,
             position: [0.0, 0.2, 0.0],
             velocity: [0.0; 3],
             orientation: [0.0, 0.0, 0.0, 1.0],  // Identity quaternion
             angular_velocity: [0.0; 3],
+            euler_deg: [0.0; 3],
+            spin_rpm: 120.0,
+            prop_blades: 3,
+            prop_pitch_deg: 35.0,
             half_extent: 0.15,
-            density: 300.0,  // Lighter than default rest_density (6000) → floats
+            relative_density: 0.5,  // Half the fluid density → floats half-submerged-ish
             color: [0.9, 0.7, 0.2],  // Yellow/gold
+            spin_angle: 0.0,
         }
     }
 }
 
 impl RigidBodyConfig {
-    pub fn reset_defaults(&mut self) {
-        *self = Self::default();
+    /// Base orientation quaternion from the euler sliders
+    pub fn base_quat(&self) -> [f32; 4] {
+        quat_from_euler_deg(self.euler_deg)
+    }
+
+    /// Kinematic spin rate in radians/sec
+    pub fn spin_rate(&self) -> f32 {
+        self.spin_rpm * std::f32::consts::TAU / 60.0
+    }
+
+    /// Recompute pose/velocities for Static and Kinematic bodies (applies
+    /// euler slider edits and the current spin phase). No-op for Dynamic.
+    pub fn refresh_pose(&mut self) {
+        match self.motion {
+            RigidBodyMotion::Static => {
+                self.orientation = self.base_quat();
+                self.velocity = [0.0; 3];
+                self.angular_velocity = [0.0; 3];
+            }
+            RigidBodyMotion::Kinematic => {
+                let base = self.base_quat();
+                let spin = quat_axis_angle([0.0, 1.0, 0.0], self.spin_angle);
+                // Spin around the body-local Y axis: right-multiply
+                self.orientation = quat_normalize(quat_mul(base, spin));
+                self.velocity = [0.0; 3];
+                // World-space spin axis = base-rotated local Y (spin does not
+                // move its own axis)
+                let axis = quat_rotate_vec(base, [0.0, 1.0, 0.0]);
+                let rate = self.spin_rate();
+                self.angular_velocity = [axis[0] * rate, axis[1] * rate, axis[2] * rate];
+            }
+            RigidBodyMotion::Dynamic => {}
+        }
+    }
+
+    /// Advance the kinematic spin phase by dt and refresh the pose
+    pub fn advance_kinematic(&mut self, dt: f32) {
+        if self.motion == RigidBodyMotion::Kinematic {
+            self.spin_angle =
+                (self.spin_angle + self.spin_rate() * dt).rem_euclid(std::f32::consts::TAU);
+            self.refresh_pose();
+        }
+    }
+
+    /// Vertex count for the procedural renderer (propeller depends on blades)
+    pub fn render_vertex_count(&self) -> u32 {
+        match self.shape {
+            RigidBodyShape::Propeller => {
+                RigidBodyShape::Propeller.vertex_count() + self.prop_blades * 36
+            }
+            s => s.vertex_count(),
+        }
     }
 
     pub fn to_gpu_rigid_body(&self, wall_stiffness: f32) -> GpuRigidBody {
@@ -137,8 +279,10 @@ impl RigidBodyConfig {
             is_active: if self.enabled { 1 } else { 0 },
             stiffness: wall_stiffness,
             shape: self.shape as u32,
-            _pad1: 0.0,
-            _pad2: 0.0,
+            motion: self.motion as u32,
+            prop_blades: self.prop_blades.max(1),
+            angular_velocity: self.angular_velocity,
+            prop_pitch: self.prop_pitch_deg.to_radians(),
             rot_row0: rows[0],
             rot_row1: rows[1],
             rot_row2: rows[2],
@@ -156,6 +300,10 @@ impl RigidBodyConfig {
             rot_row0: rows[0],
             rot_row1: rows[1],
             rot_row2: rows[2],
+            prop_blades: self.prop_blades.max(1),
+            prop_pitch: self.prop_pitch_deg.to_radians(),
+            _pad0: 0.0,
+            _pad1: 0.0,
         }
     }
 }
@@ -183,6 +331,39 @@ pub fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+/// Quaternion from axis (normalized) + angle in radians
+pub fn quat_axis_angle(axis: [f32; 3], angle: f32) -> [f32; 4] {
+    let half = angle * 0.5;
+    let s = half.sin();
+    [axis[0] * s, axis[1] * s, axis[2] * s, half.cos()]
+}
+
+/// Quaternion from euler angles in degrees (X pitch, Y yaw, Z roll),
+/// applied as yaw * pitch * roll
+pub fn quat_from_euler_deg(euler_deg: [f32; 3]) -> [f32; 4] {
+    let qx = quat_axis_angle([1.0, 0.0, 0.0], euler_deg[0].to_radians());
+    let qy = quat_axis_angle([0.0, 1.0, 0.0], euler_deg[1].to_radians());
+    let qz = quat_axis_angle([0.0, 0.0, 1.0], euler_deg[2].to_radians());
+    quat_normalize(quat_mul(quat_mul(qy, qx), qz))
+}
+
+/// Rotate a vector by a quaternion (local → world)
+pub fn quat_rotate_vec(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    // v' = q * (v, 0) * q^-1, expanded
+    let [x, y, z, w] = q;
+    let (vx, vy, vz) = (v[0], v[1], v[2]);
+    // t = 2 * cross(q.xyz, v)
+    let tx = 2.0 * (y * vz - z * vy);
+    let ty = 2.0 * (z * vx - x * vz);
+    let tz = 2.0 * (x * vy - y * vx);
+    // v' = v + w * t + cross(q.xyz, t)
+    [
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    ]
+}
+
 /// Convert quaternion to 3 rotation matrix rows (world→local, i.e. R_quat transposed).
 /// Matches the container bounds convention used in the integrate shader.
 pub fn quat_to_rotation_rows(q: [f32; 4]) -> [[f32; 4]; 3] {
@@ -206,21 +387,24 @@ pub fn quat_to_rotation_rows(q: [f32; 4]) -> [[f32; 4]; 3] {
 
 // --- GPU structs ---
 
-/// GPU-compatible rigid body parameters for integrate shader (96 bytes)
+/// GPU-compatible rigid body parameters for integrate shader (112 bytes;
+/// array element in the bodies storage buffer)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuRigidBody {
-    pub position: [f32; 3],     // 12 bytes
-    pub half_extent: f32,       // 4 bytes  → 16
-    pub velocity: [f32; 3],     // 12 bytes
-    pub is_active: u32,         // 4 bytes  → 32
-    pub stiffness: f32,         // 4 bytes
-    pub shape: u32,             // 4 bytes
-    pub _pad1: f32,             // 4 bytes
-    pub _pad2: f32,             // 4 bytes  → 48
-    pub rot_row0: [f32; 4],     // 16 bytes → 64
-    pub rot_row1: [f32; 4],     // 16 bytes → 80
-    pub rot_row2: [f32; 4],     // 16 bytes → 96
+    pub position: [f32; 3],         // 12 bytes
+    pub half_extent: f32,           // 4 bytes  → 16
+    pub velocity: [f32; 3],         // 12 bytes
+    pub is_active: u32,             // 4 bytes  → 32
+    pub stiffness: f32,             // 4 bytes
+    pub shape: u32,                 // 4 bytes
+    pub motion: u32,                // 4 bytes
+    pub prop_blades: u32,           // 4 bytes  → 48
+    pub angular_velocity: [f32; 3], // 12 bytes
+    pub prop_pitch: f32,            // 4 bytes  → 64 (radians)
+    pub rot_row0: [f32; 4],         // 16 bytes → 80
+    pub rot_row1: [f32; 4],         // 16 bytes → 96
+    pub rot_row2: [f32; 4],         // 16 bytes → 112
 }
 
 impl Default for GpuRigidBody {
@@ -232,8 +416,10 @@ impl Default for GpuRigidBody {
             is_active: 0,
             stiffness: 200.0,
             shape: 0,
-            _pad1: 0.0,
-            _pad2: 0.0,
+            motion: 0,
+            prop_blades: 3,
+            angular_velocity: [0.0; 3],
+            prop_pitch: 0.0,
             rot_row0: [1.0, 0.0, 0.0, 0.0],
             rot_row1: [0.0, 1.0, 0.0, 0.0],
             rot_row2: [0.0, 0.0, 1.0, 0.0],
@@ -241,22 +427,39 @@ impl Default for GpuRigidBody {
     }
 }
 
-/// GPU rigid body force accumulator (32 bytes, atomic i32 on GPU side)
+/// Header for the bodies storage buffer (16 bytes, followed by the body array)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable, Default)]
+pub struct GpuRigidBodiesHeader {
+    pub count: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// GPU rigid body force accumulator (48 bytes, atomic i32 on GPU side).
+/// Penalty (static contact) and damping (velocity drag) reactions are kept
+/// separate so integration can attenuate the static component by submersion.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable, Default)]
 pub struct GpuRigidBodyAccum {
-    pub force_x: i32,       // fixed-point × 1000
-    pub force_y: i32,
-    pub force_z: i32,
+    pub penalty_x: i32,     // fixed-point × 1000
+    pub penalty_y: i32,
+    pub penalty_z: i32,
     pub contact_count: u32,
+    pub damping_x: i32,     // fixed-point × 1000
+    pub damping_y: i32,
+    pub damping_z: i32,
+    pub _pad0: u32,
     pub torque_x: i32,      // fixed-point × 1000
     pub torque_y: i32,
     pub torque_z: i32,
-    pub _pad: u32,
+    pub _pad1: u32,
 }
 
 
-/// GPU rigid body rendering parameters (96 bytes)
+/// GPU rigid body rendering parameters (112 bytes; array element in the
+/// render bodies storage buffer)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuRigidBodyRender {
@@ -268,34 +471,94 @@ pub struct GpuRigidBodyRender {
     pub rot_row0: [f32; 4],     // 16 bytes → 64
     pub rot_row1: [f32; 4],     // 16 bytes → 80
     pub rot_row2: [f32; 4],     // 16 bytes → 96
+    pub prop_blades: u32,       // 4 bytes
+    pub prop_pitch: f32,        // 4 bytes (radians)
+    pub _pad0: f32,             // 4 bytes
+    pub _pad1: f32,             // 4 bytes  → 112
+}
+
+impl Default for GpuRigidBodyRender {
+    fn default() -> Self {
+        Self {
+            position: [0.0; 3],
+            half_extent: 0.15,
+            color: [1.0; 4],
+            light_dir: [0.4, 0.8, 0.3],
+            shape: 0,
+            rot_row0: [1.0, 0.0, 0.0, 0.0],
+            rot_row1: [0.0, 1.0, 0.0, 0.0],
+            rot_row2: [0.0, 0.0, 1.0, 0.0],
+            prop_blades: 3,
+            prop_pitch: 0.0,
+            _pad0: 0.0,
+            _pad1: 0.0,
+        }
+    }
 }
 
 // --- CPU rigid body integration ---
 
 /// Integrate rigid body physics on CPU: forces → velocity → position, with container collision.
-/// Called once per frame after SPH simulation has accumulated reaction forces.
+/// Called once per frame per Dynamic body after SPH simulation has accumulated reaction forces.
+/// `fluid_density` is the SPH rest density (SphConfig::rest_density()) — body
+/// mass is relative_density × fluid_density × volume. `kernel_radius` and
+/// `particles_per_volume` (rest_density / particle mass) size the expected
+/// wetted-shell contact count for the submerged-fraction estimate.
 pub fn integrate_rigid_body(
     rigid_body: &mut RigidBodyConfig,
     container: &ContainerConfig,
     delta_time: f32,
     num_substeps: u32,
     gravity: [f32; 3],
+    fluid_density: f32,
+    kernel_radius: f32,
+    particles_per_volume: f32,
     accum: &GpuRigidBodyAccum,
 ) {
-    let reaction = [
-        accum.force_x as f32 / 1000.0,
-        accum.force_y as f32 / 1000.0,
-        accum.force_z as f32 / 1000.0,
-    ];
-
     let he = rigid_body.half_extent;
     let volume = rigid_body.shape.volume(he);
-    let body_mass = rigid_body.density * volume;
+    let body_mass = rigid_body.relative_density.max(0.01) * fluid_density * volume;
     let total_dt = num_substeps as f32 * delta_time;
 
     if body_mass <= 0.0 {
         return;
     }
+
+    // Submerged fraction from the wetted contact shell: contact_count counts
+    // particles within the 0.7h penalty layer, accumulated over all substeps.
+    // Fully submerged -> the whole surface is wetted -> fraction 1.
+    let shell_particles = rigid_body.shape.surface_area(he, rigid_body.prop_blades)
+        * (0.7 * kernel_radius)
+        * particles_per_volume;
+    let expected = (num_substeps as f32 * shell_particles).max(1.0);
+    let submerged = (accum.contact_count as f32 / expected).clamp(0.0, 1.0);
+    if std::env::var_os("RB_DEBUG").is_some() {
+        eprintln!(
+            "rb sub={:.3} count={} expected={:.0} y={:.3}",
+            submerged, accum.contact_count, expected, rigid_body.position[1]
+        );
+    }
+
+    // Analytic Archimedes buoyancy: a = -g * (rho_fluid * V_submerged) / m
+    //                                 = -g * submerged / relative_density.
+    // The gap-penalty reaction cannot express displaced-volume buoyancy (its
+    // shell force is symmetric once submerged), so without this term dense
+    // bodies ride the contact cushion and never sink.
+    let buoyancy = submerged / rigid_body.relative_density.max(0.01);
+
+    // Contact reactions fade with submersion: a fully-wetted body is
+    // supported by buoyancy + analytic drag, not by contact forces
+    // (sustained shell support is the trampoline artifact that held dense
+    // bodies in mid-water). The damping channel keeps 30% when submerged so
+    // flow still entrains bodies (propeller wash shoving a ball around);
+    // the static penalty channel fades out completely.
+    let pen_scale = 1.0 - submerged;
+    let damp_scale = 1.0 - 0.7 * submerged;
+    let reaction = [
+        accum.penalty_x as f32 / 1000.0 * pen_scale + accum.damping_x as f32 / 1000.0 * damp_scale,
+        accum.penalty_y as f32 / 1000.0 * pen_scale + accum.damping_y as f32 / 1000.0 * damp_scale,
+        accum.penalty_z as f32 / 1000.0 * pen_scale + accum.damping_z as f32 / 1000.0 * damp_scale,
+    ];
 
     // Reaction-induced velocity change (clamped to prevent explosions with light bodies)
     let mut dv = [0.0f32; 3];
@@ -308,9 +571,20 @@ pub fn integrate_rigid_body(
         let scale = max_dv / dv_mag;
         for d in &mut dv { *d *= scale; }
     }
+    // Hydrodynamic drag, scaled by submersion: quadratic bluff-body term
+    // (mean projected area of a convex body = surface_area / 4, Cauchy) sets
+    // a physical terminal velocity; a light linear term settles bobbing.
+    // Multiplicative decay cannot reverse the velocity.
+    let speed = (rigid_body.velocity[0].powi(2)
+        + rigid_body.velocity[1].powi(2)
+        + rigid_body.velocity[2].powi(2))
+    .sqrt();
+    let projected_area = rigid_body.shape.surface_area(he, rigid_body.prop_blades) * 0.25;
+    let quad_coeff = 0.4 * fluid_density * projected_area / body_mass; // 1/2 C_d(0.8) rho A / m
+    let drag = (1.0 - (quad_coeff * speed + 1.5) * submerged * total_dt).max(0.0);
     for i in 0..3 {
-        rigid_body.velocity[i] += dv[i] + total_dt * gravity[i];
-        rigid_body.velocity[i] *= 0.995; // Light damping
+        rigid_body.velocity[i] += dv[i] + total_dt * gravity[i] * (1.0 - buoyancy);
+        rigid_body.velocity[i] *= 0.995 * drag;
     }
     for i in 0..3 {
         rigid_body.position[i] += total_dt * rigid_body.velocity[i];
@@ -379,6 +653,10 @@ fn rotated_aabb_half_extents(
             // major=he, minor=0.3*he → bounding box [1.3*he, 0.3*he, 1.3*he]
             let r_minor = 0.3 * he;
             [he + r_minor, r_minor, he + r_minor]
+        }
+        RigidBodyShape::Propeller => {
+            let radial = (PROP_BLADE_CENTER + PROP_BLADE_HALF[0]) * he;
+            [radial, (PROP_HUB_HALF_HEIGHT + PROP_BLADE_HALF[1]) * he, radial]
         }
         // Cube, Cylinder, Custom: all fit in [-he, he]^3
         _ => [he, he, he],

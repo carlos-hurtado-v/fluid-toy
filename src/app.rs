@@ -17,12 +17,12 @@ use wgpu::util::DeviceExt;
 use crate::gpu::GpuContext;
 use crate::launch::LaunchOptions;
 use crate::gui::{self, GuiAction};
-use crate::render::{Camera, CausticsRenderer, ContainerRenderer, GpuPoolStyle, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyRenderer, ScreenSpaceFluidRenderer, SprayRenderer, WireframeRenderer};
+use crate::render::{Camera, CausticsRenderer, ContainerRenderer, GpuPoolStyle, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyDraw, RigidBodyRenderer, ScreenSpaceFluidRenderer, SprayRenderer, WireframeRenderer};
 use crate::state::ContainerStyle;
 use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
 use crate::render::mesh_loader::{self, SdfData};
-use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuShCoefficients, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, integrate_rigid_body, clamp_rigid_body_to_container};
+use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuShCoefficients, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, RigidBodyMotion, integrate_rigid_body};
 use crate::render::environment::ShCoefficients;
 
 pub struct App {
@@ -323,15 +323,11 @@ impl App {
         );
 
         // Create rigid body renderer + fallback depth texture
-        let rb_render_params = self.state.rigid_body.to_gpu_render(
-            self.state.lighting.sun_direction_normalized(),
-        );
         let rigid_body_renderer = RigidBodyRenderer::new(
             &gpu.device,
             &gpu.queue,
             gpu.config.format,
             &camera_params,
-            &rb_render_params,
             self.state.quality.msaa.as_u32(),
         );
         let rigid_body_depth_view = create_depth_texture(
@@ -567,10 +563,16 @@ impl App {
     }
 
     fn reset_simulation(&mut self) {
-        // Reset rigid body velocity and rotation (keep position)
-        self.state.rigid_body.velocity = [0.0; 3];
-        self.state.rigid_body.angular_velocity = [0.0; 3];
-        self.state.rigid_body.orientation = [0.0, 0.0, 0.0, 1.0];
+        // Reset dynamic rigid body velocity and rotation (keep position);
+        // Static/Kinematic bodies re-derive their pose from euler/spin anyway
+        for body in &mut self.state.rigid_bodies {
+            body.velocity = [0.0; 3];
+            body.angular_velocity = [0.0; 3];
+            if body.motion == RigidBodyMotion::Dynamic {
+                body.orientation = [0.0, 0.0, 0.0, 1.0];
+            }
+            body.spin_angle = 0.0;
+        }
 
         if let Some(gpu) = &self.gpu {
             let particles = self.create_initial_particles();
@@ -664,7 +666,7 @@ impl App {
         self.state.lighting.reset_defaults();
         self.state.caustics.reset_defaults();
         self.state.container.reset_defaults();
-        self.state.rigid_body.reset_defaults();
+        self.state.rigid_bodies.clear();
         self.state.spray.reset_defaults();
         self.state.environment.reset_defaults();
         // Reset camera to defaults
@@ -1026,9 +1028,18 @@ impl App {
 
             sph_sim.update_mouse_force(&gpu.queue, &mouse_force);
 
-            // Update rigid body
-            let rb_params = self.state.rigid_body.to_gpu_rigid_body(self.state.sph.wall_stiffness);
-            sph_sim.update_rigid_body(&gpu.queue, &rb_params);
+            // Update rigid bodies (re-derive Static/Kinematic poses from the
+            // GUI euler/spin state so slider edits apply immediately)
+            for body in &mut self.state.rigid_bodies {
+                body.refresh_pose();
+            }
+            let gpu_bodies: Vec<_> = self
+                .state
+                .rigid_bodies
+                .iter()
+                .map(|b| b.to_gpu_rigid_body(self.state.sph.wall_stiffness))
+                .collect();
+            sph_sim.update_rigid_bodies(&gpu.queue, &gpu_bodies);
 
             // Update camera
             let camera_params = self.camera.to_gpu_params();
@@ -1038,12 +1049,17 @@ impl App {
             }
             if let Some(rb_renderer) = &mut self.rigid_body_renderer {
                 rb_renderer.update_camera(&gpu.queue, &camera_params);
-                let rb_render = self.state.rigid_body.to_gpu_render(
-                    self.state.lighting.sun_direction_normalized(),
-                );
-                rb_renderer.update_params(&gpu.queue, &rb_render);
-                rb_renderer.set_shape(self.state.rigid_body.shape);
-                rb_renderer.set_vertex_count(self.state.rigid_body.shape.vertex_count());
+                let light_dir = self.state.lighting.sun_direction_normalized();
+                let mut renders = Vec::new();
+                let mut draws = Vec::new();
+                for body in self.state.rigid_bodies.iter().filter(|b| b.enabled) {
+                    renders.push(body.to_gpu_render(light_dir));
+                    draws.push(RigidBodyDraw {
+                        shape: body.shape,
+                        vertex_count: body.render_vertex_count(),
+                    });
+                }
+                rb_renderer.update_bodies(&gpu.queue, &renders, &draws);
             }
             if let Some(spray_renderer) = &self.spray_renderer {
                 spray_renderer.update_camera(&gpu.queue, &camera_params);
@@ -1218,18 +1234,43 @@ impl App {
         let substep_dt = self.simulation_substep_dt();
         if !self.state.simulation.paused {
             if let Some(sph_sim) = &mut self.sph_simulation {
-                // Clear accumulator once, then accumulate over all sub-steps
-                let rigid_enabled = self.state.rigid_body.enabled;
-                if rigid_enabled {
+                // Only Dynamic bodies consume the reaction accumulators;
+                // Static/Kinematic skip the clear AND the blocking readback
+                // (saves a hard GPU sync per frame).
+                let any_dynamic = self
+                    .state
+                    .rigid_bodies
+                    .iter()
+                    .any(|b| b.enabled && b.motion == RigidBodyMotion::Dynamic);
+                let any_spinning = self
+                    .state
+                    .rigid_bodies
+                    .iter()
+                    .any(|b| b.enabled && b.motion == RigidBodyMotion::Kinematic && b.spin_rpm != 0.0);
+                // Clear accumulators once, then accumulate over all sub-steps
+                if any_dynamic {
                     sph_sim.clear_rigid_body_accum(&gpu.queue);
                 }
                 for _ in 0..num_substeps {
+                    // Advance kinematic spin per substep so fast bodies sweep
+                    // smoothly instead of jumping once per frame (each step()
+                    // submits its own command buffer, so the write lands
+                    // between substeps)
+                    if any_spinning {
+                        for body in &mut self.state.rigid_bodies {
+                            body.advance_kinematic(substep_dt);
+                        }
+                        let gpu_bodies: Vec<_> = self
+                            .state
+                            .rigid_bodies
+                            .iter()
+                            .map(|b| b.to_gpu_rigid_body(self.state.sph.wall_stiffness))
+                            .collect();
+                        sph_sim.update_rigid_bodies(&gpu.queue, &gpu_bodies);
+                    }
                     sph_sim.step(&gpu.device, &gpu.queue);
                 }
-                // Read back total accumulated rigid body forces. The readback
-                // blocks until the GPU drains, so skip it entirely when no
-                // rigid body consumes the data (saves a hard sync per frame).
-                if rigid_enabled {
+                if any_dynamic {
                     sph_sim.read_rigid_body_accum(&gpu.device);
                 }
             }
@@ -1290,28 +1331,38 @@ impl App {
             None
         };
 
-        // Integrate rigid body on CPU
-        if self.state.rigid_body.enabled && !self.state.rigid_body.held && !self.state.simulation.paused {
+        // Integrate dynamic rigid bodies on CPU (Static/Kinematic bodies are
+        // pose-driven and intentionally skip the container clamp so obstacles
+        // can be embedded in walls/floor)
+        if !self.state.simulation.paused {
             if let Some(sph_sim) = &self.sph_simulation {
-                let accum = sph_sim.rigid_body_accum();
-                integrate_rigid_body(
-                    &mut self.state.rigid_body,
-                    &self.state.container,
-                    substep_dt,
-                    num_substeps,
-                    self.state.simulation.gravity_vector(),
-                    accum,
-                );
+                let accums = *sph_sim.rigid_body_accums();
+                let gravity = self.state.simulation.gravity_vector();
+                let fluid_density = self.state.sph.rest_density();
+                let kernel_radius = self.state.sph.kernel_radius;
+                let particles_per_volume = fluid_density / self.state.sph.mass.max(1e-6);
+                for (i, body) in self
+                    .state
+                    .rigid_bodies
+                    .iter_mut()
+                    .take(accums.len())
+                    .enumerate()
+                {
+                    if body.enabled && body.motion == RigidBodyMotion::Dynamic {
+                        integrate_rigid_body(
+                            body,
+                            &self.state.container,
+                            substep_dt,
+                            num_substeps,
+                            gravity,
+                            fluid_density,
+                            kernel_radius,
+                            particles_per_volume,
+                            &accums[i],
+                        );
+                    }
+                }
             }
-        }
-
-        // Clamp held rigid body to container (physics mode clamps in integrate_rigid_body)
-        if self.state.rigid_body.enabled && self.state.rigid_body.held {
-            clamp_rigid_body_to_container(
-                &mut self.state.rigid_body,
-                &self.state.container,
-                false,
-            );
         }
 
         // Determine render target (post-process intermediate or direct to screen)
@@ -1464,7 +1515,7 @@ impl App {
 
                         // Scene objects go into the SS background pass (refraction +
                         // depth-aware composite), mirroring the MC renderer.
-                        let rb_for_ss = if self.state.rigid_body.enabled {
+                        let rb_for_ss = if self.state.rigid_bodies.iter().any(|b| b.enabled) {
                             self.rigid_body_renderer.as_ref()
                         } else {
                             None
@@ -1662,7 +1713,7 @@ impl App {
                             }
                         }
                         // Pass rigid body renderer into MC pass for proper MSAA depth testing
-                        let rb_for_mc = if self.state.rigid_body.enabled {
+                        let rb_for_mc = if self.state.rigid_bodies.iter().any(|b| b.enabled) {
                             self.rigid_body_renderer.as_ref()
                         } else {
                             None
@@ -1728,9 +1779,11 @@ impl App {
             }
         }
 
-        // Render rigid body cube with depth testing against fluid surface
+        // Render rigid bodies with depth testing against fluid surface
         // (MC and SS modes handle this inside their own passes above)
-        if self.state.rigid_body.enabled && self.state.rendering.render_mode == FluidRenderMode::Particles {
+        if self.state.rigid_bodies.iter().any(|b| b.enabled)
+            && self.state.rendering.render_mode == FluidRenderMode::Particles
+        {
             if let Some(rb_renderer) = &self.rigid_body_renderer {
                 let depth_view = fluid_depth_view
                     .unwrap_or_else(|| self.rigid_body_depth_view.as_ref().unwrap());

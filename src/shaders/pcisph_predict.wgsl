@@ -46,6 +46,8 @@ struct PredictedState {
 @group(0) @binding(2) var<storage, read_write> sorted_predicted: array<PredictedState>;
 @group(0) @binding(3) var<storage, read> sorted_index: array<u32>;
 @group(0) @binding(4) var<storage, read> prev_pressure: array<f32>;
+@group(0) @binding(5) var<uniform> container: ContainerGeometry;
+@group(0) @binding(6) var<storage, read> rigid_bodies: RigidBodies;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -60,7 +62,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Semi-implicit Euler prediction
     let v_star = vel + params.dt * a_np;
-    let x_star = pos + params.dt * v_star;
+    // Boundary-aware prediction: the predicted POSITION is clamped to the
+    // container and pushed out of rigid bodies so the solve's density
+    // estimate matches what integration will actually allow (walls/bodies
+    // apply in integrate, after the solve). Predicted velocity is untouched.
+    let x_star = boundary_clamp_predicted(pos + params.dt * v_star);
 
     // Write to sorted position for neighbor access in solve shader
     let si = sorted_index[i];

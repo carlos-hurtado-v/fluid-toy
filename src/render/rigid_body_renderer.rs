@@ -4,10 +4,25 @@ use wgpu::util::DeviceExt;
 
 use crate::render::camera::GpuCameraParams;
 use crate::render::mesh_loader::{self, MeshVertex};
-use crate::state::{GpuRigidBodyRender, RigidBodyShape};
+use crate::state::{GpuRigidBodyRender, RigidBodyShape, MAX_RIGID_BODIES};
+
+/// Per-body draw info, parallel to the uploaded render params array
+#[derive(Debug, Clone, Copy)]
+pub struct RigidBodyDraw {
+    pub shape: RigidBodyShape,
+    pub vertex_count: u32,
+}
+
+/// Which pipeline family a pass needs
+#[derive(Clone, Copy, PartialEq)]
+enum DrawMode {
+    Standard,
+    Msaa,
+    DepthOnly,
+}
 
 pub struct RigidBodyRenderer {
-    // Procedural pipeline (Cube, Sphere, Cylinder, Torus)
+    // Procedural pipeline (Cube, Sphere, Cylinder, Torus, Propeller)
     pipeline: wgpu::RenderPipeline,
     msaa_pipeline: Option<wgpu::RenderPipeline>,
 
@@ -15,11 +30,13 @@ pub struct RigidBodyRenderer {
     depth_only_pipeline: wgpu::RenderPipeline,
     mesh_depth_only_pipeline: Option<wgpu::RenderPipeline>,
 
-    // Shared bind group (group 0): camera + body params — used by both pipelines
+    // Shared bind group (group 0): camera + bodies array — used by both pipelines
     bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
-    body_buffer: wgpu::Buffer,
-    vertex_count: u32,
+    bodies_buffer: wgpu::Buffer,
+
+    // Draw list for the current frame (index i draws instance i)
+    draws: Vec<RigidBodyDraw>,
 
     // Mesh pipeline (Custom GLB models)
     mesh_pipeline: Option<wgpu::RenderPipeline>,
@@ -28,9 +45,6 @@ pub struct RigidBodyRenderer {
     mesh_vertex_buffer: Option<wgpu::Buffer>,
     mesh_index_buffer: Option<wgpu::Buffer>,
     mesh_index_count: u32,
-
-    // Current rendering mode
-    current_shape: RigidBodyShape,
 }
 
 impl RigidBodyRenderer {
@@ -39,7 +53,6 @@ impl RigidBodyRenderer {
         queue: &wgpu::Queue,
         surface_format: wgpu::TextureFormat,
         camera_params: &GpuCameraParams,
-        body_params: &GpuRigidBodyRender,
         msaa_sample_count: u32,
     ) -> Self {
         // === Shared resources (group 0) ===
@@ -49,10 +62,10 @@ impl RigidBodyRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let body_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let bodies_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("RigidBody Params Buffer"),
-            contents: bytemuck::bytes_of(body_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            contents: bytemuck::cast_slice(&[GpuRigidBodyRender::default(); MAX_RIGID_BODIES]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -72,7 +85,7 @@ impl RigidBodyRenderer {
                     binding: 1,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -91,7 +104,7 @@ impl RigidBodyRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: body_buffer.as_entire_binding(),
+                    resource: bodies_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -241,15 +254,14 @@ impl RigidBodyRenderer {
             mesh_depth_only_pipeline,
             bind_group,
             camera_buffer,
-            body_buffer,
-            vertex_count: 36,
+            bodies_buffer,
+            draws: Vec::new(),
             mesh_pipeline,
             mesh_msaa_pipeline,
             mesh_texture_bind_group,
             mesh_vertex_buffer,
             mesh_index_buffer,
             mesh_index_count,
-            current_shape: RigidBodyShape::Cube,
         }
     }
 
@@ -526,81 +538,84 @@ impl RigidBodyRenderer {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(params));
     }
 
-    pub fn update_params(&mut self, queue: &wgpu::Queue, params: &GpuRigidBodyRender) {
-        queue.write_buffer(&self.body_buffer, 0, bytemuck::bytes_of(params));
-    }
-
-    pub fn set_vertex_count(&mut self, count: u32) {
-        self.vertex_count = count;
-    }
-
-    pub fn set_shape(&mut self, shape: RigidBodyShape) {
-        self.current_shape = shape;
+    /// Upload this frame's body render params + draw list. `bodies[i]` is
+    /// drawn as instance i; both slices must be parallel (enabled bodies only).
+    pub fn update_bodies(
+        &mut self,
+        queue: &wgpu::Queue,
+        bodies: &[GpuRigidBodyRender],
+        draws: &[RigidBodyDraw],
+    ) {
+        debug_assert_eq!(bodies.len(), draws.len());
+        let count = bodies.len().min(MAX_RIGID_BODIES);
+        if count > 0 {
+            queue.write_buffer(
+                &self.bodies_buffer,
+                0,
+                bytemuck::cast_slice(&bodies[..count]),
+            );
+        }
+        self.draws.clear();
+        self.draws.extend_from_slice(&draws[..count]);
     }
 
     pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
-        if self.current_shape == RigidBodyShape::Custom {
-            self.render_mesh(render_pass, false);
-        } else {
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(0, &self.bind_group, &[]);
-            render_pass.draw(0..self.vertex_count, 0..1);
-        }
+        self.draw_all(render_pass, DrawMode::Standard);
     }
 
     /// Render using the MSAA pipeline (for rendering inside MC's multisampled pass)
     pub fn render_msaa<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
-        if self.current_shape == RigidBodyShape::Custom {
-            self.render_mesh(render_pass, true);
-        } else {
-            let pipeline = self.msaa_pipeline.as_ref().unwrap_or(&self.pipeline);
-            render_pass.set_pipeline(pipeline);
-            render_pass.set_bind_group(0, &self.bind_group, &[]);
-            render_pass.draw(0..self.vertex_count, 0..1);
-        }
+        self.draw_all(render_pass, DrawMode::Msaa);
     }
 
     /// Render depth-only (for GTAO front depth prepass, 1x, no color targets)
     pub fn render_depth_only<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
-        if self.current_shape == RigidBodyShape::Custom {
-            // Mesh depth-only
-            if let (Some(pipeline), Some(vb), Some(ib)) = (
-                &self.mesh_depth_only_pipeline,
+        self.draw_all(render_pass, DrawMode::DepthOnly);
+    }
+
+    fn draw_all<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, mode: DrawMode) {
+        // Procedural bodies (all shapes except Custom)
+        if self.draws.iter().any(|d| d.shape != RigidBodyShape::Custom) {
+            let pipeline = match mode {
+                DrawMode::Standard => &self.pipeline,
+                DrawMode::Msaa => self.msaa_pipeline.as_ref().unwrap_or(&self.pipeline),
+                DrawMode::DepthOnly => &self.depth_only_pipeline,
+            };
+            render_pass.set_pipeline(pipeline);
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
+            for (i, draw) in self.draws.iter().enumerate() {
+                if draw.shape != RigidBodyShape::Custom {
+                    render_pass.draw(0..draw.vertex_count, i as u32..i as u32 + 1);
+                }
+            }
+        }
+
+        // Mesh bodies (Custom GLB)
+        if self.draws.iter().any(|d| d.shape == RigidBodyShape::Custom) {
+            let pipeline = match mode {
+                DrawMode::Standard => self.mesh_pipeline.as_ref(),
+                DrawMode::Msaa => self.mesh_msaa_pipeline.as_ref().or(self.mesh_pipeline.as_ref()),
+                DrawMode::DepthOnly => self.mesh_depth_only_pipeline.as_ref(),
+            };
+            if let (Some(pipeline), Some(vb), Some(ib), Some(tbg)) = (
+                pipeline,
                 &self.mesh_vertex_buffer,
                 &self.mesh_index_buffer,
+                &self.mesh_texture_bind_group,
             ) {
                 render_pass.set_pipeline(pipeline);
                 render_pass.set_bind_group(0, &self.bind_group, &[]);
+                if mode != DrawMode::DepthOnly {
+                    render_pass.set_bind_group(1, tbg, &[]);
+                }
                 render_pass.set_vertex_buffer(0, vb.slice(..));
                 render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..self.mesh_index_count, 0, 0..1);
+                for (i, draw) in self.draws.iter().enumerate() {
+                    if draw.shape == RigidBodyShape::Custom {
+                        render_pass.draw_indexed(0..self.mesh_index_count, 0, i as u32..i as u32 + 1);
+                    }
+                }
             }
-        } else {
-            render_pass.set_pipeline(&self.depth_only_pipeline);
-            render_pass.set_bind_group(0, &self.bind_group, &[]);
-            render_pass.draw(0..self.vertex_count, 0..1);
-        }
-    }
-
-    fn render_mesh<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, msaa: bool) {
-        let pipeline = if msaa {
-            self.mesh_msaa_pipeline.as_ref().or(self.mesh_pipeline.as_ref())
-        } else {
-            self.mesh_pipeline.as_ref()
-        };
-
-        if let (Some(pipeline), Some(vb), Some(ib), Some(tbg)) = (
-            pipeline,
-            &self.mesh_vertex_buffer,
-            &self.mesh_index_buffer,
-            &self.mesh_texture_bind_group,
-        ) {
-            render_pass.set_pipeline(pipeline);
-            render_pass.set_bind_group(0, &self.bind_group, &[]);
-            render_pass.set_bind_group(1, tbg, &[]);
-            render_pass.set_vertex_buffer(0, vb.slice(..));
-            render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..self.mesh_index_count, 0, 0..1);
         }
     }
 }

@@ -21,6 +21,7 @@ Options:
                            --set sph.kernel_radius=0.05
                            --set rendering.render_mode=MarchingCubes
                            --set lighting.sun_direction=[0.4,0.8,0.3]
+                           --set rigid_bodies.0.enabled=false (array index)
   --save-config <file>     Write the effective config (defaults + --config +
                            --set) to a file and exit
   --capture <f1,f2,...>    Save a PNG of the rendered scene (no GUI) after the
@@ -152,7 +153,10 @@ impl LaunchOptions {
         if let Some(path) = &self.config_path {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-            state = serde_json::from_str(&text)
+            let mut tree: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+            migrate_legacy_config(&mut tree);
+            state = serde_json::from_value(tree)
                 .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
         }
 
@@ -170,9 +174,35 @@ impl LaunchOptions {
     }
 }
 
+/// Migrate legacy config keys so old export files keep loading:
+/// `rigid_body` (single object with `held: bool`) became `rigid_bodies`
+/// (array with `motion: Static|Kinematic|Dynamic`).
+fn migrate_legacy_config(tree: &mut serde_json::Value) {
+    let Some(obj) = tree.as_object_mut() else {
+        return;
+    };
+    if obj.contains_key("rigid_bodies") {
+        obj.remove("rigid_body");
+        return;
+    }
+    if let Some(mut rb) = obj.remove("rigid_body") {
+        if let Some(rbo) = rb.as_object_mut() {
+            let held = rbo
+                .remove("held")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            rbo.entry("motion").or_insert(serde_json::Value::String(
+                if held { "Static" } else { "Dynamic" }.to_string(),
+            ));
+        }
+        obj.insert("rigid_bodies".to_string(), serde_json::Value::Array(vec![rb]));
+    }
+}
+
 /// Set a dotted-path key in a JSON tree. The key must already exist (catches
-/// typos); the value is parsed as JSON, falling back to a bare string so enum
-/// variants can be written without quotes.
+/// typos); numeric path parts index into arrays (e.g.
+/// `rigid_bodies.0.enabled=false`). The value is parsed as JSON, falling back
+/// to a bare string so enum variants can be written without quotes.
 fn apply_set(root: &mut serde_json::Value, path: &str, raw: &str) -> Result<(), String> {
     let parts: Vec<&str> = path.split('.').collect();
     let (last, walk) = parts
@@ -181,18 +211,43 @@ fn apply_set(root: &mut serde_json::Value, path: &str, raw: &str) -> Result<(), 
 
     let mut current = root;
     for part in walk {
-        check_key(current, part, path)?;
-        current = current.get_mut(*part).unwrap();
+        current = step_into(current, part, path)?;
     }
-    check_key(current, last, path)?;
 
     let value = serde_json::from_str(raw)
         .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
-    current
-        .as_object_mut()
-        .unwrap()
-        .insert(last.to_string(), value);
+
+    if current.is_array() {
+        let slot = step_into(current, last, path)?;
+        *slot = value;
+    } else {
+        check_key(current, last, path)?;
+        current
+            .as_object_mut()
+            .unwrap()
+            .insert(last.to_string(), value);
+    }
     Ok(())
+}
+
+/// Walk one path segment: object key, or array index for numeric parts.
+fn step_into<'a>(
+    node: &'a mut serde_json::Value,
+    key: &str,
+    full_path: &str,
+) -> Result<&'a mut serde_json::Value, String> {
+    if node.is_array() {
+        let len = node.as_array().map(|a| a.len()).unwrap_or(0);
+        let idx: usize = key.parse().map_err(|_| {
+            format!("--set {full_path}: '{key}' is not an array index (array has {len} entries)")
+        })?;
+        node.get_mut(idx).ok_or_else(|| {
+            format!("--set {full_path}: index {idx} out of range (array has {len} entries)")
+        })
+    } else {
+        check_key(node, key, full_path)?;
+        Ok(node.get_mut(key).unwrap())
+    }
 }
 
 /// Verify `key` exists in the object at `node`, with a helpful error listing

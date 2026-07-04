@@ -23,15 +23,20 @@ struct RigidBodyParams {
     rot_row0: vec4<f32>,
     rot_row1: vec4<f32>,
     rot_row2: vec4<f32>,
+    prop_blades: u32,
+    prop_pitch: f32,
+    _pad0: f32,
+    _pad1: f32,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraParams;
-@group(0) @binding(1) var<uniform> body: RigidBodyParams;
+@group(0) @binding(1) var<storage, read> bodies: array<RigidBodyParams>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) world_pos: vec3<f32>,
+    @location(2) @interpolate(flat) body_idx: u32,
 }
 
 const PI: f32 = 3.14159265359;
@@ -41,6 +46,14 @@ const SHAPE_CUBE: u32 = 0u;
 const SHAPE_SPHERE: u32 = 1u;
 const SHAPE_CYLINDER: u32 = 2u;
 const SHAPE_TORUS: u32 = 3u;
+const SHAPE_PROPELLER: u32 = 5u;
+
+// Propeller proportions in units of half_extent (spin axis = Y).
+// Must match state/rigid_body.rs PROP_* and the SDF in sph_integrate_3d.wgsl.
+const PROP_HUB_RADIUS: f32 = 0.25;
+const PROP_HUB_HALF_HEIGHT: f32 = 0.30;
+const PROP_BLADE_CENTER: f32 = 0.55;
+const PROP_BLADE_HALF: vec3<f32> = vec3<f32>(0.44, 0.18, 0.045);
 
 const SPHERE_SLICES: u32 = 32u;
 const SPHERE_STACKS: u32 = 16u;
@@ -217,8 +230,47 @@ fn torus_vertex(vi: u32) -> ShapeVertex {
     return torus_point(ma, mi);
 }
 
+// === PROPELLER (hub cylinder 384 verts + 36 per blade) ===
+// Forward transform per blade: scale → offset radially → pitch around X →
+// rotate into sector around Y. The SDF applies the exact inverse.
+fn propeller_vertex(vi: u32, blades: u32, pitch: f32) -> ShapeVertex {
+    let hub_verts = CYL_SEGMENTS * 12u; // 384
+    if (vi < hub_verts) {
+        let cv = cylinder_vertex(vi);
+        // Non-uniform scale keeps cylinder normals valid (barrel normals are
+        // horizontal, cap normals vertical)
+        return ShapeVertex(
+            vec3(cv.pos.x * PROP_HUB_RADIUS, cv.pos.y * PROP_HUB_HALF_HEIGHT, cv.pos.z * PROP_HUB_RADIUS),
+            cv.norm,
+        );
+    }
+
+    let bi = (vi - hub_verts) / 36u;
+    let bv = (vi - hub_verts) % 36u;
+    let cv = cube_vertex(bv);
+
+    var pos = cv.pos * PROP_BLADE_HALF;
+    pos.x += PROP_BLADE_CENTER;
+    var norm = cv.norm; // box face normals stay axis-aligned under scale
+
+    // Pitch around the radial (X) axis
+    let cp = cos(pitch);
+    let sp = sin(pitch);
+    pos = vec3(pos.x, cp * pos.y - sp * pos.z, sp * pos.y + cp * pos.z);
+    norm = vec3(norm.x, cp * norm.y - sp * norm.z, sp * norm.y + cp * norm.z);
+
+    // Place the blade in its sector around Y
+    let theta = f32(bi) * TWO_PI / f32(blades);
+    let ct = cos(theta);
+    let st = sin(theta);
+    pos = vec3(ct * pos.x + st * pos.z, pos.y, -st * pos.x + ct * pos.z);
+    norm = vec3(ct * norm.x + st * norm.z, norm.y, -st * norm.x + ct * norm.z);
+
+    return ShapeVertex(pos, norm);
+}
+
 // === Shared rotation helper ===
-fn rotate_local_to_world(local: vec3<f32>) -> vec3<f32> {
+fn rotate_local_to_world(body: RigidBodyParams, local: vec3<f32>) -> vec3<f32> {
     return vec3(
         body.rot_row0.x * local.x + body.rot_row1.x * local.y + body.rot_row2.x * local.z,
         body.rot_row0.y * local.x + body.rot_row1.y * local.y + body.rot_row2.y * local.z,
@@ -227,28 +279,35 @@ fn rotate_local_to_world(local: vec3<f32>) -> vec3<f32> {
 }
 
 @vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+fn vs_main(
+    @builtin(vertex_index) vi: u32,
+    @builtin(instance_index) ii: u32,
+) -> VertexOutput {
+    let body = bodies[ii];
     var sv: ShapeVertex;
     switch (body.shape) {
-        case SHAPE_SPHERE:   { sv = sphere_vertex(vi); }
-        case SHAPE_CYLINDER: { sv = cylinder_vertex(vi); }
-        case SHAPE_TORUS:    { sv = torus_vertex(vi); }
-        default:             { sv = cube_vertex(vi); }
+        case SHAPE_SPHERE:    { sv = sphere_vertex(vi); }
+        case SHAPE_CYLINDER:  { sv = cylinder_vertex(vi); }
+        case SHAPE_TORUS:     { sv = torus_vertex(vi); }
+        case SHAPE_PROPELLER: { sv = propeller_vertex(vi, max(body.prop_blades, 1u), body.prop_pitch); }
+        default:              { sv = cube_vertex(vi); }
     }
 
     let local_pos = sv.pos * body.half_extent;
-    let world_pos = rotate_local_to_world(local_pos) + body.position;
-    let world_n = rotate_local_to_world(sv.norm);
+    let world_pos = rotate_local_to_world(body, local_pos) + body.position;
+    let world_n = rotate_local_to_world(body, sv.norm);
 
     var out: VertexOutput;
     out.position = camera.projection * camera.view * vec4(world_pos, 1.0);
     out.normal = world_n;
     out.world_pos = world_pos;
+    out.body_idx = ii;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let body = bodies[in.body_idx];
     let n = normalize(in.normal);
     let l = normalize(body.light_dir);
 

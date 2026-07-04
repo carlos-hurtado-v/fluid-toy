@@ -282,6 +282,10 @@ pub struct SphConfig {
     pub wall_stiffness: f32,
     /// XSPH velocity smoothing coefficient (0 = off, 0.5 = heavy damping)
     pub xsph_epsilon: f32,
+    /// Boundary density strength for the PCISPH solve (0 = off): fills the
+    /// missing-neighbor deficit near walls/bodies so pressure resists
+    /// compression against boundaries. 1.0 = physical half-space integral.
+    pub boundary_density: f32,
 }
 
 impl Default for SphConfig {
@@ -295,6 +299,7 @@ impl Default for SphConfig {
             surface_tension: 0.005,
             wall_stiffness: 200.0,
             xsph_epsilon: 0.305,
+            boundary_density: 1.0,
         }
     }
 }
@@ -331,7 +336,7 @@ impl SphConfig {
             surface_tension: self.surface_tension,
             pcisph_delta: compute_pcisph_delta(h, self.mass, rest_density, dt),
             xsph_epsilon: self.xsph_epsilon,
-            _padding_st: 0.0,
+            boundary_density: self.boundary_density,
         }
     }
 }
@@ -357,7 +362,7 @@ pub struct GpuSphParams3D {
     pub surface_tension: f32,
     pub pcisph_delta: f32,
     pub xsph_epsilon: f32,
-    pub _padding_st: f32,
+    pub boundary_density: f32,
 }
 
 /// Unified container geometry for GPU (128 bytes).

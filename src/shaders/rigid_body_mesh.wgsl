@@ -23,10 +23,14 @@ struct RigidBodyParams {
     rot_row0: vec4<f32>,
     rot_row1: vec4<f32>,
     rot_row2: vec4<f32>,
+    prop_blades: u32,
+    prop_pitch: f32,
+    _pad0: f32,
+    _pad1: f32,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraParams;
-@group(0) @binding(1) var<uniform> body: RigidBodyParams;
+@group(0) @binding(1) var<storage, read> bodies: array<RigidBodyParams>;
 
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
@@ -44,9 +48,10 @@ struct VertexOutput {
     @location(1) world_pos: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec4<f32>,
+    @location(4) @interpolate(flat) body_idx: u32,
 }
 
-fn rotate_local_to_world(local: vec3<f32>) -> vec3<f32> {
+fn rotate_local_to_world(body: RigidBodyParams, local: vec3<f32>) -> vec3<f32> {
     return vec3(
         body.rot_row0.x * local.x + body.rot_row1.x * local.y + body.rot_row2.x * local.z,
         body.rot_row0.y * local.x + body.rot_row1.y * local.y + body.rot_row2.y * local.z,
@@ -55,10 +60,11 @@ fn rotate_local_to_world(local: vec3<f32>) -> vec3<f32> {
 }
 
 @vertex
-fn vs_main(in: VertexInput) -> VertexOutput {
+fn vs_main(in: VertexInput, @builtin(instance_index) ii: u32) -> VertexOutput {
+    let body = bodies[ii];
     let local_pos = in.position * body.half_extent;
-    let world_pos = rotate_local_to_world(local_pos) + body.position;
-    let world_n = normalize(rotate_local_to_world(in.normal));
+    let world_pos = rotate_local_to_world(body, local_pos) + body.position;
+    let world_n = normalize(rotate_local_to_world(body, in.normal));
 
     var out: VertexOutput;
     out.position = camera.projection * camera.view * vec4(world_pos, 1.0);
@@ -66,11 +72,13 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.world_pos = world_pos;
     out.uv = in.uv;
     out.color = in.color;
+    out.body_idx = ii;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let body = bodies[in.body_idx];
     let n = normalize(in.normal);
     let l = normalize(body.light_dir);
 

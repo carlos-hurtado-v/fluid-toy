@@ -28,7 +28,7 @@ pub struct AppState {
     pub quality: QualityConfig,
     pub post_process: PostProcessConfig,
     pub camera: CameraConfig,
-    pub rigid_body: RigidBodyConfig,
+    pub rigid_bodies: Vec<RigidBodyConfig>,
     pub spray: SprayConfig,
     pub mouse_force: MouseForceConfig,
     #[serde(skip)]

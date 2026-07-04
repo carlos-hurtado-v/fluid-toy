@@ -1,6 +1,6 @@
 //! GUI module - egui integration for parameter control
 
-use crate::state::{AoDebugMode, AppState, BackgroundMode, ContainerStyle, FluidRenderMode, ForceMode, HdrEnvironment, McGridResolution, RigidBodyShape, SimulationConfig};
+use crate::state::{AoDebugMode, AppState, BackgroundMode, ContainerStyle, FluidRenderMode, ForceMode, HdrEnvironment, McGridResolution, RigidBodyConfig, RigidBodyMotion, RigidBodyShape, SimulationConfig, MAX_RIGID_BODIES};
 
 /// Renders the control panel and returns any triggered action
 pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAction {
@@ -159,75 +159,115 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
             ui.add_space(8.0);
 
             // Rigid Body controls
-            ui.collapsing("Rigid Body", |ui| {
-                ui.checkbox(&mut state.rigid_body.enabled, "Enable");
+            ui.collapsing("Rigid Bodies", |ui| {
+                let mut remove_idx: Option<usize> = None;
 
-                if state.rigid_body.enabled {
-                    ui.add_space(4.0);
-                    ui.label("Shape:");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut state.rigid_body.shape, RigidBodyShape::Cube, "Cube");
-                        ui.selectable_value(&mut state.rigid_body.shape, RigidBodyShape::Sphere, "Sphere");
-                        ui.selectable_value(&mut state.rigid_body.shape, RigidBodyShape::Cylinder, "Cylinder");
-                        ui.selectable_value(&mut state.rigid_body.shape, RigidBodyShape::Torus, "Torus");
-                        ui.selectable_value(&mut state.rigid_body.shape, RigidBodyShape::Custom, "Duck");
-                    });
+                for (i, body) in state.rigid_bodies.iter_mut().enumerate() {
+                    let title = format!("Body {} — {:?} {:?}", i + 1, body.motion, body.shape);
+                    egui::CollapsingHeader::new(title)
+                        .id_salt(i)
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut body.enabled, "Enable");
+                                if ui.button("Remove").clicked() {
+                                    remove_idx = Some(i);
+                                }
+                            });
 
-                    ui.add_space(4.0);
-                    ui.checkbox(&mut state.rigid_body.held, "Held (manual position)");
+                            ui.add_space(4.0);
+                            ui.label("Shape:");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.selectable_value(&mut body.shape, RigidBodyShape::Cube, "Cube");
+                                ui.selectable_value(&mut body.shape, RigidBodyShape::Sphere, "Sphere");
+                                ui.selectable_value(&mut body.shape, RigidBodyShape::Cylinder, "Cylinder");
+                                ui.selectable_value(&mut body.shape, RigidBodyShape::Torus, "Torus");
+                                ui.selectable_value(&mut body.shape, RigidBodyShape::Propeller, "Propeller");
+                                ui.selectable_value(&mut body.shape, RigidBodyShape::Custom, "Duck");
+                            });
 
-                    ui.horizontal(|ui| {
-                        if ui.button("Drop").clicked() {
-                            state.rigid_body.held = false;
-                            state.rigid_body.velocity = [0.0; 3];
-                        }
-                        if ui.button("Reset").clicked() {
-                            state.rigid_body.held = true;
-                            state.rigid_body.position = [0.0, 0.2, 0.0];
-                            state.rigid_body.velocity = [0.0; 3];
-                            state.rigid_body.orientation = [0.0, 0.0, 0.0, 1.0];
-                            state.rigid_body.angular_velocity = [0.0; 3];
-                        }
-                        if ui.button("Reset Rotation").clicked() {
-                            state.rigid_body.orientation = [0.0, 0.0, 0.0, 1.0];
-                            state.rigid_body.angular_velocity = [0.0; 3];
-                        }
-                    });
+                            if body.shape == RigidBodyShape::Propeller {
+                                ui.add(egui::Slider::new(&mut body.prop_blades, 2..=6).text("Blades"));
+                                ui.add(
+                                    egui::Slider::new(&mut body.prop_pitch_deg, 0.0..=60.0)
+                                        .text("Blade Pitch (deg)"),
+                                );
+                            }
 
-                    ui.add_space(4.0);
-                    ui.add(
-                        egui::Slider::new(&mut state.rigid_body.half_extent, 0.05..=0.5)
-                            .text("Size")
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut state.rigid_body.density, 10.0..=10000.0)
-                            .text("Density")
-                            .logarithmic(true)
-                    );
-                    ui.label(format!("  Fluid density: {:.0}", state.sph.rest_density()));
+                            ui.add_space(4.0);
+                            ui.label("Motion:");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut body.motion, RigidBodyMotion::Static, "Static");
+                                ui.selectable_value(&mut body.motion, RigidBodyMotion::Kinematic, "Kinematic");
+                                ui.selectable_value(&mut body.motion, RigidBodyMotion::Dynamic, "Dynamic");
+                            });
 
-                    if state.rigid_body.held {
-                        ui.add_space(4.0);
-                        ui.label("Position:");
-                        ui.add(
-                            egui::Slider::new(&mut state.rigid_body.position[0], -1.0..=1.0)
-                                .text("X")
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut state.rigid_body.position[1], -1.0..=1.0)
-                                .text("Y")
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut state.rigid_body.position[2], -1.0..=1.0)
-                                .text("Z")
-                        );
+                            match body.motion {
+                                RigidBodyMotion::Static => {}
+                                RigidBodyMotion::Kinematic => {
+                                    ui.add(
+                                        egui::Slider::new(&mut body.spin_rpm, -300.0..=300.0)
+                                            .text("Spin (RPM)"),
+                                    );
+                                }
+                                RigidBodyMotion::Dynamic => {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Stop Motion").clicked() {
+                                            body.velocity = [0.0; 3];
+                                            body.angular_velocity = [0.0; 3];
+                                        }
+                                        if ui.button("Reset Rotation").clicked() {
+                                            body.orientation = [0.0, 0.0, 0.0, 1.0];
+                                            body.angular_velocity = [0.0; 3];
+                                        }
+                                    });
+                                }
+                            }
+
+                            ui.add_space(4.0);
+                            ui.add(egui::Slider::new(&mut body.half_extent, 0.05..=0.5).text("Size"));
+                            if body.motion == RigidBodyMotion::Dynamic {
+                                ui.add(
+                                    egui::Slider::new(&mut body.relative_density, 0.05..=3.0)
+                                        .text("Density (x fluid)")
+                                        .logarithmic(true),
+                                );
+                                ui.label("  1.0 = neutral buoyancy, above 1 sinks");
+                            }
+
+                            ui.add_space(4.0);
+                            ui.label("Position:");
+                            ui.add(egui::Slider::new(&mut body.position[0], -1.5..=1.5).text("X"));
+                            ui.add(egui::Slider::new(&mut body.position[1], -1.5..=1.5).text("Y"));
+                            ui.add(egui::Slider::new(&mut body.position[2], -1.5..=1.5).text("Z"));
+
+                            if body.motion != RigidBodyMotion::Dynamic {
+                                ui.add_space(4.0);
+                                ui.label("Orientation (deg):");
+                                ui.add(egui::Slider::new(&mut body.euler_deg[0], -180.0..=180.0).text("Rot X"));
+                                ui.add(egui::Slider::new(&mut body.euler_deg[1], -180.0..=180.0).text("Rot Y"));
+                                ui.add(egui::Slider::new(&mut body.euler_deg[2], -180.0..=180.0).text("Rot Z"));
+                            }
+
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Color:");
+                                egui::color_picker::color_edit_button_rgb(ui, &mut body.color);
+                            });
+                        });
+                }
+
+                if let Some(i) = remove_idx {
+                    state.rigid_bodies.remove(i);
+                }
+
+                ui.add_space(4.0);
+                if state.rigid_bodies.len() < MAX_RIGID_BODIES {
+                    if ui.button("+ Add Body").clicked() {
+                        state.rigid_bodies.push(RigidBodyConfig::default());
                     }
-
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Color:");
-                        egui::color_picker::color_edit_button_rgb(ui, &mut state.rigid_body.color);
-                    });
+                } else {
+                    ui.label(format!("Max {} bodies", MAX_RIGID_BODIES));
                 }
             });
 
@@ -263,6 +303,10 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 ui.add(
                     egui::Slider::new(&mut state.sph.xsph_epsilon, 0.0..=0.5)
                         .text("XSPH Smoothing")
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.sph.boundary_density, 0.0..=1.25)
+                        .text("Boundary Density")
                 );
             });
 

@@ -28,7 +28,7 @@ struct SphParams {
     surface_tension: f32,
     pcisph_delta: f32,
     xsph_epsilon: f32,
-    _pad_st2: f32,
+    boundary_density: f32,
 }
 
 struct MouseForce {
@@ -48,43 +48,34 @@ const FORCE_VORTEX: u32 = 2u;
 const FORCE_EXPLODE: u32 = 3u;
 const FORCE_DRAIN: u32 = 4u;
 
-const SHAPE_CUBE: u32 = 0u;
-const SHAPE_SPHERE: u32 = 1u;
-const SHAPE_CYLINDER: u32 = 2u;
-const SHAPE_TORUS: u32 = 3u;
-const SHAPE_CUSTOM: u32 = 4u;
+// RigidBody/RigidBodies structs, shape/motion constants, and propeller_sdf
+// come from rigid_body_common.wgsl (concatenated before this file).
 
-struct RigidBody {
-    position: vec3<f32>,
-    half_extent: f32,
-    velocity: vec3<f32>,
-    is_active: u32,
-    stiffness: f32,
-    shape: u32,
-    _pad1: f32,
-    _pad2: f32,
-    rot_row0: vec4<f32>,
-    rot_row1: vec4<f32>,
-    rot_row2: vec4<f32>,
-}
-
+// Penalty (static contact) and damping (velocity drag) reactions accumulate
+// separately: the CPU attenuates the static component by submersion so a
+// fully-wetted body is supported by analytic buoyancy + drag, not by the
+// gap-stiffness cushion (which otherwise holds dense bodies in mid-water).
 struct RigidBodyAccum {
-    force_x: atomic<i32>,
-    force_y: atomic<i32>,
-    force_z: atomic<i32>,
+    penalty_x: atomic<i32>,
+    penalty_y: atomic<i32>,
+    penalty_z: atomic<i32>,
     contact_count: atomic<u32>,
+    damping_x: atomic<i32>,
+    damping_y: atomic<i32>,
+    damping_z: atomic<i32>,
+    _pad0: u32,
     torque_x: atomic<i32>,
     torque_y: atomic<i32>,
     torque_z: atomic<i32>,
-    _pad: u32,
+    _pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: SphParams;
 @group(0) @binding(1) var<storage, read_write> particles: array<SphParticle3D>;
 @group(0) @binding(2) var<uniform> container: ContainerGeometry;
 @group(0) @binding(3) var<uniform> mouse_force: MouseForce;
-@group(0) @binding(4) var<uniform> rigid_body: RigidBody;
-@group(0) @binding(5) var<storage, read_write> body_accum: RigidBodyAccum;
+@group(0) @binding(4) var<storage, read> rigid_bodies: RigidBodies;
+@group(0) @binding(5) var<storage, read_write> body_accums: array<RigidBodyAccum, MAX_RIGID_BODIES>;
 @group(0) @binding(6) var sdf_texture: texture_3d<f32>;
 @group(0) @binding(7) var sdf_sampler: sampler;
 
@@ -199,10 +190,22 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
 
-    // Rigid body penalty forces (per-shape SDF)
-    if (rigid_body.is_active != 0u) {
-        // Transform particle position to body-local frame
+    // Rigid body penalty forces (per-shape SDF), one pass per body
+    let interact_range = params.kernel_radius * 0.7;
+    for (var b = 0u; b < min(rigid_bodies.count, MAX_RIGID_BODIES); b++) {
+        let rigid_body = rigid_bodies.bodies[b];
+        if (rigid_body.is_active == 0u) {
+            continue;
+        }
+
+        // Bounding-sphere early-out (1.75 covers the cube corner at sqrt(3))
         let world_rel = pos - rigid_body.position;
+        let bound = rigid_body.half_extent * 1.75 + interact_range;
+        if (dot(world_rel, world_rel) > bound * bound) {
+            continue;
+        }
+
+        // Transform particle position to body-local frame
         let rb_local = vec3<f32>(
             dot(rigid_body.rot_row0.xyz, world_rel),
             dot(rigid_body.rot_row1.xyz, world_rel),
@@ -286,6 +289,29 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     local_normal = normalize(rb_local + vec3<f32>(0.0, 1e-6, 0.0));
                 }
             }
+            case SHAPE_PROPELLER: {
+                let blades = max(rigid_body.prop_blades, 1u);
+                let pitch = rigid_body.prop_pitch;
+                sdf = propeller_sdf(rb_local, he, blades, pitch);
+
+                // Normal via central differences (thin pitched blades have no
+                // clean analytic branch structure)
+                let eps = max(0.01 * he, 1e-4);
+                let ex = vec3<f32>(eps, 0.0, 0.0);
+                let ey = vec3<f32>(0.0, eps, 0.0);
+                let ez = vec3<f32>(0.0, 0.0, eps);
+                let grad = vec3<f32>(
+                    propeller_sdf(rb_local + ex, he, blades, pitch) - propeller_sdf(rb_local - ex, he, blades, pitch),
+                    propeller_sdf(rb_local + ey, he, blades, pitch) - propeller_sdf(rb_local - ey, he, blades, pitch),
+                    propeller_sdf(rb_local + ez, he, blades, pitch) - propeller_sdf(rb_local - ez, he, blades, pitch),
+                );
+                let grad_len = length(grad);
+                if (grad_len > 1e-6) {
+                    local_normal = grad / grad_len;
+                } else {
+                    local_normal = vec3<f32>(0.0, 1.0, 0.0);
+                }
+            }
             default: {
                 // Cube SDF: axis-aligned box
                 let d = abs(rb_local) - vec3<f32>(he);
@@ -299,8 +325,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 }
             }
         }
-
-        let interact_range = params.kernel_radius * 0.7;
 
         if (sdf < interact_range) {
             // Transform normal from local to world (transpose multiply)
@@ -316,27 +340,38 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let penalty = normal * rigid_body.stiffness * t * t;
             accel += penalty;
 
-            // Velocity-dependent damping
+            // Velocity-dependent damping against the body's surface point
+            // velocity (rigid velocity field: v + omega x r) — this is what
+            // lets a spinning body drive the fluid
+            let v_point = rigid_body.velocity + cross(rigid_body.angular_velocity, world_rel);
             var damping_accel = vec3<f32>(0.0);
-            let rel_vel = vel - rigid_body.velocity;
+            let rel_vel = vel - v_point;
             let vn = dot(rel_vel, normal);
             if (vn < 0.0) {
                 damping_accel = -normal * vn * 5.0;
                 accel += damping_accel;
             }
 
-            // Accumulate reaction force and torque (Newton's 3rd law)
-            let reaction = -(penalty + damping_accel) * params.mass;
-            atomicAdd(&body_accum.force_x, i32(reaction.x * 1000.0));
-            atomicAdd(&body_accum.force_y, i32(reaction.y * 1000.0));
-            atomicAdd(&body_accum.force_z, i32(reaction.z * 1000.0));
-            atomicAdd(&body_accum.contact_count, 1u);
+            // Accumulate reaction force and torque (Newton's 3rd law) —
+            // only Dynamic bodies consume them on the CPU. contact_count
+            // feeds the CPU submerged-fraction estimate for buoyancy.
+            if (rigid_body.motion == MOTION_DYNAMIC) {
+                let pen_reaction = -penalty * params.mass;
+                let damp_reaction = -damping_accel * params.mass;
+                atomicAdd(&body_accums[b].penalty_x, i32(pen_reaction.x * 1000.0));
+                atomicAdd(&body_accums[b].penalty_y, i32(pen_reaction.y * 1000.0));
+                atomicAdd(&body_accums[b].penalty_z, i32(pen_reaction.z * 1000.0));
+                atomicAdd(&body_accums[b].damping_x, i32(damp_reaction.x * 1000.0));
+                atomicAdd(&body_accums[b].damping_y, i32(damp_reaction.y * 1000.0));
+                atomicAdd(&body_accums[b].damping_z, i32(damp_reaction.z * 1000.0));
+                atomicAdd(&body_accums[b].contact_count, 1u);
 
-            // Torque: cross(r, F) where r = particle_pos - body_center
-            let torque = cross(world_rel, reaction);
-            atomicAdd(&body_accum.torque_x, i32(torque.x * 1000.0));
-            atomicAdd(&body_accum.torque_y, i32(torque.y * 1000.0));
-            atomicAdd(&body_accum.torque_z, i32(torque.z * 1000.0));
+                // Torque: cross(r, F) where r = particle_pos - body_center
+                let torque = cross(world_rel, pen_reaction + damp_reaction);
+                atomicAdd(&body_accums[b].torque_x, i32(torque.x * 1000.0));
+                atomicAdd(&body_accums[b].torque_y, i32(torque.y * 1000.0));
+                atomicAdd(&body_accums[b].torque_z, i32(torque.z * 1000.0));
+            }
         }
     }
 
