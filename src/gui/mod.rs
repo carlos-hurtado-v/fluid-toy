@@ -484,6 +484,33 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     );
                     state.rendering.ss_filter_iterations = filter_iters as u32;
                     ui.add(
+                        egui::Slider::new(&mut state.rendering.ss_nr_range, 1.0..=15.0)
+                            .text("NR Depth Range")
+                            .suffix(" r")
+                    ).on_hover_text(
+                        "Narrow-range filter window in particle radii. Small (~3, per the \
+                         paper) keeps nearby surfaces separate in churn; large (10, Splash) \
+                         depth-merges them into blobs",
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.ss_nr_offset, 0.5..=10.0)
+                            .text("NR Clamp Offset")
+                            .suffix(" r")
+                    ).on_hover_text(
+                        "Where far-side and background samples clamp, in particle radii; \
+                         equal to the range keeps the filter response continuous",
+                    );
+                    ui.checkbox(&mut state.rendering.ss_temporal, "Temporal Smoothing")
+                        .on_hover_text(
+                            "Reprojected EMA on the filtered depth; damps churn shimmer \
+                             and specular fireflies",
+                        );
+                    ui.checkbox(&mut state.rendering.mc_anisotropy, "Anisotropic Splats")
+                        .on_hover_text(
+                            "Stretch splats into Yu & Turk ellipsoids (same records and \
+                             toggle as the MC mode); flattens calm surfaces and thin sheets",
+                        );
+                    ui.add(
                         egui::Slider::new(&mut state.rendering.water_roughness, 0.01..=0.5)
                             .text("Roughness")
                     );

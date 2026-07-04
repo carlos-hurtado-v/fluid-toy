@@ -2345,24 +2345,21 @@ impl MarchingCubesRenderer {
         queue.write_buffer(&self.ssr_params_buffer, 0, bytemuck::bytes_of(&params));
     }
 
-    /// Generate mesh from particles using SPH grid-accelerated density computation
-    pub fn generate(
+    /// Per-particle ellipsoid records from the last anisotropy pass, indexed
+    /// by sorted particle index (valid after run_anisotropy this frame).
+    pub fn aniso_buffer(&self) -> &wgpu::Buffer {
+        &self.aniso_buffer
+    }
+
+    /// Invalidate cached bind groups if the sim handed us different buffer
+    /// objects (sim rebuild on respawn/container change swaps them out).
+    fn sync_sim_buffer_cache(
         &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        device: &wgpu::Device,
         sorted_particle_buffer: &wgpu::Buffer,
         cell_starts_buffer: &wgpu::Buffer,
         cell_counts_buffer: &wgpu::Buffer,
         sph_grid_params_buffer: &wgpu::Buffer,
-        blur_radius: u32,
-        num_particles: u32,
-        aniso_enabled: bool,
     ) {
-        // Reset counter
-        encoder.clear_buffer(&self.counter_buffer, 0, None);
-
-        // Invalidate cached bind groups if the sim handed us different buffer
-        // objects (sim rebuild on respawn/container change swaps them out)
         let sim_buffers_changed = match &self.cached_sim_buffers {
             Some([a, b, c, d]) => {
                 a != sorted_particle_buffer
@@ -2382,12 +2379,119 @@ impl MarchingCubesRenderer {
             self.cached_density_bg = None;
             self.cached_aniso_bg = None;
         }
+    }
 
-        let run_aniso = aniso_enabled && num_particles > 0;
-        if run_aniso {
-            // Must happen before the density bind group is created below
-            // (may recreate aniso_buffer, which both bind groups reference)
-            self.ensure_aniso_capacity(device, num_particles);
+    /// Per-particle anisotropic kernel fit (covariance + eigensolve), Yu &
+    /// Turk. Standalone entry so the screen-space renderer can run it without
+    /// the rest of the MC pipeline; generate() calls it too. The separate
+    /// compute pass gives an implicit barrier before any consumer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_anisotropy(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        sorted_particle_buffer: &wgpu::Buffer,
+        cell_starts_buffer: &wgpu::Buffer,
+        cell_counts_buffer: &wgpu::Buffer,
+        sph_grid_params_buffer: &wgpu::Buffer,
+        num_particles: u32,
+    ) {
+        if num_particles == 0 {
+            return;
+        }
+        self.sync_sim_buffer_cache(
+            sorted_particle_buffer,
+            cell_starts_buffer,
+            cell_counts_buffer,
+            sph_grid_params_buffer,
+        );
+        // May recreate aniso_buffer (invalidates both cached bind groups)
+        self.ensure_aniso_capacity(device, num_particles);
+
+        let aniso_bind_group = match &self.cached_aniso_bg {
+            Some(bg) => bg.clone(),
+            None => {
+                let layout = self.aniso_pipeline.get_bind_group_layout(0);
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("MC Anisotropy BG"),
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: sorted_particle_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: cell_starts_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: cell_counts_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: sph_grid_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.aniso_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: self.aniso_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+                self.cached_aniso_bg = Some(bg.clone());
+                bg
+            }
+        };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("MC Anisotropy Pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.aniso_pipeline);
+        pass.set_bind_group(0, &aniso_bind_group, &[]);
+        pass.dispatch_workgroups(num_particles.div_ceil(128), 1, 1);
+    }
+
+    /// Generate mesh from particles using SPH grid-accelerated density computation
+    pub fn generate(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        sorted_particle_buffer: &wgpu::Buffer,
+        cell_starts_buffer: &wgpu::Buffer,
+        cell_counts_buffer: &wgpu::Buffer,
+        sph_grid_params_buffer: &wgpu::Buffer,
+        blur_radius: u32,
+        num_particles: u32,
+        aniso_enabled: bool,
+    ) {
+        // Reset counter
+        encoder.clear_buffer(&self.counter_buffer, 0, None);
+
+        // Pass 0: Per-particle anisotropic kernel fit (covariance + eigensolve).
+        // Runs before the density bind group is created below — it may grow
+        // aniso_buffer, which that bind group references. Also syncs the sim
+        // buffer cache; repeat the sync here for the aniso-disabled path.
+        if aniso_enabled && num_particles > 0 {
+            self.run_anisotropy(
+                encoder,
+                device,
+                sorted_particle_buffer,
+                cell_starts_buffer,
+                cell_counts_buffer,
+                sph_grid_params_buffer,
+                num_particles,
+            );
+        } else {
+            self.sync_sim_buffer_cache(
+                sorted_particle_buffer,
+                cell_starts_buffer,
+                cell_counts_buffer,
+                sph_grid_params_buffer,
+            );
         }
 
         // Density bind group with SPH grid buffers (cached across frames)
@@ -2405,56 +2509,6 @@ impl MarchingCubesRenderer {
                 bg
             }
         };
-
-        // Pass 0: Per-particle anisotropic kernel fit (covariance + eigensolve).
-        // Separate compute pass gives an implicit barrier before the density pass.
-        if run_aniso {
-            let aniso_bind_group = match &self.cached_aniso_bg {
-                Some(bg) => bg.clone(),
-                None => {
-                    let layout = self.aniso_pipeline.get_bind_group_layout(0);
-                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("MC Anisotropy BG"),
-                        layout: &layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: sorted_particle_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: cell_starts_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: cell_counts_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: sph_grid_params_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 4,
-                                resource: self.aniso_params_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 5,
-                                resource: self.aniso_buffer.as_entire_binding(),
-                            },
-                        ],
-                    });
-                    self.cached_aniso_bg = Some(bg.clone());
-                    bg
-                }
-            };
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("MC Anisotropy Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.aniso_pipeline);
-            pass.set_bind_group(0, &aniso_bind_group, &[]);
-            pass.dispatch_workgroups(num_particles.div_ceil(128), 1, 1);
-        }
 
         // Pass 1: Generate density field (splat particles into texture A)
         {

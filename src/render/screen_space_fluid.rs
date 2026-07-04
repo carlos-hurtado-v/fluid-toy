@@ -7,6 +7,8 @@
 //! narrow-range filter → normals → opaque scene to background (env + container +
 //! rigid body + spray, with depth) → depth-aware composite (water or scene per pixel)
 
+use std::cell::Cell;
+
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
@@ -27,9 +29,12 @@ struct GpuSsParams {
     screen_width: f32,
     screen_height: f32,
     thickness_scale: f32,
+    /// 1 = splat Yu & Turk ellipsoids from the shared anisotropy records
+    aniso_enabled: u32,
+    /// Ellipsoid iso-level: records are normalized to the MC kernel radius
+    /// h_mc, the SS surface sits at ss_radius, so scale = ss_radius / h_mc
+    aniso_surface_scale: f32,
     _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
 }
 
 #[repr(C)]
@@ -66,6 +71,19 @@ struct GpuNormalParams {
     _pad0: u32,
     _pad1: u32,
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct GpuTemporalParams {
+    screen_width: u32,
+    screen_height: u32,
+    history_weight: f32,
+    depth_tolerance: f32,
+}
+
+/// EMA weight on accepted temporal history (0.6 ≈ 2.5-frame time constant);
+/// the reprojection validity gate keeps fast-moving surfaces from smearing.
+const TEMPORAL_HISTORY_WEIGHT: f32 = 0.6;
 
 // ─── Helper: create a 2D texture ───────────────────────────────────────────
 
@@ -115,6 +133,9 @@ pub struct ScreenSpaceFluidRenderer {
     background_view: wgpu::TextureView,
     background_depth_texture: wgpu::Texture,
     background_depth_view: wgpu::TextureView,
+    // Previous frame's blended depth (copied from depth_texture each frame)
+    history_texture: wgpu::Texture,
+    history_view: wgpu::TextureView,
 
     // Uniform buffers
     ss_params_buffer: wgpu::Buffer,
@@ -129,6 +150,7 @@ pub struct ScreenSpaceFluidRenderer {
     thickness_blur_h_buffer: wgpu::Buffer,
     thickness_blur_v_buffer: wgpu::Buffer,
     normal_params_buffer: wgpu::Buffer,
+    temporal_params_buffer: wgpu::Buffer,
 
     // Pipelines
     depth_pipeline: wgpu::RenderPipeline,
@@ -136,6 +158,7 @@ pub struct ScreenSpaceFluidRenderer {
     filter_pipeline: wgpu::ComputePipeline,
     thickness_blur_pipeline: wgpu::ComputePipeline,
     normal_pipeline: wgpu::ComputePipeline,
+    temporal_pipeline: wgpu::ComputePipeline,
     composite_pipeline: wgpu::RenderPipeline,
     env_pipeline: wgpu::RenderPipeline,
 
@@ -144,6 +167,7 @@ pub struct ScreenSpaceFluidRenderer {
     filter_bgl: wgpu::BindGroupLayout,
     thickness_blur_bgl: wgpu::BindGroupLayout,
     normal_bgl: wgpu::BindGroupLayout,
+    temporal_bgl: wgpu::BindGroupLayout,
     composite_texture_bgl: wgpu::BindGroupLayout,
     env_bgl: wgpu::BindGroupLayout,
 
@@ -155,6 +179,9 @@ pub struct ScreenSpaceFluidRenderer {
     thickness_blur_h_bg: wgpu::BindGroup,
     thickness_blur_v_bg: wgpu::BindGroup,
     normal_bg: wgpu::BindGroup,
+    temporal_bg: wgpu::BindGroup,
+    // Previous frame's view matrices for reprojection (None = no history yet)
+    prev_view_mats: Cell<Option<([[f32; 4]; 4], [[f32; 4]; 4])>>,
     composite_uniform_bg: wgpu::BindGroup,
     composite_texture_bg: wgpu::BindGroup,
     env_bg: wgpu::BindGroup,
@@ -174,6 +201,7 @@ impl ScreenSpaceFluidRenderer {
         light_params: &GpuLightParams,
         water_params: &GpuWaterParams,
         sh: &GpuShCoefficients,
+        foam_density_view: &wgpu::TextureView,
         width: u32,
         height: u32,
     ) -> Self {
@@ -185,8 +213,15 @@ impl ScreenSpaceFluidRenderer {
 
         let depth_texture = create_texture(device, "SS Depth", width, height,
             wgpu::TextureFormat::R32Float,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC);
         let depth_view = depth_texture.create_view(&Default::default());
+
+        // Temporal history: last frame's blended depth (zero = invalid)
+        let history_texture = create_texture(device, "SS Depth History", width, height,
+            wgpu::TextureFormat::R32Float,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let history_view = history_texture.create_view(&Default::default());
 
         let hw_depth_texture = create_texture(device, "SS HW Depth", width, height,
             wgpu::TextureFormat::Depth32Float,
@@ -242,7 +277,9 @@ impl ScreenSpaceFluidRenderer {
                 screen_width: width as f32,
                 screen_height: height as f32,
                 thickness_scale: 1.0,
-                _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
+                aniso_enabled: 0,
+                aniso_surface_scale: 1.0,
+                _pad0: 0.0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -330,6 +367,17 @@ impl ScreenSpaceFluidRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let temporal_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SS Temporal Params"),
+            contents: bytemuck::bytes_of(&GpuTemporalParams {
+                screen_width: width,
+                screen_height: height,
+                history_weight: 0.0,
+                depth_tolerance: 0.1,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         let env_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SS Env Params"),
             contents: bytemuck::bytes_of(&crate::state::GpuEnvironmentParams {
@@ -374,6 +422,18 @@ impl ScreenSpaceFluidRenderer {
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Anisotropy records (sorted-particle indexed, owned by the
+                // MC renderer; read only when aniso_enabled)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -503,6 +563,44 @@ impl ScreenSpaceFluidRenderer {
             ],
         });
 
+        // Temporal BGL: params + depth (read_write, blended in place — each
+        // thread touches only its own texel) + history
+        let temporal_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SS Temporal BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::ReadWrite,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
         // Composite uniform BGL (group 0): camera, water, light, sh_coeffs
         let composite_uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("SS Composite Uniform BGL"),
@@ -621,6 +719,18 @@ impl ScreenSpaceFluidRenderer {
                     },
                     count: None,
                 },
+                // Whitewater field (half-res Rg16Float, owned by the MC
+                // renderer, splatted by the spray system in both modes)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -688,6 +798,10 @@ impl ScreenSpaceFluidRenderer {
         let normal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SS Normal Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/ss_normal.wgsl").into()),
+        });
+        let temporal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("SS Temporal Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/ss_temporal.wgsl").into()),
         });
         let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SS Composite Shader"),
@@ -828,6 +942,20 @@ impl ScreenSpaceFluidRenderer {
             cache: None,
         });
 
+        let temporal_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("SS Temporal PL"),
+            bind_group_layouts: &[&temporal_bgl],
+            push_constant_ranges: &[],
+        });
+        let temporal_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("SS Temporal Pipeline"),
+            layout: Some(&temporal_pl),
+            module: &temporal_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         // Composite pipeline
         let composite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("SS Composite PL"),
@@ -936,6 +1064,16 @@ impl ScreenSpaceFluidRenderer {
             ],
         });
 
+        let temporal_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SS Temporal BG"),
+            layout: &temporal_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: temporal_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&depth_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&history_view) },
+            ],
+        });
+
         let composite_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SS Composite Uniform BG"),
             layout: &composite_uniform_bgl,
@@ -950,6 +1088,7 @@ impl ScreenSpaceFluidRenderer {
         let composite_texture_bg = Self::create_composite_texture_bg(
             device, &composite_texture_bgl, &depth_view, &filtered_thickness_b_view,
             &normal_view, &background_view, env_view, &sampler, &background_depth_view,
+            foam_density_view,
         );
 
         let env_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -974,21 +1113,24 @@ impl ScreenSpaceFluidRenderer {
             normal_texture, normal_view,
             background_texture, background_view,
             background_depth_texture, background_depth_view,
+            history_texture, history_view,
             ss_params_buffer, camera_buffer, water_params_buffer,
             light_params_buffer, sh_coefficients_buffer,
             filter_params_h_buffer, filter_params_v_buffer,
             filter_params_2d_buffer, filter_params_2d_back_buffer,
             thickness_blur_h_buffer, thickness_blur_v_buffer,
-            normal_params_buffer, env_params_buffer,
+            normal_params_buffer, temporal_params_buffer, env_params_buffer,
             depth_pipeline, thickness_pipeline,
             filter_pipeline, thickness_blur_pipeline,
-            normal_pipeline, composite_pipeline, env_pipeline,
-            splat_bgl, filter_bgl, thickness_blur_bgl, normal_bgl,
+            normal_pipeline, temporal_pipeline, composite_pipeline, env_pipeline,
+            splat_bgl, filter_bgl, thickness_blur_bgl, normal_bgl, temporal_bgl,
             composite_texture_bgl, env_bgl,
             filter_h_bg, filter_v_bg,
             filter_2d_bg, filter_2d_back_bg,
             thickness_blur_h_bg, thickness_blur_v_bg,
-            normal_bg, composite_uniform_bg, composite_texture_bg,
+            normal_bg, temporal_bg,
+            prev_view_mats: Cell::new(None),
+            composite_uniform_bg, composite_texture_bg,
             env_bg, sampler,
         }
     }
@@ -1031,6 +1173,7 @@ impl ScreenSpaceFluidRenderer {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_composite_texture_bg(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -1041,6 +1184,7 @@ impl ScreenSpaceFluidRenderer {
         env_view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
         background_depth_view: &wgpu::TextureView,
+        foam_density_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SS Composite Texture BG"),
@@ -1053,6 +1197,7 @@ impl ScreenSpaceFluidRenderer {
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(env_view) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(background_depth_view) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(foam_density_view) },
             ],
         })
     }
@@ -1095,13 +1240,14 @@ impl ScreenSpaceFluidRenderer {
         device: &wgpu::Device,
         env_view: &wgpu::TextureView,
         env_sampler: &wgpu::Sampler,
+        foam_density_view: &wgpu::TextureView,
         width: u32,
         height: u32,
     ) {
         if width == 0 || height == 0 { return; }
         self.width = width;
         self.height = height;
-        self.recreate_textures_and_bind_groups(device, env_view, env_sampler);
+        self.recreate_textures_and_bind_groups(device, env_view, env_sampler, foam_density_view);
     }
 
     pub fn rebuild_env_bind_groups(
@@ -1109,13 +1255,14 @@ impl ScreenSpaceFluidRenderer {
         device: &wgpu::Device,
         env_view: &wgpu::TextureView,
         env_sampler: &wgpu::Sampler,
+        foam_density_view: &wgpu::TextureView,
     ) {
         // Composite reads from depth_view (filter result), not filtered_depth_view
         self.composite_texture_bg = Self::create_composite_texture_bg(
             device, &self.composite_texture_bgl,
             &self.depth_view, &self.filtered_thickness_b_view,
             &self.normal_view, &self.background_view, env_view, &self.sampler,
-            &self.background_depth_view,
+            &self.background_depth_view, foam_density_view,
         );
         self.env_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SS Env BG"),
@@ -1134,6 +1281,7 @@ impl ScreenSpaceFluidRenderer {
         device: &wgpu::Device,
         env_view: &wgpu::TextureView,
         env_sampler: &wgpu::Sampler,
+        foam_density_view: &wgpu::TextureView,
     ) {
         let w = self.width;
         let h = self.height;
@@ -1141,8 +1289,15 @@ impl ScreenSpaceFluidRenderer {
         let storage_tex_usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING;
 
         self.depth_texture = create_texture(device, "SS Depth", w, h, wgpu::TextureFormat::R32Float,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC);
         self.depth_view = self.depth_texture.create_view(&Default::default());
+
+        self.history_texture = create_texture(device, "SS Depth History", w, h,
+            wgpu::TextureFormat::R32Float,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        self.history_view = self.history_texture.create_view(&Default::default());
+        self.prev_view_mats.set(None);
 
         self.hw_depth_texture = create_texture(device, "SS HW Depth", w, h, wgpu::TextureFormat::Depth32Float,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
@@ -1191,11 +1346,20 @@ impl ScreenSpaceFluidRenderer {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.normal_view) },
             ],
         });
+        self.temporal_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SS Temporal BG"),
+            layout: &self.temporal_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.temporal_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.depth_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.history_view) },
+            ],
+        });
         self.composite_texture_bg = Self::create_composite_texture_bg(
             device, &self.composite_texture_bgl,
             &self.depth_view, &self.filtered_thickness_b_view,
             &self.normal_view, &self.background_view, env_view, &self.sampler,
-            &self.background_depth_view,
+            &self.background_depth_view, foam_density_view,
         );
         self.env_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SS Env BG"),
@@ -1223,8 +1387,14 @@ impl ScreenSpaceFluidRenderer {
         camera_params: &GpuCameraParams,
         particle_radius: f32,
         particle_spacing: f32,
+        aniso_buffer: &wgpu::Buffer,
+        aniso_enabled: bool,
+        aniso_surface_scale: f32,
         filter_size: u32,
         filter_iterations: u32,
+        nr_range: f32,
+        nr_offset: f32,
+        temporal_enabled: bool,
         fov_y: f32,
         rigid_body: Option<&RigidBodyRenderer>,
         spray: Option<&SprayRenderer>,
@@ -1247,7 +1417,9 @@ impl ScreenSpaceFluidRenderer {
             screen_width: self.width as f32,
             screen_height: self.height as f32,
             thickness_scale,
-            _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
+            aniso_enabled: aniso_enabled as u32,
+            aniso_surface_scale,
+            _pad0: 0.0,
         }));
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera_params));
 
@@ -1258,8 +1430,11 @@ impl ScreenSpaceFluidRenderer {
         let projected_particle_constant = (blur_filter_size * diameter * 0.05
             * (self.height as f32 / 2.0)) / (fov_y / 2.0).tan();
         let max_filter_size = 50.0_f32;
-        let mu = 3.0 * particle_radius;
-        let depth_threshold = 10.0 * particle_radius;
+        // Narrow-range window and clamp offset in world units. GUI-tunable in
+        // particle radii; equal values keep the far-side response continuous
+        // (samples beyond the window clamp exactly to its edge).
+        let mu = nr_offset.max(0.1) * particle_radius;
+        let depth_threshold = nr_range.max(0.1) * particle_radius;
 
         // 1D filter params (H direction)
         let filter_h = GpuFilterParams {
@@ -1308,6 +1483,7 @@ impl ScreenSpaceFluidRenderer {
                 wgpu::BindGroupEntry { binding: 0, resource: self.camera_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: particle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.ss_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: aniso_buffer.as_entire_binding() },
             ],
         });
 
@@ -1388,10 +1564,9 @@ impl ScreenSpaceFluidRenderer {
         }
 
         // ── Pass 4: Narrow-range filter (Truong & Yuksel, matching Splash) ──
-        // 2 iterations of 1D separable (4 passes: H,V,H,V)
-        // + 1 iteration of 2D diamond refinement (2 passes)
-        // Total: 6 passes. Ping-pong: depth ↔ filtered_depth.
-        // After 6 passes result is in depth_texture.
+        // `filter_iterations` iterations of 1D separable (H,V each), then one
+        // 2D diamond refinement applied twice. Ping-pong: depth ↔
+        // filtered_depth; every pair ends with the result in depth_texture.
         let num_1d_iters = filter_iterations.max(1);
         for _ in 0..num_1d_iters {
             // H: depth → filtered
@@ -1435,6 +1610,42 @@ impl ScreenSpaceFluidRenderer {
             pass.set_bind_group(0, &self.filter_2d_back_bg, &[]);
             pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
+
+        // ── Pass 4.5: Temporal accumulation (blended in place on depth) ──
+        // Only while the camera is static: history then shares pixel coords
+        // with the current frame, so no reprojection is needed. During camera
+        // motion the blend is skipped but history keeps refreshing, so the
+        // EMA re-engages the frame the camera stops.
+        if temporal_enabled {
+            let camera_static = matches!(
+                self.prev_view_mats.get(),
+                Some((v, iv)) if v == camera_params.view && iv == camera_params.inv_view
+            );
+            if camera_static {
+                queue.write_buffer(&self.temporal_params_buffer, 0, bytemuck::bytes_of(&GpuTemporalParams {
+                    screen_width: self.width,
+                    screen_height: self.height,
+                    history_weight: TEMPORAL_HISTORY_WEIGHT,
+                    // Accept history within a few particle radii; beyond that
+                    // it's a genuinely moving surface or a disocclusion
+                    depth_tolerance: 3.0 * particle_radius,
+                }));
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("SS Temporal"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.temporal_pipeline);
+                pass.set_bind_group(0, &self.temporal_bg, &[]);
+                pass.dispatch_workgroups(wg_x, wg_y, 1);
+            }
+            // The (possibly blended) result becomes next frame's history
+            encoder.copy_texture_to_texture(
+                self.depth_texture.as_image_copy(),
+                self.history_texture.as_image_copy(),
+                wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 },
+            );
+        }
+        self.prev_view_mats.set(Some((camera_params.view, camera_params.inv_view)));
 
         // ── Pass 5: Normal reconstruction ─────────────────────────────────
         {

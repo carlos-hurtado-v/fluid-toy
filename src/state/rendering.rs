@@ -273,6 +273,15 @@ pub struct RenderConfig {
     pub ss_filter_iterations: u32,
     /// Screen-space debug view (0=off, 1=depth, 2=filtered depth, 3=normals, 4=thickness)
     pub ss_debug_view: u32,
+    /// Narrow-range filter depth window, in particle radii. The paper's base
+    /// window is ~1-3 r (dynamic expansion handles slopes); Splash shipped 10,
+    /// which depth-merges any surfaces within 10 radii and mushes churn.
+    pub ss_nr_range: f32,
+    /// Far-outlier/background clamp offset (mu), in particle radii. Equal to
+    /// ss_nr_range keeps the filter response continuous at the window edge.
+    pub ss_nr_offset: f32,
+    /// Temporal EMA on the filtered SS depth (reprojected, validity-gated)
+    pub ss_temporal: bool,
 }
 
 impl Default for RenderConfig {
@@ -298,6 +307,9 @@ impl Default for RenderConfig {
             ss_filter_size: 12,
             ss_filter_iterations: 3,
             ss_debug_view: 0,
+            ss_nr_range: 3.0,
+            ss_nr_offset: 3.0,
+            ss_temporal: true,
         }
     }
 }

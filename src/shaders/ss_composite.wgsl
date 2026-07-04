@@ -37,8 +37,8 @@ struct WaterParams {
     ripple_strength: f32,
     clarity: f32,
     debug_mode: f32,  // 0=off, 1=raw depth, 2=filtered depth, 3=normals, 4=thickness
-    _pad2: f32,
-    _pad3: f32,
+    foam_coverage: f32,
+    aeration_strength: f32,
 }
 
 struct LightParams {
@@ -64,6 +64,9 @@ struct LightParams {
 @group(1) @binding(4) var env_tex: texture_2d<f32>;
 @group(1) @binding(5) var tex_sampler: sampler;
 @group(1) @binding(6) var background_depth_tex: texture_depth_2d;   // opaque scene depth
+// Half-res whitewater field splatted by the spray system (R = surface foam,
+// G = aeration), same texture the MC composite reads
+@group(1) @binding(7) var foam_density_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -71,6 +74,46 @@ struct VertexOutput {
 }
 
 const PI: f32 = 3.14159265359;
+
+// Whitewater composite constants — keep in sync with mc_render.wgsl (same
+// field, same calibration; the two modes must read foam identically)
+const FOAM_DENSITY_LO: f32 = 0.07;
+const FOAM_COVERAGE_K: f32 = 1.1;
+const FOAM_NOISE_SCALE: f32 = 50.0;
+const FOAM_NOISE_SCALE_FINE: f32 = 187.0;
+const FOAM_NOISE_BREAKUP: f32 = 0.9;
+const FOAM_TEX_CONTRAST: f32 = 0.22;
+const FOAM_TEX_CONTRAST_FINE: f32 = 0.13;
+const FOAM_ALBEDO: vec3<f32> = vec3<f32>(0.34, 0.36, 0.37);
+const FOAM_VEIL_ALBEDO: vec3<f32> = vec3<f32>(0.22, 0.26, 0.29);
+const FOAM_THICK_LO: f32 = 0.45;
+const FOAM_THICK_HI: f32 = 0.85;
+const AERATION_K: f32 = 0.15;
+const AERATION_ALBEDO: vec3<f32> = vec3<f32>(0.22, 0.27, 0.31);
+
+fn hash2(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Smooth value noise with analytic gradient (returns: vec3(noise, dN/dx, dN/dz))
+fn value_noise_grad(p: vec2<f32>) -> vec3<f32> {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+
+    let a = hash2(i + vec2<f32>(0.0, 0.0));
+    let b = hash2(i + vec2<f32>(1.0, 0.0));
+    let c = hash2(i + vec2<f32>(0.0, 1.0));
+    let d = hash2(i + vec2<f32>(1.0, 1.0));
+
+    let val = a + (b - a) * u.x + (c - a) * u.y + (a - b - c + d) * u.x * u.y;
+    let dx = du.x * ((b - a) + (a - b - c + d) * u.y);
+    let dy = du.y * ((c - a) + (a - b - c + d) * u.x);
+    return vec3<f32>(val, dx, dy);
+}
 
 // Fullscreen triangle (3 vertices cover entire screen)
 @vertex
@@ -234,9 +277,14 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     let clamped_thickness = min(thickness, 5.0);
     let transmittance = exp(-absorption_coeffs * optical_density * clamped_thickness);
 
+    // Roughness floor: reconstructed normals carry residual per-pixel noise
+    // that sharp GGX lobes turn into firefly glints; MC's mesh normals don't,
+    // so the floor lives here rather than on the shared slider.
+    let ss_roughness = max(water.roughness, 0.03);
+
     // === REFLECTION ===
     let reflect_dir = reflect(-view_dir, normal);
-    let roughness_sq = water.roughness * water.roughness;
+    let roughness_sq = ss_roughness * ss_roughness;
     var reflection_color: vec3<f32>;
     if (water.use_env_background == 0u) {
         reflection_color = vec3<f32>(water.background_r, water.background_g, water.background_b);
@@ -300,13 +348,13 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         let NdotL = max(0.0, dot(normal, light_dir));
         let NdotV = max(dot(normal, view_dir), 0.001);
 
-        let alpha = water.roughness * water.roughness;
+        let alpha = ss_roughness * ss_roughness;
         let half_vec = normalize(light_dir + view_dir);
         let NdotH = max(dot(normal, half_vec), 0.0);
         let HdotV = max(dot(half_vec, view_dir), 0.0);
 
         let D = D_GGX(NdotH, alpha);
-        let G = G_Smith(NdotV, max(NdotL, 0.001), water.roughness);
+        let G = G_Smith(NdotV, max(NdotL, 0.001), ss_roughness);
         let F_spec = F0 + (1.0 - F0) * pow(1.0 - HdotV, 5.0);
 
         let denom = 4.0 * NdotV * max(NdotL, 0.001);
@@ -315,7 +363,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         sun_specular = light.sun_color * light.sun_intensity * specular_brdf * NdotL;
         // Firefly clamp: noisy reconstructed normals + sharp GGX produce
         // pinpoint glints that bloom into white sparkle noise.
-        sun_specular = min(sun_specular, vec3<f32>(6.0));
+        sun_specular = min(sun_specular, vec3<f32>(3.0));
 
         let light_entering = NdotL * (1.0 - F_spec);
         let interior_glow = water.water_color * transmittance;
@@ -330,12 +378,55 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     let ambient_irradiance = evaluate_sh_irradiance(normal) * water.env_intensity;
     let ambient_subsurface = ambient_irradiance * water.water_color * transmittance * scatter_strength * 0.6;
 
-    let lit_interior = interior_with_scatter
+    var lit_interior = interior_with_scatter
         + sun_subsurface * (1.0 - fresnel)
         + ambient_subsurface * (1.0 - fresnel);
 
+    // === AERATION (submerged whitewater) ===
+    // G channel of the whitewater field: milkiness INSIDE the water, mixed
+    // before the Fresnel combine so reflections survive on top. Same mapping
+    // as mc_render.wgsl.
+    let whitewater_field = textureSampleLevel(foam_density_tex, tex_sampler, input.uv, 0.0).rg;
+    let aeration = 1.0 - exp(-AERATION_K * water.aeration_strength * whitewater_field.g);
+    if (aeration > 0.002) {
+        var aeration_light = evaluate_sh_irradiance(normal) * water.env_intensity;
+        if (light.sun_enabled == 1u) {
+            aeration_light += light.sun_color * light.sun_intensity
+                * max(dot(normal, normalize(light.sun_direction)), 0.0) * 0.6;
+        }
+        lit_interior = mix(lit_interior, AERATION_ALBEDO * aeration_light, aeration);
+    }
+
     var color = mix(lit_interior, reflection_color, fresnel);
     color += sun_specular;
+
+    // === FOAM OVERLAY ===
+    // R channel: surface whitening after the Fresnel combine (foam is rough
+    // and diffuse — it replaces the specular water response). Same mapping as
+    // mc_render.wgsl.
+    let foam_density = whitewater_field.r;
+    if (foam_density > 0.01) {
+        let n_coarse = value_noise_grad(world_pos.xz * FOAM_NOISE_SCALE).x;
+        let n_fine = value_noise_grad(
+            world_pos.xz * FOAM_NOISE_SCALE_FINE + vec2<f32>(37.42, 11.18),
+        ).x;
+        let breakup = (n_coarse - 0.5) * FOAM_NOISE_BREAKUP;
+        let d_eff = max(foam_density * (1.0 + breakup) - FOAM_DENSITY_LO, 0.0);
+        let coverage = 1.0 - exp(-FOAM_COVERAGE_K * water.foam_coverage * d_eff);
+        if (coverage > 0.002) {
+            var foam_light = evaluate_sh_irradiance(normal) * water.env_intensity;
+            if (light.sun_enabled == 1u) {
+                foam_light += light.sun_color * light.sun_intensity
+                    * max(dot(normal, normalize(light.sun_direction)), 0.0);
+            }
+            let thick = smoothstep(FOAM_THICK_LO, FOAM_THICK_HI, coverage);
+            let albedo = mix(FOAM_VEIL_ALBEDO, FOAM_ALBEDO, thick);
+            let tex = 1.0 + (n_coarse - 0.5) * FOAM_TEX_CONTRAST
+                + (n_fine - 0.5) * FOAM_TEX_CONTRAST_FINE;
+            let foam_color = albedo * tex * foam_light;
+            color = mix(color, foam_color, coverage);
+        }
+    }
 
     // Thin-coverage fade: the splat fringe (sub-particle thickness) carries
     // bead-shaped normals that read as scalloped silhouettes and milky halos.

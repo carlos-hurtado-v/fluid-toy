@@ -31,6 +31,9 @@ pub struct App {
     renderer: Option<ParticleRenderer3D>,
     mc_renderer: Option<MarchingCubesRenderer>,
     ss_renderer: Option<ScreenSpaceFluidRenderer>,
+    /// Which water renderer's front depth the whitewater splat gate is bound
+    /// to; None forces a rebind (set after resize / renderer recreation)
+    spray_depth_bound: Option<FluidRenderMode>,
     wireframe_renderer: Option<WireframeRenderer>,
     container_renderer: Option<ContainerRenderer>,
     caustics_renderer: Option<CausticsRenderer>,
@@ -125,6 +128,7 @@ impl App {
             renderer: None,
             mc_renderer: None,
             ss_renderer: None,
+            spray_depth_bound: None,
             wireframe_renderer: None,
             container_renderer: None,
             caustics_renderer: None,
@@ -516,11 +520,13 @@ impl App {
             &self.state.lighting.to_gpu_params(),
             &crate::render::marching_cubes::GpuWaterParams::default(),
             &gpu_sh,
+            mc_renderer.foam_density_view(),
             gpu.config.width,
             gpu.config.height,
         );
 
-        // Wire the MC front depth into the foam splat pass (depth-aware foam)
+        // Wire the MC front depth into the foam splat pass (depth-aware foam);
+        // the per-frame sync rebinds to the SS depth when that mode is active
         {
             let mut spray_renderer = spray_renderer;
             spray_renderer.set_depth_view(
@@ -529,6 +535,7 @@ impl App {
                 mc_renderer.front_depth_view(),
             );
             self.spray_renderer = Some(spray_renderer);
+            self.spray_depth_bound = Some(FluidRenderMode::MarchingCubes);
         }
 
         self.gpu = Some(gpu);
@@ -629,6 +636,9 @@ impl App {
                         spray_system.spray_buffer(),
                         mc_renderer.front_depth_view(),
                     );
+                    // New spray buffer: let the per-frame sync rebind for the
+                    // active mode (SS uses its own front depth)
+                    self.spray_depth_bound = Some(FluidRenderMode::MarchingCubes);
                 }
                 self.spray_renderer = Some(spray_renderer);
                 self.spray_system = Some(spray_system);
@@ -716,21 +726,18 @@ impl ApplicationHandler for App {
                     if let Some(mc_renderer) = &mut self.mc_renderer {
                         mc_renderer.resize(&gpu.device, env_view, env_sampler, new_size.width, new_size.height);
                     }
-                    // MC resize recreated the front depth — rebind it in the
-                    // foam splat pass
-                    if let (Some(spray_renderer), Some(mc_renderer), Some(spray_system)) = (
-                        &mut self.spray_renderer,
-                        &self.mc_renderer,
-                        &self.spray_system,
-                    ) {
-                        spray_renderer.set_depth_view(
-                            &gpu.device,
-                            spray_system.spray_buffer(),
-                            mc_renderer.front_depth_view(),
+                    // Resize recreated the water front depths — force the
+                    // per-frame sync to rebind the foam splat gate for the
+                    // active mode
+                    self.spray_depth_bound = None;
+                    if let (Some(ss_renderer), Some(mc_renderer)) =
+                        (&mut self.ss_renderer, &self.mc_renderer)
+                    {
+                        ss_renderer.resize(
+                            &gpu.device, env_view, env_sampler,
+                            mc_renderer.foam_density_view(),
+                            new_size.width, new_size.height,
                         );
-                    }
-                    if let Some(ss_renderer) = &mut self.ss_renderer {
-                        ss_renderer.resize(&gpu.device, env_view, env_sampler, new_size.width, new_size.height);
                     }
                     self.rigid_body_depth_view = Some(create_depth_texture(
                         &gpu.device, new_size.width, new_size.height,
@@ -867,8 +874,13 @@ impl App {
         }
 
         // Rebuild SS renderer bind groups and update SH coefficients
-        if let Some(ss_renderer) = &mut self.ss_renderer {
-            ss_renderer.rebuild_env_bind_groups(&gpu.device, &env_view, &env_sampler);
+        if let (Some(ss_renderer), Some(mc_renderer)) =
+            (&mut self.ss_renderer, &self.mc_renderer)
+        {
+            ss_renderer.rebuild_env_bind_groups(
+                &gpu.device, &env_view, &env_sampler,
+                mc_renderer.foam_density_view(),
+            );
             let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
             ss_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
         }
@@ -1079,9 +1091,12 @@ impl App {
     }
 
     fn build_spray_render_params(&self) -> GpuSprayRenderParams {
-        // In MC mode foam renders as a screen-space density field; the sprite
-        // pass then draws only spray streaks and bubbles
-        let foam_as_field = self.state.rendering.render_mode == FluidRenderMode::MarchingCubes;
+        // In MC and SS modes foam renders as a screen-space density field;
+        // the sprite pass then draws only spray streaks and bubbles
+        let foam_as_field = matches!(
+            self.state.rendering.render_mode,
+            FluidRenderMode::MarchingCubes | FluidRenderMode::ScreenSpace
+        );
         GpuSprayRenderParams {
             particle_size: self.state.spray.particle_size,
             max_particles: self.state.spray.max_particles,
@@ -1372,8 +1387,53 @@ impl App {
                     }
                 }
                 FluidRenderMode::ScreenSpace => {
+                    // Whitewater splat depth gate follows the active water
+                    // renderer's front depth (1 frame stale, same as MC)
+                    if self.spray_depth_bound != Some(FluidRenderMode::ScreenSpace) {
+                        if let (Some(spray_renderer), Some(ss_renderer), Some(spray_system)) = (
+                            &mut self.spray_renderer,
+                            &self.ss_renderer,
+                            &self.spray_system,
+                        ) {
+                            spray_renderer.set_depth_view(
+                                &gpu.device,
+                                spray_system.spray_buffer(),
+                                ss_renderer.front_depth_view(),
+                            );
+                            self.spray_depth_bound = Some(FluidRenderMode::ScreenSpace);
+                        }
+                    }
+                    // Run the shared Yu & Turk anisotropy fit so the SS splats
+                    // can stretch into ellipsoids (records live in the MC
+                    // renderer; sorted-particle indexed)
+                    let aniso_on = self.state.rendering.mc_anisotropy && sph_sim.num_particles() > 0;
+                    let h_mc = self.state.sph.kernel_radius
+                        * self.state.rendering.mc_density_radius_scale;
+                    if aniso_on {
+                        if let Some(mc_renderer) = &mut self.mc_renderer {
+                            mc_renderer.update_aniso_params(
+                                &gpu.queue,
+                                true,
+                                self.state.rendering.mc_anisotropy_strength,
+                                self.state.sph.kernel_radius,
+                                h_mc,
+                            );
+                            mc_renderer.run_anisotropy(
+                                &mut encoder,
+                                &gpu.device,
+                                sph_sim.sorted_particle_buffer(),
+                                sph_sim.cell_starts_buffer(),
+                                sph_sim.cell_counts_buffer(),
+                                sph_sim.grid_params_buffer(),
+                                sph_sim.num_particles(),
+                            );
+                        }
+                    }
+
                     // Screen-space fluid rendering with narrow-range depth filter
-                    if let Some(ss_renderer) = &self.ss_renderer {
+                    if let (Some(ss_renderer), Some(mc_renderer)) =
+                        (&self.ss_renderer, &self.mc_renderer)
+                    {
                         let camera_params = self.camera.to_gpu_params();
                         ss_renderer.update_camera(&gpu.queue, &camera_params);
                         ss_renderer.update_light_params(&gpu.queue, &self.state.lighting.to_gpu_params());
@@ -1395,8 +1455,8 @@ impl App {
                             ripple_strength: self.state.rendering.ripple_strength,
                             clarity: self.state.rendering.water_clarity,
                             _pad1: self.state.rendering.ss_debug_view as f32,
-                            foam_coverage: 1.0,
-                            aeration_strength: 1.0,
+                            foam_coverage: self.state.spray.foam_coverage,
+                            aeration_strength: self.state.spray.aeration_strength,
                         };
                         ss_renderer.update_water_params(&gpu.queue, &water_params);
                         let env_params = self.state.environment.to_gpu_params();
@@ -1420,20 +1480,42 @@ impl App {
                             None
                         };
 
+                        // Splat whitewater into the shared half-res field
+                        // (owned by the MC renderer, composited by ss_composite;
+                        // cleared even when spray is off so no stale foam lingers)
+                        if let (Some(spray_renderer), Some(mc_renderer)) =
+                            (&self.spray_renderer, &self.mc_renderer)
+                        {
+                            spray_renderer.render_foam_density(
+                                &mut encoder,
+                                mc_renderer.foam_density_view(),
+                                self.state.spray.enabled,
+                            );
+                        }
+
                         let ss_radius = self.state.sph.kernel_radius * self.state.rendering.ss_radius_scale;
                         let particle_spacing = self.state.sph.kernel_radius * 0.6;
+                        // Ellipsoid records are normalized to h_mc; the SS
+                        // surface sits at ss_radius
+                        let aniso_surface_scale = ss_radius / h_mc.max(1e-6);
                         ss_renderer.render(
                             &gpu.device,
                             &gpu.queue,
                             &mut encoder,
                             render_target,
-                            sph_sim.particle_buffer(),
+                            sph_sim.sorted_particle_buffer(),
                             sph_sim.num_particles(),
                             &camera_params,
                             ss_radius,
                             particle_spacing,
+                            mc_renderer.aniso_buffer(),
+                            aniso_on,
+                            aniso_surface_scale,
                             self.state.rendering.ss_filter_size,
                             self.state.rendering.ss_filter_iterations,
+                            self.state.rendering.ss_nr_range,
+                            self.state.rendering.ss_nr_offset,
+                            self.state.rendering.ss_temporal,
                             self.camera.fov,
                             rb_for_ss,
                             spray_for_ss,
@@ -1443,6 +1525,22 @@ impl App {
                     }
                 }
                 FluidRenderMode::MarchingCubes => {
+                    // Rebind the whitewater splat depth gate to the MC front
+                    // depth after a mode switch or resize
+                    if self.spray_depth_bound != Some(FluidRenderMode::MarchingCubes) {
+                        if let (Some(spray_renderer), Some(mc_renderer), Some(spray_system)) = (
+                            &mut self.spray_renderer,
+                            &self.mc_renderer,
+                            &self.spray_system,
+                        ) {
+                            spray_renderer.set_depth_view(
+                                &gpu.device,
+                                spray_system.spray_buffer(),
+                                mc_renderer.front_depth_view(),
+                            );
+                            self.spray_depth_bound = Some(FluidRenderMode::MarchingCubes);
+                        }
+                    }
                     // Marching cubes surface mesh rendering
                     let caustics_on = self.caustics_active();
                     if let Some(mc_renderer) = &mut self.mc_renderer {
