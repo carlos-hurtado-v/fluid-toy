@@ -357,8 +357,12 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     ).on_hover_text("Random velocity added at spawn (m/s), spreads the launch cone");
                     ui.add_space(4.0);
                     ui.add(
-                        egui::Slider::new(&mut state.spray.particle_size, 0.001..=0.05)
+                        egui::Slider::new(&mut state.spray.particle_size, 0.001..=0.01)
+                            .logarithmic(true)
                             .text("Particle Size")
+                    ).on_hover_text(
+                        "Sprite size of spray streaks and bubbles, grain of the foam field; \
+                         total foam amount is size-invariant (Coverage/Aeration set that)",
                     );
                     ui.add_space(4.0);
                     ui.add(

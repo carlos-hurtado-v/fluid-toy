@@ -73,6 +73,9 @@ const BUBBLE_SPLAT_WEIGHT: f32 = 0.35;
 // Splat footprint relative to the sprite base size — wide enough that nearby
 // foam overlaps into patches; the gaussian falloff keeps isolated splats dim.
 const SPLAT_SCALE: f32 = 4.5;
+// Calibration anchor for the field pipeline: the weights below and the
+// composite thresholds in mc_render.wgsl were tuned at this particle_size.
+const REF_SIZE: f32 = 0.0015;
 // Peak density contribution of one fully-grown splat at its center. The
 // composite threshold (mc_render FOAM_DENSITY_LO) sits below a single grown
 // splat but above a newborn one, so accumulations and mature foam read while
@@ -176,7 +179,15 @@ fn vs_main(
     if (p.kind == KIND_BUBBLE) {
         base_weight = BUBBLE_SPLAT_WEIGHT;
     }
-    out.weight = base_weight * life_frac * mix(NEWBORN_WEIGHT, 1.0, grow);
+    // The footprint above scales with the size slider, so normalize deposited
+    // mass by its area: each diffuse particle carries a fixed foam quantum
+    // however wide it is smeared. Total coverage stays size-invariant —
+    // Coverage/Aeration own the amount, size is grain. Normalizes by the
+    // slider only, NOT the per-particle variance: heavy-tail outliers are
+    // meant to deposit more.
+    let size_norm = REF_SIZE / max(render_params.particle_size, 1e-5);
+    out.weight = base_weight * life_frac * mix(NEWBORN_WEIGHT, 1.0, grow)
+        * size_norm * size_norm;
     out.kind = p.kind;
 
     let stretch = 1.0 + clamp(screen_speed * STRETCH_PER_SPEED, 0.0, MAX_STRETCH);
