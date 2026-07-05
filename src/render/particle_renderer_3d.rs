@@ -51,7 +51,7 @@ impl ParticleRenderer3D {
             sun_enabled: 1,
             sun_color: [0.98, 0.82, 0.6],
             sun_intensity: 2.0,
-            _pad_unused: 0.0,
+            ambient_intensity: 1.0,
             _pad0: [0.0; 3],
             _padding: [0.0; 3],
             _pad1: 0.0,

@@ -21,6 +21,11 @@ struct ContainerGeometry {
     damping: f32,
     clip_enabled: u32,
     clip_margin: f32,
+    // Style (16 bytes): opaque pool walls exist and block the sun
+    is_pool: u32,
+    _pad_style0: f32,
+    _pad_style1: f32,
+    _pad_style2: f32,
 }
 
 // Transform a world-space position to container-local space.
@@ -78,4 +83,27 @@ fn is_inside_box(c: ContainerGeometry, local_pos: vec3<f32>, margin: f32) -> boo
     return local_pos.x >= -hw && local_pos.x <= hw &&
            local_pos.y >= -hh && local_pos.y <= hh &&
            local_pos.z >= -hd && local_pos.z <= hd;
+}
+
+// Analytic container self-shadowing. The pool walls all top out at local
+// y = 0 (the mesh caps them at 50% of container height), so an interior
+// point receives direct sun iff its ray to the sun exits through the open
+// top rectangle. Penumbra widens with ray length to the opening.
+// Returns 1.0 (fully lit) when the container has no opaque walls.
+fn rim_visibility(c: ContainerGeometry, local_pos: vec3<f32>, light_dir_local: vec3<f32>) -> f32 {
+    if (c.is_pool == 0u) {
+        return 1.0;
+    }
+    if (light_dir_local.y < 0.02) {
+        return 0.0; // sun at or below the rim plane: no direct sun inside
+    }
+    let t = -local_pos.y / light_dir_local.y;
+    if (t <= 0.0) {
+        return 1.0; // already above the rim
+    }
+    let exit = local_pos.xz + light_dir_local.xz * t;
+    // Signed distance to the opening boundary (positive = inside)
+    let d = min(c.half_width - abs(exit.x), c.half_depth - abs(exit.y));
+    let penumbra = 0.02 + 0.08 * t;
+    return smoothstep(-penumbra, penumbra, d);
 }

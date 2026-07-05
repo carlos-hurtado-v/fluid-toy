@@ -6,8 +6,8 @@
 #
 # Keep PREFIXED in sync with the format!("{}\n{}", container_common_wgsl, ...) call
 # sites: marching_cubes.rs, sph_3d_grid.rs, spray.rs, wireframe.rs, container_renderer.rs,
-# caustics.rs. RIGIDPREFIXED shaders get container_common + rigid_body_common
-# (sph_3d_grid.rs integrate/predict/solve).
+# caustics.rs, rigid_body_renderer.rs. RIGIDPREFIXED shaders get
+# container_common + rigid_body_common (sph_3d_grid.rs integrate/predict/solve).
 
 $ErrorActionPreference = "Stop"
 
@@ -23,8 +23,11 @@ $prefixed = @(
     "mc_caustics_splat.wgsl",
     "sph_density_3d_grid.wgsl",
     "spray_simulate.wgsl",
+    "spray_render.wgsl",
     "wireframe.wgsl",
-    "container.wgsl"
+    "container.wgsl",
+    "rigid_body.wgsl",
+    "rigid_body_mesh.wgsl"
 )
 
 $rigidPrefixed = @(

@@ -1,10 +1,28 @@
 //! Rigid body renderer — procedural shapes + custom GLB mesh support
 
+use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
 
 use crate::render::camera::GpuCameraParams;
 use crate::render::mesh_loader::{self, MeshVertex};
-use crate::state::{GpuRigidBodyRender, RigidBodyShape, MAX_RIGID_BODIES};
+use crate::state::{
+    GpuContainerGeometry, GpuRigidBodyRender, GpuShCoefficients, RigidBodyShape,
+    MAX_RIGID_BODIES,
+};
+
+/// Scene lighting shared by all bodies — mirrors RbLightParams in
+/// rigid_body.wgsl / rigid_body_mesh.wgsl.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuRbLightParams {
+    /// Direction toward the sun (world space, normalized)
+    pub sun_dir: [f32; 3],
+    /// SH ambient scale (environment intensity)
+    pub ibl_strength: f32,
+    /// Sun color x intensity, zeroed when the sun is disabled
+    pub sun_rgb: [f32; 3],
+    pub _pad0: f32,
+}
 
 /// Per-body draw info, parallel to the uploaded render params array
 #[derive(Debug, Clone, Copy)]
@@ -30,10 +48,14 @@ pub struct RigidBodyRenderer {
     depth_only_pipeline: wgpu::RenderPipeline,
     mesh_depth_only_pipeline: Option<wgpu::RenderPipeline>,
 
-    // Shared bind group (group 0): camera + bodies array — used by both pipelines
+    // Shared bind group (group 0): camera + bodies + scene lighting — used by
+    // both pipeline families
     bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     bodies_buffer: wgpu::Buffer,
+    light_buffer: wgpu::Buffer,
+    sh_buffer: wgpu::Buffer,
+    container_geom_buffer: wgpu::Buffer,
 
     // Draw list for the current frame (index i draws instance i)
     draws: Vec<RigidBodyDraw>,
@@ -68,19 +90,40 @@ impl RigidBodyRenderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RigidBody Light Buffer"),
+            contents: bytemuck::bytes_of(&GpuRbLightParams::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let sh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RigidBody SH Buffer"),
+            contents: bytemuck::bytes_of(&GpuShCoefficients::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Zeroed geometry => is_pool = 0 => rim_visibility returns fully lit
+        let container_geom_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RigidBody Container Geometry"),
+            contents: bytemuck::bytes_of(&GpuContainerGeometry::zeroed()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let uniform_entry = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("RigidBody Group0 Layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                uniform_entry(0, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
@@ -91,6 +134,9 @@ impl RigidBodyRenderer {
                     },
                     count: None,
                 },
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(4, wgpu::ShaderStages::FRAGMENT),
             ],
         });
 
@@ -105,6 +151,18 @@ impl RigidBodyRenderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: bodies_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: light_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: sh_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: container_geom_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -135,9 +193,13 @@ impl RigidBodyRenderer {
         };
 
         // === Procedural pipeline ===
+        // container_common.wgsl supplies ContainerGeometry + rim_visibility
+        let container_common = include_str!("../shaders/container_common.wgsl");
         let procedural_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Rigid Body Procedural Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/rigid_body.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", container_common, include_str!("../shaders/rigid_body.wgsl")).into(),
+            ),
         });
 
         let procedural_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -255,6 +317,9 @@ impl RigidBodyRenderer {
             bind_group,
             camera_buffer,
             bodies_buffer,
+            light_buffer,
+            sh_buffer,
+            container_geom_buffer,
             draws: Vec::new(),
             mesh_pipeline,
             mesh_msaa_pipeline,
@@ -382,10 +447,17 @@ impl RigidBodyRenderer {
             ],
         });
 
-        // Mesh shader
+        // Mesh shader (container_common.wgsl supplies rim_visibility)
         let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Rigid Body Mesh Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/rigid_body_mesh.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}",
+                    include_str!("../shaders/container_common.wgsl"),
+                    include_str!("../shaders/rigid_body_mesh.wgsl")
+                )
+                .into(),
+            ),
         });
 
         // Mesh pipeline layout: group 0 (camera+body) + group 1 (texture)
@@ -534,8 +606,26 @@ impl RigidBodyRenderer {
         )
     }
 
+    /// Render-side body array (position/rotation/shape/half_extent) — bound by
+    /// the caustics splat pass for photon occlusion.
+    pub fn bodies_buffer(&self) -> &wgpu::Buffer {
+        &self.bodies_buffer
+    }
+
     pub fn update_camera(&self, queue: &wgpu::Queue, params: &GpuCameraParams) {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn update_light(&self, queue: &wgpu::Queue, params: &GpuRbLightParams) {
+        queue.write_buffer(&self.light_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn update_sh_coefficients(&self, queue: &wgpu::Queue, coeffs: &GpuShCoefficients) {
+        queue.write_buffer(&self.sh_buffer, 0, bytemuck::bytes_of(coeffs));
+    }
+
+    pub fn update_container_geometry(&self, queue: &wgpu::Queue, geom: &GpuContainerGeometry) {
+        queue.write_buffer(&self.container_geom_buffer, 0, bytemuck::bytes_of(geom));
     }
 
     /// Upload this frame's body render params + draw list. `bodies[i]` is

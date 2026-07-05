@@ -67,7 +67,7 @@ pub struct SprayConfig {
 impl Default for SprayConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             min_speed: 0.8,
             emission_rate: 30.0,
             lifetime: 2.8,

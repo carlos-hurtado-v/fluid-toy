@@ -128,24 +128,7 @@ const SUN_DIFFUSE_SCALE: f32 = 0.39;
 const SUN_SPECULAR_SCALE: f32 = 0.6;
 const SUN_EXTERIOR_SCALE: f32 = 0.3;
 
-// Analytic container self-shadowing. The pool walls all top out at local
-// y = 0 (the mesh caps them at 50% of container height), so an interior
-// point receives direct sun iff its ray to the sun exits through the open
-// top rectangle. Penumbra widens with ray length to the opening.
-fn rim_visibility(local_pos: vec3<f32>, light_dir_local: vec3<f32>) -> f32 {
-    if light_dir_local.y < 0.02 {
-        return 0.0; // sun at or below the rim plane: no direct sun inside
-    }
-    let t = -local_pos.y / light_dir_local.y;
-    if t <= 0.0 {
-        return 1.0; // already above the rim
-    }
-    let exit = local_pos.xz + light_dir_local.xz * t;
-    // Signed distance to the opening boundary (positive = inside)
-    let d = min(container.half_width - abs(exit.x), container.half_depth - abs(exit.y));
-    let penumbra = 0.02 + 0.08 * t;
-    return smoothstep(-penumbra, penumbra, d);
-}
+// Rim self-shadowing comes from container_common.wgsl (rim_visibility).
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
@@ -195,35 +178,79 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // --- Container self-shadowing (analytic, walls block the sun) ---
     let local = world_to_local(container, input.world_position);
     let L_local = world_dir_to_local(container, L);
-    let rim_vis = rim_visibility(local, L_local);
+    let rim_vis = rim_visibility(container, local, L_local);
 
-    // --- Caustics + water shadow (floor face only) ---
-    // The caustic map's shadow channel removes direct sun where water covers
-    // the floor; the RGB channels re-deposit it as refracted irradiance.
-    // Both are in units of "fraction of full direct sun", so flat water leaves
-    // the overall floor brightness nearly unchanged (energy conservation).
-    // The light raster sees the container as an occluder, so rim-shadowed
-    // water emits neither photons nor shadow splats - no double counting.
+    // --- Caustics + water shadow (floor + walls) ---
+    // The caustic atlas holds one tile per interior face (floor tile, then
+    // four half-height wall tiles). The shadow channel removes direct sun
+    // where water shades the face; the RGB channels re-deposit it as
+    // refracted irradiance. Both are in units of "fraction of full direct
+    // sun", so flat water leaves floor brightness nearly unchanged (energy
+    // conservation). The light raster sees the container as an occluder, so
+    // rim-shadowed water emits neither photons nor shadow splats.
     var sun_direct = NdotL * rim_vis;
     var caustic = vec3<f32>(0.0);
     if pool.caustic_strength > 0.0 {
         let n_local = world_dir_to_local(container, N);
+        // Face pick: floor by up-normal, else dominant horizontal axis.
+        // Inner wall normals point INTO the pool: the +X wall (x = +hw) has
+        // n_local.x < 0. Face ids match the splat pass (0 floor, 1 +X, 2 -X,
+        // 3 +Z, 4 -Z).
+        var face = -1;
+        var uv = vec2<f32>(0.0);
         if n_local.y > 0.9 {
-            let uv = vec2<f32>(
+            face = 0;
+            uv = vec2<f32>(
                 local.x / container.half_width,
                 local.z / container.half_depth,
             ) * 0.5 + 0.5;
+        } else if abs(n_local.y) < 0.5 && local.y <= 0.001 {
+            let vv = -local.y / container.half_height; // 0 at rim, 1 at floor
+            if abs(n_local.x) > abs(n_local.z) {
+                face = select(2, 1, n_local.x < 0.0);
+                uv = vec2<f32>(local.z / container.half_depth * 0.5 + 0.5, vv);
+            } else {
+                face = select(4, 3, n_local.z < 0.0);
+                uv = vec2<f32>(local.x / container.half_width * 0.5 + 0.5, vv);
+            }
+        }
+        if face >= 0 {
+            // Face uv -> atlas uv (vertical strip: floor tile res tall, wall
+            // tiles res/2), with a half-texel row inset so bilinear taps
+            // never blend across neighboring faces
+            let dims = vec2<f32>(textureDimensions(caustic_map));
+            let res = dims.y / 3.0;
+            var row_start = 0.0;
+            var row_h = res;
+            if face > 0 {
+                row_start = res + f32(face - 1) * res * 0.5;
+                row_h = res * 0.5;
+            }
+            let av_px = clamp(
+                row_start + uv.y * row_h,
+                row_start + 0.5,
+                row_start + row_h - 0.5,
+            );
+            let atlas_uv = vec2<f32>(uv.x, av_px / dims.y);
             // SampleLevel: inside non-uniform control flow, no derivatives
-            let c = textureSampleLevel(caustic_map, caustic_sampler, uv, 0.0);
+            let c = textureSampleLevel(caustic_map, caustic_sampler, atlas_uv, 0.0);
             sun_direct = max(sun_direct - c.a * pool.shadow_strength, 0.0);
-            // Focus: contrast exponent around the flat-water irradiance level,
-            // which is ~NdotL (not 1.0) under a slanted sun. Filaments amplify,
-            // dark lanes deepen, and the mean stays anchored at the local
-            // direct-sun level, so it punches through tile camouflage without
-            // blowout at any sun elevation.
-            let anchor = max(NdotL, 0.05);
-            let focused = pow(max(c.rgb, vec3<f32>(0.0)) / anchor, vec3<f32>(pool.caustic_focus)) * anchor;
-            caustic = focused * pool.caustic_strength;
+            if face == 0 {
+                // Focus: contrast exponent around the flat-water irradiance
+                // level, which is ~NdotL (not 1.0) under a slanted sun.
+                // Filaments amplify, dark lanes deepen, and the mean stays
+                // anchored at the local direct-sun level, so it punches
+                // through tile camouflage without blowout at any elevation.
+                let anchor = max(NdotL, 0.05);
+                let focused = pow(max(c.rgb, vec3<f32>(0.0)) / anchor, vec3<f32>(pool.caustic_focus)) * anchor;
+                caustic = focused * pool.caustic_strength;
+            } else {
+                // Walls take the map linearly: refracted bands only arrive
+                // where waves aim them, so they are naturally high-contrast,
+                // and the flat-water anchor (~NdotL) is meaningless on a
+                // vertical face (pow around a near-zero anchor blows up).
+                caustic = max(c.rgb, vec3<f32>(0.0)) * pool.caustic_strength;
+            }
         }
     }
 

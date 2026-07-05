@@ -49,7 +49,8 @@ struct LightParams {
     sun_enabled: u32,
     sun_color: vec3<f32>,
     sun_intensity: f32,
-    _pad2: f32,
+    // SH ambient scale (environment intensity)
+    ambient_intensity: f32,
     _padding: vec3<f32>,
 }
 
@@ -57,6 +58,24 @@ struct LightParams {
 @group(0) @binding(1) var<storage, read> spray_particles: array<SprayParticle>;
 @group(0) @binding(2) var<uniform> render_params: RenderParams;
 @group(0) @binding(3) var<uniform> light: LightParams;
+@group(0) @binding(6) var<uniform> sh_coeffs: array<vec4<f32>, 9>;
+@group(0) @binding(7) var<uniform> container: ContainerGeometry;
+
+const INV_PI: f32 = 0.31830988;
+
+// Evaluate order-2 spherical harmonics irradiance
+fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
+    var irradiance = sh_coeffs[0].rgb * 0.282095;
+    irradiance += sh_coeffs[1].rgb * 0.488603 * n.y;
+    irradiance += sh_coeffs[2].rgb * 0.488603 * n.z;
+    irradiance += sh_coeffs[3].rgb * 0.488603 * n.x;
+    irradiance += sh_coeffs[4].rgb * 1.092548 * n.x * n.y;
+    irradiance += sh_coeffs[5].rgb * 1.092548 * n.y * n.z;
+    irradiance += sh_coeffs[6].rgb * 0.315392 * (3.0 * n.z * n.z - 1.0);
+    irradiance += sh_coeffs[7].rgb * 1.092548 * n.x * n.z;
+    irradiance += sh_coeffs[8].rgb * 0.546274 * (n.x * n.x - n.y * n.y);
+    return max(irradiance, vec3<f32>(0.0));
+}
 
 const KIND_SPRAY: u32 = 0u;
 const KIND_FOAM: u32 = 1u;
@@ -82,6 +101,11 @@ struct VertexOutput {
     @location(2) stretch_ratio: f32,  // how elongated this particle is (for fragment shaping)
     @location(3) @interpolate(flat) kind: u32,
     @location(4) @interpolate(flat) sun_view: vec4<f32>,  // xyz: view-space sun dir, w: enabled
+    // Scene light at this particle: SH ambient (sky-weighted, /pi) and
+    // rim-shadowed sun color x intensity (/pi) — billboards follow the same
+    // lighting as every other receiver instead of glowing fixed white
+    @location(5) @interpolate(flat) ambient_rgb: vec3<f32>,
+    @location(6) @interpolate(flat) sun_rgb: vec3<f32>,
 };
 
 fn hash(seed: u32) -> u32 {
@@ -116,6 +140,8 @@ fn discard_vertex() -> VertexOutput {
     out.stretch_ratio = 1.0;
     out.kind = 0u;
     out.sun_view = vec4<f32>(0.0);
+    out.ambient_rgb = vec3<f32>(0.0);
+    out.sun_rgb = vec3<f32>(0.0);
     return out;
 }
 
@@ -156,6 +182,17 @@ fn vs_main(
     // View-space sun direction for fake-sphere foam shading
     let sun_vs = (camera.view * vec4<f32>(light.sun_direction, 0.0)).xyz;
     out.sun_view = vec4<f32>(normalize(sun_vs), f32(light.sun_enabled));
+
+    // Per-particle scene light: sky-weighted SH ambient + rim-shadowed sun.
+    // Both /pi (irradiance -> reflected radiance for a white scatterer).
+    out.ambient_rgb = evaluate_sh_irradiance(vec3<f32>(0.0, 1.0, 0.0))
+        * light.ambient_intensity * INV_PI;
+    let rim = rim_visibility(
+        container,
+        world_to_local(container, world_pos),
+        world_dir_to_local(container, light.sun_direction),
+    );
+    out.sun_rgb = light.sun_color * light.sun_intensity * f32(light.sun_enabled) * INV_PI * rim;
 
     // Camera basis vectors
     let cam_right = vec3<f32>(camera.view[0][0], camera.view[1][0], camera.view[2][0]);
@@ -231,16 +268,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var alpha: f32;
 
     if (in.kind == KIND_FOAM) {
-        // Dense white cap with fake-sphere sun shading
+        // Dense white cap with fake-sphere sun shading; multiple scattering
+        // keeps foam brighter than a Lambert surface (1.4 gain on the sun)
         let n = vec3<f32>(uv.x, uv.y, sqrt(max(1.0 - dist * dist, 0.0)));
         let ndotl = max(dot(n, in.sun_view.xyz), 0.0);
-        let shade = 0.45 + 0.7 * ndotl * in.sun_view.w;
-        color = vec3<f32>(0.97, 0.99, 1.0) * shade;
+        let light_rgb = in.ambient_rgb + in.sun_rgb * (ndotl * 1.4);
+        color = vec3<f32>(0.97, 0.99, 1.0) * light_rgb;
         alpha = in.alpha * smoothstep(1.0, 0.6, dist) * 0.9;
     } else if (in.kind == KIND_BUBBLE) {
-        // Dim ring: brighter toward the rim, soft outer cutoff
+        // Dim ring: brighter toward the rim, soft outer cutoff. Submerged, so
+        // mostly ambient with a touch of transmitted sun.
         let ring = 0.25 + 0.75 * smoothstep(0.35, 0.85, dist);
-        color = vec3<f32>(0.85, 0.94, 1.0);
+        color = vec3<f32>(0.85, 0.94, 1.0) * (in.ambient_rgb + in.sun_rgb * 0.5) * 2.0;
         alpha = in.alpha * ring * smoothstep(1.0, 0.85, dist) * 0.45;
     } else {
         // Spray: very soft gaussian falloff — wide and diffuse for a misty look
@@ -248,7 +287,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Subtle per-fragment color variation: warmer at center, cooler at edges
         let warm = vec3<f32>(1.0, 0.98, 0.95);   // slight warm white
         let cool = vec3<f32>(0.88, 0.93, 1.0);    // blue-white
-        color = mix(warm, cool, dist);
+        // Airborne droplets forward-scatter the sun (0.75 average phase)
+        color = mix(warm, cool, dist) * (in.ambient_rgb + in.sun_rgb * 0.75) * 1.6;
         alpha = in.alpha * falloff * 0.35;
     }
 

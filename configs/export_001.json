@@ -7,26 +7,26 @@
     "max_particles": 200000,
     "initial_cube_size": 58,
     "substeps": 6,
-    "pcisph_iterations": 4
+    "pcisph_iterations": 5
   },
   "container": {
-    "width": 2.22,
-    "depth": 1.8,
+    "width": 2.55,
+    "depth": 2.25,
     "floor_y": -0.9,
-    "height": 1.8,
+    "height": 1.45,
     "tilt_x": 0.0,
     "tilt_z": 0.0,
     "tilt_x_target": 0.0,
     "tilt_z_target": 0.0,
     "style": "Wireframe",
     "tile_color": [
-      0.15,
-      0.35,
-      0.55
+      0.12154964,
+      0.48275533,
+      0.84396136
     ],
     "grout_color": [
       0.08,
-      0.1,
+      0.09999998,
       0.14
     ],
     "tile_scale": 20.0,
@@ -41,7 +41,8 @@
     "mass": 1.0,
     "surface_tension": 0.005,
     "wall_stiffness": 200.0,
-    "xsph_epsilon": 0.305
+    "xsph_epsilon": 0.305,
+    "boundary_density": 1.0
   },
   "rendering": {
     "particle_radius": 0.02,
@@ -52,7 +53,7 @@
     ],
     "color_by_velocity": true,
     "render_mode": "MarchingCubes",
-    "mc_threshold": 0.9,
+    "mc_threshold": 0.95,
     "mc_density_radius_scale": 1.0,
     "mc_anisotropy": true,
     "mc_anisotropy_strength": 1.0,
@@ -65,16 +66,19 @@
     "mc_blur_radius": 1,
     "water_roughness": 0.1,
     "ripple_strength": 0.011,
-    "water_clarity": 0.25,
+    "water_clarity": 0.65,
     "ssr_enabled": true,
     "mc_grid_resolution": "High",
     "ss_radius_scale": 0.6,
     "ss_filter_size": 12,
     "ss_filter_iterations": 3,
-    "ss_debug_view": 0
+    "ss_debug_view": 0,
+    "ss_nr_range": 3.0,
+    "ss_nr_offset": 3.0,
+    "ss_temporal": true
   },
   "environment": {
-    "background_mode": "SolidColor",
+    "background_mode": "Environment",
     "background_color": [
       0.132,
       0.153,
@@ -87,15 +91,27 @@
     "sun_enabled": true,
     "sun_direction": [
       0.6,
-      0.5,
-      0.3
+      1.0,
+      -0.7
     ],
     "sun_color": [
-      0.98,
-      0.82,
-      0.6
+      1.0,
+      0.8465646,
+      0.6355909
     ],
     "sun_intensity": 2.0
+  },
+  "caustics": {
+    "enabled": true,
+    "intensity": 1.15,
+    "shadow_strength": 1.0,
+    "focus": 2.3,
+    "dispersion": 0.15,
+    "splat_size": 1.17,
+    "blur_sigma": 1.35,
+    "temporal_smoothing": 0.6,
+    "ripple_strength": 0.145,
+    "light_resolution": 768
   },
   "quality": {
     "msaa": "X4",
@@ -121,7 +137,7 @@
     "streaks_intensity": 0.15,
     "streaks_threshold": 0.75,
     "streaks_tint": [
-      0.099999994,
+      0.1,
       0.17,
       0.25
     ],
@@ -131,9 +147,9 @@
     "ao_debug_mode": "Off"
   },
   "camera": {
-    "distance": 3.0,
-    "yaw": 15.60988,
-    "pitch": 1.400796,
+    "distance": 4.0,
+    "yaw": 30.170431,
+    "pitch": 0.8507973,
     "target": [
       0.0,
       -0.3,
@@ -141,57 +157,67 @@
     ],
     "fov": 0.7853982
   },
-  "rigid_body": {
-    "enabled": true,
-    "held": false,
-    "shape": "Sphere",
-    "position": [
-      0.14985573,
-      -0.31655404,
-      0.4271199
-    ],
-    "velocity": [
-      -0.021309596,
-      -0.0077909366,
-      -0.00083879975
-    ],
-    "orientation": [
-      0.0,
-      0.0,
-      0.0,
-      1.0
-    ],
-    "angular_velocity": [
-      0.0,
-      0.0,
-      0.0
-    ],
-    "half_extent": 0.24,
-    "density": 10000.0,
-    "color": [
-      0.9,
-      0.7000001,
-      0.19999999
-    ]
-  },
+  "rigid_bodies": [
+    {
+      "enabled": true,
+      "motion": "Kinematic",
+      "shape": "Propeller",
+      "position": [
+        0.0,
+        -0.75,
+        0.0
+      ],
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "orientation": [
+        0.0,
+        0.47339755,
+        0.0,
+        -0.8808489
+      ],
+      "angular_velocity": [
+        0.0,
+        4.1887903,
+        0.0
+      ],
+      "euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "spin_rpm": 40.0,
+      "prop_blades": 5,
+      "prop_pitch_deg": 0.0,
+      "half_extent": 0.42,
+      "relative_density": 0.5,
+      "color": [
+        0.9,
+        0.7000001,
+        0.19999999
+      ]
+    }
+  ],
   "spray": {
-    "enabled": true,
-    "min_speed": 0.8,
+    "enabled": false,
+    "min_speed": 0.7,
     "emission_rate": 30.0,
-    "lifetime": 2.5,
-    "lifetime_variation": 0.5,
-    "drag": 3.3,
-    "speed_multiplier": 0.85,
-    "velocity_jitter": 0.9,
-    "particle_size": 0.0015,
+    "lifetime": 2.0,
+    "lifetime_variation": 0.55,
+    "drag": 2.9,
+    "speed_multiplier": 1.12,
+    "velocity_jitter": 0.95,
+    "particle_size": 0.001,
     "max_particles": 100000,
-    "k_trapped_air": 1.3,
-    "k_wave_crest": 1.1,
-    "bubble_buoyancy": 2.5,
-    "bubble_drag": 0.7,
+    "k_trapped_air": 2.0,
+    "k_wave_crest": 2.0,
+    "bubble_buoyancy": 3.5,
+    "bubble_drag": 0.6,
     "bubbles_visible": true,
-    "foam_coverage": 0.45,
-    "aeration_strength": 1.25
+    "foam_coverage": 0.95,
+    "aeration_strength": 1.6
   },
   "mouse_force": {
     "mode": "Vortex",

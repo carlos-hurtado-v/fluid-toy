@@ -355,10 +355,20 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     }
 
     // === DIRECTIONAL LIGHT (SUN) ===
+    // Analytic rim shadow: pool walls block direct sun on the water surface,
+    // matching the floor's rim shadowing and the caustics light raster (which
+    // draws the container as an occluder). 1.0 outside pool mode.
+    let sun_dir_ws = normalize(light.sun_direction);
+    let rim_vis = rim_visibility(
+        container,
+        world_to_local(container, input.world_position),
+        world_dir_to_local(container, sun_dir_ws),
+    );
+
     var sun_specular = vec3<f32>(0.0);
     var sun_subsurface = vec3<f32>(0.0);
     if (light.sun_enabled == 1u) {
-        let light_dir = normalize(light.sun_direction);
+        let light_dir = sun_dir_ws;
         let NdotL = max(0.0, dot(normal, light_dir));
         let NdotV = max(dot(normal, view_dir), 0.001);
 
@@ -376,7 +386,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         let denom = 4.0 * NdotV * max(NdotL, 0.001);
         let specular_brdf = (D * G * F_spec) / max(denom, 0.001);
 
-        sun_specular = light.sun_color * light.sun_intensity * specular_brdf * NdotL;
+        sun_specular = light.sun_color * light.sun_intensity * specular_brdf * NdotL * rim_vis;
 
         // Subsurface illumination — light enters water, scatters, exits toward viewer
         let light_entering = NdotL * (1.0 - F_spec);
@@ -387,6 +397,9 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         let VdotL = max(0.0, dot(-view_dir, light_dir));
         let forward_scatter = pow(VdotL, 4.0) * exp(-thickness * optical_density * 1.5);
         sun_subsurface += water.water_color * forward_scatter * light.sun_color * light.sun_intensity * 0.10;
+
+        // Both subsurface paths are fed by direct sun at this surface point
+        sun_subsurface *= rim_vis;
     }
 
     // IBL diffuse irradiance from spherical harmonics
@@ -410,7 +423,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         var aeration_light = evaluate_sh_irradiance(normal) * water.env_intensity;
         if (light.sun_enabled == 1u) {
             aeration_light += light.sun_color * light.sun_intensity
-                * max(dot(normal, normalize(light.sun_direction)), 0.0) * 0.6;
+                * max(dot(normal, sun_dir_ws), 0.0) * 0.6 * rim_vis;
         }
         lit_interior = mix(lit_interior, AERATION_ALBEDO * aeration_light, aeration);
     }
@@ -441,7 +454,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
             var foam_light = evaluate_sh_irradiance(normal) * water.env_intensity;
             if (light.sun_enabled == 1u) {
                 foam_light += light.sun_color * light.sun_intensity
-                    * max(dot(normal, normalize(light.sun_direction)), 0.0);
+                    * max(dot(normal, sun_dir_ws), 0.0) * rim_vis;
             }
             // Thin veil -> dry white crest, plus saturation-proof brightness
             // texture so thick carpets keep internal structure

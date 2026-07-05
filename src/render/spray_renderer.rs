@@ -4,7 +4,7 @@ use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
 
 use crate::render::camera::GpuCameraParams;
-use crate::state::{GpuLightParams, GpuSprayRenderParams};
+use crate::state::{GpuContainerGeometry, GpuLightParams, GpuShCoefficients, GpuSprayRenderParams};
 
 pub struct SprayRenderer {
     pipeline: wgpu::RenderPipeline,
@@ -16,6 +16,8 @@ pub struct SprayRenderer {
     camera_buffer: wgpu::Buffer,
     render_params_buffer: wgpu::Buffer,
     light_buffer: wgpu::Buffer,
+    sh_buffer: wgpu::Buffer,
+    container_geom_buffer: wgpu::Buffer,
     // Water front depth for depth-aware foam splatting. Constructed with a
     // 1x1 fallback (zero depth = everything attenuated); the app rebinds the
     // MC front depth via set_depth_view() once both renderers exist and again
@@ -24,6 +26,7 @@ pub struct SprayRenderer {
     max_particles: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -31,6 +34,8 @@ fn build_bind_group(
     spray_buffer: &wgpu::Buffer,
     render_params_buffer: &wgpu::Buffer,
     light_buffer: &wgpu::Buffer,
+    sh_buffer: &wgpu::Buffer,
+    container_geom_buffer: &wgpu::Buffer,
     depth_view: &wgpu::TextureView,
     depth_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
@@ -62,6 +67,14 @@ fn build_bind_group(
                 binding: 5,
                 resource: wgpu::BindingResource::Sampler(depth_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: sh_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: container_geom_buffer.as_entire_binding(),
+            },
         ],
     })
 }
@@ -80,9 +93,17 @@ impl SprayRenderer {
         render_params: &GpuSprayRenderParams,
         msaa_sample_count: u32,
     ) -> Self {
+        // container_common.wgsl supplies ContainerGeometry + rim_visibility
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Spray Render Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/spray_render.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}",
+                    include_str!("../shaders/container_common.wgsl"),
+                    include_str!("../shaders/spray_render.wgsl")
+                )
+                .into(),
+            ),
         });
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -101,6 +122,20 @@ impl SprayRenderer {
         let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Spray Light Buffer"),
             contents: bytemuck::bytes_of(&GpuLightParams::zeroed()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // SH ambient so billboards share the scene's diffuse light
+        let sh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Spray SH Buffer"),
+            contents: bytemuck::bytes_of(&GpuShCoefficients::zeroed()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Zeroed geometry => is_pool = 0 => rim_visibility returns fully lit
+        let container_geom_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Spray Container Geometry"),
+            contents: bytemuck::bytes_of(&GpuContainerGeometry::zeroed()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -141,7 +176,7 @@ impl SprayRenderer {
                     },
                     count: None,
                 },
-                // Light params (sun direction for foam shading)
+                // Light params (sun direction + color for billboard shading)
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::VERTEX,
@@ -167,6 +202,28 @@ impl SprayRenderer {
                     binding: 5,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                // SH irradiance (per-particle ambient, vertex stage)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Container geometry (per-particle rim shadow, vertex stage)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
             ],
@@ -203,6 +260,8 @@ impl SprayRenderer {
             spray_buffer,
             &render_params_buffer,
             &light_buffer,
+            &sh_buffer,
+            &container_geom_buffer,
             &fallback_depth_view,
             &depth_sampler,
         );
@@ -383,6 +442,8 @@ impl SprayRenderer {
             camera_buffer,
             render_params_buffer,
             light_buffer,
+            sh_buffer,
+            container_geom_buffer,
             depth_sampler,
             max_particles: render_params.max_particles,
         }
@@ -404,6 +465,8 @@ impl SprayRenderer {
             spray_buffer,
             &self.render_params_buffer,
             &self.light_buffer,
+            &self.sh_buffer,
+            &self.container_geom_buffer,
             depth_view,
             &self.depth_sampler,
         );
@@ -419,6 +482,14 @@ impl SprayRenderer {
 
     pub fn update_light(&self, queue: &wgpu::Queue, params: &GpuLightParams) {
         queue.write_buffer(&self.light_buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    pub fn update_sh_coefficients(&self, queue: &wgpu::Queue, coeffs: &GpuShCoefficients) {
+        queue.write_buffer(&self.sh_buffer, 0, bytemuck::bytes_of(coeffs));
+    }
+
+    pub fn update_container_geometry(&self, queue: &wgpu::Queue, geom: &GpuContainerGeometry) {
+        queue.write_buffer(&self.container_geom_buffer, 0, bytemuck::bytes_of(geom));
     }
 
     /// Render spray (single-sampled pass, e.g. MC background pass)

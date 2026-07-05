@@ -179,6 +179,8 @@ impl ContainerConfig {
             damping,
             clip_enabled: if clip_enabled { 1 } else { 0 },
             clip_margin,
+            is_pool: if self.style == ContainerStyle::OpaquePool { 1 } else { 0 },
+            _pad_style: [0.0; 3],
         }
     }
 
@@ -365,7 +367,7 @@ pub struct GpuSphParams3D {
     pub boundary_density: f32,
 }
 
-/// Unified container geometry for GPU (128 bytes).
+/// Unified container geometry for GPU (144 bytes).
 /// One buffer, one write, every shader that touches the container reads this.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -388,6 +390,9 @@ pub struct GpuContainerGeometry {
     pub damping: f32,
     pub clip_enabled: u32,
     pub clip_margin: f32,
+    // Style (16 bytes): opaque pool walls exist and block the sun (rim shadow)
+    pub is_pool: u32,
+    pub _pad_style: [f32; 3],
 }
 
 /// GPU-compatible gravity parameters

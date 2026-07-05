@@ -1,5 +1,6 @@
 // Mesh rigid body rendering shader — vertex buffer + textured
 // Used for custom GLB models alongside the procedural shape shader
+// Concatenated with container_common.wgsl (rim_visibility for sun shadowing).
 
 struct CameraParams {
     view: mat4x4<f32>,
@@ -18,6 +19,7 @@ struct RigidBodyParams {
     position: vec3<f32>,
     half_extent: f32,
     color: vec4<f32>,
+    // Unused since scene lighting moved to RbLightParams; kept for layout
     light_dir: vec3<f32>,
     shape: u32,
     rot_row0: vec4<f32>,
@@ -29,11 +31,63 @@ struct RigidBodyParams {
     _pad1: f32,
 }
 
+// Scene lighting shared by all bodies — mirrors GpuRbLightParams (Rust)
+struct RbLightParams {
+    // Direction toward the sun (world space, normalized)
+    sun_dir: vec3<f32>,
+    // SH ambient scale (environment intensity)
+    ibl_strength: f32,
+    // Sun color x intensity, zeroed when the sun is disabled
+    sun_rgb: vec3<f32>,
+    _pad0: f32,
+}
+
 @group(0) @binding(0) var<uniform> camera: CameraParams;
 @group(0) @binding(1) var<storage, read> bodies: array<RigidBodyParams>;
+@group(0) @binding(2) var<uniform> rb_light: RbLightParams;
+@group(0) @binding(3) var<uniform> sh_coeffs: array<vec4<f32>, 9>;
+@group(0) @binding(4) var<uniform> container: ContainerGeometry;
 
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
+
+const INV_PI: f32 = 0.31830988;
+const BODY_SPEC_STRENGTH: f32 = 0.5;
+
+// Evaluate order-2 spherical harmonics irradiance
+fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
+    var irradiance = sh_coeffs[0].rgb * 0.282095;
+    irradiance += sh_coeffs[1].rgb * 0.488603 * n.y;
+    irradiance += sh_coeffs[2].rgb * 0.488603 * n.z;
+    irradiance += sh_coeffs[3].rgb * 0.488603 * n.x;
+    irradiance += sh_coeffs[4].rgb * 1.092548 * n.x * n.y;
+    irradiance += sh_coeffs[5].rgb * 1.092548 * n.y * n.z;
+    irradiance += sh_coeffs[6].rgb * 0.315392 * (3.0 * n.z * n.z - 1.0);
+    irradiance += sh_coeffs[7].rgb * 1.092548 * n.x * n.z;
+    irradiance += sh_coeffs[8].rgb * 0.546274 * (n.x * n.x - n.y * n.y);
+    return max(irradiance, vec3<f32>(0.0));
+}
+
+// Scene-coherent body shading — identical to rigid_body.wgsl's shade_body
+fn shade_body(albedo: vec3<f32>, n: vec3<f32>, v: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+    let l = normalize(rb_light.sun_dir);
+    let ndotl = max(dot(n, l), 0.0);
+
+    let local = world_to_local(container, world_pos);
+    let l_local = world_dir_to_local(container, l);
+    let rim = rim_visibility(container, local, l_local);
+
+    let ambient = evaluate_sh_irradiance(n) * rb_light.ibl_strength;
+    let sun = rb_light.sun_rgb * (ndotl * rim);
+
+    let h = normalize(l + v);
+    let ndoth = max(dot(n, h), 0.0);
+    let ndotv = max(dot(n, v), 0.0);
+    let fresnel = 0.04 + 0.96 * pow(1.0 - ndotv, 5.0);
+    let spec = rb_light.sun_rgb * (fresnel * pow(ndoth, 64.0) * BODY_SPEC_STRENGTH * rim);
+
+    return albedo * (ambient + sun) * INV_PI + spec;
+}
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -80,20 +134,13 @@ fn vs_main(in: VertexInput, @builtin(instance_index) ii: u32) -> VertexOutput {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let body = bodies[in.body_idx];
     let n = normalize(in.normal);
-    let l = normalize(body.light_dir);
+    let v = normalize(camera.camera_pos - in.world_pos);
 
     let tex_color = textureSample(base_texture, base_sampler, in.uv);
 
-    let ambient = 0.15;
-    let diffuse = max(dot(n, l), 0.0) * 0.7;
-
-    let view_dir = normalize(camera.camera_pos - in.world_pos);
-    let half_vec = normalize(l + view_dir);
-    let spec = pow(max(dot(n, half_vec), 0.0), 32.0) * 0.3;
-
-    let brightness = ambient + diffuse + spec;
     // in.color = per-vertex material color (white for textured primitives)
     // body.color = global tint (white = no tinting)
-    let color = tex_color.rgb * in.color.rgb * body.color.rgb * brightness;
+    let albedo = tex_color.rgb * in.color.rgb * body.color.rgb;
+    let color = shade_body(albedo, n, v, in.world_pos);
     return vec4(color, tex_color.a * in.color.a * body.color.a);
 }

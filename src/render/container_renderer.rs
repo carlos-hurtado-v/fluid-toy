@@ -33,6 +33,7 @@ impl GpuPoolStyle {
     pub fn from_config(
         config: &ContainerConfig,
         lighting: &LightingConfig,
+        env_intensity: f32,
         caustic_strength: f32,
         shadow_strength: f32,
         caustic_focus: f32,
@@ -51,7 +52,9 @@ impl GpuPoolStyle {
             light_dir: lighting.sun_direction_normalized(),
             grout_width: config.grout_width,
             sun_rgb,
-            ibl_strength: 0.6,
+            // Scales with the environment intensity slider like every other
+            // SH consumer (water ambient, foam, aeration)
+            ibl_strength: 0.6 * env_intensity,
             caustic_strength,
             shadow_strength,
             caustic_focus,

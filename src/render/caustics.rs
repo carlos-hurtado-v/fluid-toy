@@ -1,18 +1,23 @@
-//! Caustics renderer — light-space forward splatting onto the pool floor.
+//! Caustics renderer — light-space forward splatting onto the pool interior.
 //!
 //! Pipeline per frame (between MC mesh generation and scene rendering):
 //!   1. G-buffer: raster the MC water mesh from the sun (tight-fit ortho),
 //!      capturing front-most world position + normal per texel.
 //!   2. Splat: one photon per texel × 4 kinds (R/G/B refracted + shadow),
-//!      analytically intersected with the container-local floor plane and
-//!      additively splatted into the floor caustic map with a normalized
-//!      gaussian kernel. Identical kernels for caustic and shadow channels
-//!      make the redistribution energy-conserving by construction.
-//!   3. Filter: separable gaussian blur + temporal EMA (sparkle suppression).
+//!      analytically intersected with the FIRST interior face it hits (floor
+//!      or one of the four walls) and additively splatted into that face's
+//!      tile of the caustic atlas with a normalized gaussian kernel.
+//!      Identical kernels for caustic and shadow channels make the
+//!      redistribution energy-conserving by construction.
+//!   3. Filter: separable gaussian blur (row-clamped so faces don't bleed
+//!      into each other) + temporal EMA (sparkle suppression).
 //!   4. Copy into a stable display texture sampled by the container shader.
 //!
-//! The map covers the floor rect in container-local space:
-//!   u = local.x / half_width * 0.5 + 0.5, v = local.z / half_depth * 0.5 + 0.5
+//! Atlas layout (width = res, height = 3*res, vertical strip):
+//!   rows [0, res)             floor  (u: local.x/hw, v: local.z/hd)
+//!   rows [res + k*res/2, ...) wall k (k: 0=+X 1=-X 2=+Z 3=-Z; u along the
+//!                             wall, v = -local.y/hh, 0 at the rim plane)
+//! Walls only span local y in [-hh, 0] — the pool mesh caps them at the rim.
 
 use wgpu::util::DeviceExt;
 
@@ -37,7 +42,8 @@ struct GpuCausticsParams {
     time: f32,
     ripple_strength: f32,
     kinds: u32,
-    _pad0: f32,
+    // Enabled rigid bodies in the render array (photon occluders)
+    body_count: u32,
 }
 
 /// Layout mirrors `FilterParams` in mc_caustics_filter.wgsl.
@@ -48,6 +54,10 @@ struct GpuFilterParams {
     dir_y: i32,
     sigma: f32,
     alpha: f32,
+    /// Floor tile size in texels (wall rows are tile_res/2); the vertical
+    /// blur clamps taps to the atlas row containing the center pixel
+    tile_res: u32,
+    _pad: [u32; 3],
 }
 
 /// Beer-Lambert absorption coefficients — must match mc_render.wgsl
@@ -61,13 +71,14 @@ const LIGHT_FIT_PADDING: f32 = 0.08;
 
 fn create_map_texture(
     device: &wgpu::Device,
-    res: u32,
+    width: u32,
+    height: u32,
     label: &str,
     usage: wgpu::TextureUsages,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
-        size: wgpu::Extent3d { width: res, height: res, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -126,18 +137,22 @@ impl CausticsRenderer {
     pub fn new(
         device: &wgpu::Device,
         mc_vertex_buffer: &wgpu::Buffer,
+        rigid_bodies_buffer: &wgpu::Buffer,
         container_geom: &GpuContainerGeometry,
         config: &CausticsConfig,
     ) -> Self {
-        let res = config.light_resolution.clamp(128, 1024);
+        // Even so the res/2 wall rows tile exactly
+        let res = config.light_resolution.clamp(128, 1024) & !1;
+        // Atlas: floor tile (res tall) + four wall tiles (res/2 tall each)
+        let atlas_h = res * 3;
 
         // --- Textures ---
         let (gbuffer_pos_texture, gbuffer_pos_view) = create_map_texture(
-            device, res, "Caustics GBuffer Position",
+            device, res, res, "Caustics GBuffer Position",
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let (gbuffer_nrm_texture, gbuffer_nrm_view) = create_map_texture(
-            device, res, "Caustics GBuffer Normal",
+            device, res, res, "Caustics GBuffer Normal",
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let gbuffer_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -153,22 +168,22 @@ impl CausticsRenderer {
         let gbuffer_depth_view = gbuffer_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let (splat_texture, splat_view) = create_map_texture(
-            device, res, "Caustics Splat Map",
+            device, res, atlas_h, "Caustics Splat Map",
             wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
         );
         let (tmp_texture, tmp_view) = create_map_texture(
-            device, res, "Caustics Blur Tmp",
+            device, res, atlas_h, "Caustics Blur Tmp",
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
         );
         let (blurred_texture, blurred_view) = create_map_texture(
-            device, res, "Caustics Blurred",
+            device, res, atlas_h, "Caustics Blurred",
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
         );
         let (display_texture, display_view) = create_map_texture(
-            device, res, "Caustics Display Map",
+            device, res, atlas_h, "Caustics Display Map",
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         );
 
@@ -389,6 +404,7 @@ impl CausticsRenderer {
                 wgpu::BindGroupEntry { binding: 1, resource: container_geom_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&gbuffer_pos_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&gbuffer_nrm_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: rigid_bodies_buffer.as_entire_binding() },
             ],
         });
 
@@ -502,6 +518,7 @@ impl CausticsRenderer {
         config: &CausticsConfig,
         water_clarity: f32,
         time: f32,
+        body_count: u32,
     ) {
         queue.write_buffer(&self.container_geom_buffer, 0, bytemuck::bytes_of(container_geom));
 
@@ -591,18 +608,26 @@ impl CausticsRenderer {
             time,
             ripple_strength: config.ripple_strength,
             kinds: self.current_kinds,
-            _pad0: 0.0,
+            body_count,
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 
-        let blur_h = GpuFilterParams { dir_x: 1, dir_y: 0, sigma: config.blur_sigma.max(0.05), alpha: 0.0 };
-        let blur_v = GpuFilterParams { dir_x: 0, dir_y: 1, sigma: config.blur_sigma.max(0.05), alpha: 0.0 };
+        let filter = |dir_x: i32, dir_y: i32, sigma: f32, alpha: f32| GpuFilterParams {
+            dir_x,
+            dir_y,
+            sigma,
+            alpha,
+            tile_res: self.res,
+            _pad: [0; 3],
+        };
+        let blur_h = filter(1, 0, config.blur_sigma.max(0.05), 0.0);
+        let blur_v = filter(0, 1, config.blur_sigma.max(0.05), 0.0);
         let alpha = if self.history_valid {
             config.temporal_smoothing.clamp(0.0, 0.98)
         } else {
             0.0
         };
-        let ema = GpuFilterParams { dir_x: 0, dir_y: 0, sigma: 1.0, alpha };
+        let ema = filter(0, 0, 1.0, alpha);
         queue.write_buffer(&self.blur_h_buffer, 0, bytemuck::bytes_of(&blur_h));
         queue.write_buffer(&self.blur_v_buffer, 0, bytemuck::bytes_of(&blur_v));
         queue.write_buffer(&self.ema_buffer, 0, bytemuck::bytes_of(&ema));
@@ -691,7 +716,8 @@ impl CausticsRenderer {
         }
 
         // Passes 3-5: blur H, blur V, temporal EMA (writes back into splat map)
-        let groups = self.res.div_ceil(8);
+        let groups_x = self.res.div_ceil(8);
+        let groups_y = (self.res * 3).div_ceil(8);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Caustics Filter Pass"),
@@ -699,19 +725,19 @@ impl CausticsRenderer {
             });
             pass.set_pipeline(&self.blur_pipeline);
             pass.set_bind_group(0, &self.blur_h_bind_group, &[]);
-            pass.dispatch_workgroups(groups, groups, 1);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
             pass.set_bind_group(0, &self.blur_v_bind_group, &[]);
-            pass.dispatch_workgroups(groups, groups, 1);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
             pass.set_pipeline(&self.ema_pipeline);
             pass.set_bind_group(0, &self.ema_bind_group, &[]);
-            pass.dispatch_workgroups(groups, groups, 1);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
         }
 
         // Pass 6: publish into the stable display texture the container samples
         encoder.copy_texture_to_texture(
             self.splat_texture.as_image_copy(),
             self.display_texture.as_image_copy(),
-            wgpu::Extent3d { width: self.res, height: self.res, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: self.res, height: self.res * 3, depth_or_array_layers: 1 },
         );
     }
 }

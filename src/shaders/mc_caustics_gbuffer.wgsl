@@ -32,7 +32,8 @@ struct CausticsParams {
     ripple_strength: f32,
     // Photon kinds per texel: 4 = R/G/B/shadow (chromatic), 2 = white/shadow
     kinds: u32,
-    _pad0: f32,
+    // Enabled rigid bodies in the render array (photon occluders, splat pass)
+    body_count: u32,
 }
 
 struct Vertex {

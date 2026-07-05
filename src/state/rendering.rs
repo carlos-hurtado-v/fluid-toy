@@ -155,10 +155,18 @@ impl LightingConfig {
             sun_enabled: if self.sun_enabled { 1 } else { 0 },
             sun_color: self.sun_color,
             sun_intensity: self.sun_intensity,
-            _pad_unused: 0.0,
+            ambient_intensity: 1.0,
             _pad0: [0.0; 3],
             _padding: [0.0; 3],
             _pad1: 0.0,
+        }
+    }
+
+    /// Like `to_gpu_params` but with the SH ambient scale set (spray renderer)
+    pub fn to_gpu_params_with_ambient(&self, ambient_intensity: f32) -> GpuLightParams {
+        GpuLightParams {
+            ambient_intensity,
+            ..self.to_gpu_params()
         }
     }
 }
@@ -197,14 +205,14 @@ impl Default for CausticsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            intensity: 1.0,
-            shadow_strength: 0.6,
-            focus: 2.5,
-            dispersion: 0.0,
-            splat_size: 0.5,
-            blur_sigma: 0.3,
-            temporal_smoothing: 0.0,
-            ripple_strength: 0.13,
+            intensity: 1.5,
+            shadow_strength: 1.0,
+            focus: 2.3,
+            dispersion: 0.15,
+            splat_size: 1.15,
+            blur_sigma: 1.25,
+            temporal_smoothing: 0.5,
+            ripple_strength: 0.145,
             light_resolution: 768,
         }
     }
@@ -418,7 +426,9 @@ pub struct GpuLightParams {
     pub sun_enabled: u32,           // 4 bytes, offset 12
     pub sun_color: [f32; 3],        // 12 bytes, offset 16
     pub sun_intensity: f32,         // 4 bytes, offset 28
-    pub _pad_unused: f32,           // 4 bytes, offset 32 (was specular_power)
+    /// SH ambient scale (environment intensity). Read by spray_render.wgsl;
+    /// other consumers have their own env params and declare this as padding.
+    pub ambient_intensity: f32,     // 4 bytes, offset 32 (was specular_power)
     pub _pad0: [f32; 3],            // 12 bytes, offset 36 (aligns _padding to offset 48)
     pub _padding: [f32; 3],         // 12 bytes, offset 48 (matches WGSL vec3 alignment)
     pub _pad1: f32,                 // 4 bytes, offset 60 (struct padding to reach 64)

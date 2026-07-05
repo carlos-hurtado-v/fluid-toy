@@ -20,6 +20,22 @@ impl Default for ShCoefficients {
     }
 }
 
+impl ShCoefficients {
+    /// Coefficients for a uniform environment of the given radiance: exactly
+    /// what `compute_sh_irradiance` would return for an HDR map filled with
+    /// `color`. Only the L0 band is non-zero:
+    ///   c00 = color * Y00 * 4pi (projection) * A0 (cosine lobe, = pi)
+    /// so the shader's `evaluate_sh_irradiance` yields `pi * color` for every
+    /// normal, matching the convention of the HDR path.
+    pub fn uniform(color: [f32; 3]) -> Self {
+        let pi = std::f32::consts::PI;
+        let c00 = 0.282095 * 4.0 * pi * pi;
+        let mut coeffs = [[0.0; 4]; 9];
+        coeffs[0] = [color[0] * c00, color[1] * c00, color[2] * c00, 0.0];
+        Self { coeffs }
+    }
+}
+
 /// Compute order-2 spherical harmonics irradiance coefficients from an equirectangular HDR map.
 /// Coefficients are pre-multiplied with cosine lobe convolution (Ramamoorthi & Hanrahan 2001).
 pub fn compute_sh_irradiance(pixels: &[f32], width: u32, height: u32) -> ShCoefficients {

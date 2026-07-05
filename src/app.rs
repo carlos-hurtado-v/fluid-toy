@@ -52,6 +52,10 @@ pub struct App {
     env_sampler: Option<wgpu::Sampler>,
     current_hdr: HdrEnvironment,
     sh_coefficients: Option<ShCoefficients>,
+    // Last (mode, solid color bits, hdr) the SH uniform buffers were pushed
+    // for. SolidColor mode uses a uniform SH of the background color so the
+    // diffuse ambient matches the visible surround instead of the HDR sky.
+    last_sh_key: Option<(BackgroundMode, [u32; 3], HdrEnvironment)>,
     // Environment background rendering (for Particles mode)
     env_bg_pipeline: Option<wgpu::RenderPipeline>,
     env_bg_bind_group: Option<wgpu::BindGroup>,
@@ -145,6 +149,7 @@ impl App {
             env_sampler: None,
             current_hdr: HdrEnvironment::Farmland,
             sh_coefficients: None,
+            last_sh_key: None,
             env_bg_pipeline: None,
             env_bg_bind_group: None,
             env_bg_bind_group_layout: None,
@@ -291,10 +296,24 @@ impl App {
             &container_geom,
         );
 
+        // Create rigid body renderer + fallback depth texture (before caustics:
+        // the splat pass binds the body array for photon occlusion)
+        let rigid_body_renderer = RigidBodyRenderer::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.config.format,
+            &camera_params,
+            self.state.quality.msaa.as_u32(),
+        );
+        let rigid_body_depth_view = create_depth_texture(
+            &gpu.device, gpu.config.width, gpu.config.height,
+        );
+
         // Create caustics renderer (raster source = MC mesh; output sampled by container)
         let caustics_renderer = CausticsRenderer::new(
             &gpu.device,
             mc_renderer.mesh_vertex_buffer(),
+            rigid_body_renderer.bodies_buffer(),
             &container_geom,
             &self.state.caustics,
         );
@@ -303,6 +322,7 @@ impl App {
         let pool_style = GpuPoolStyle::from_config(
             &self.state.container,
             &self.state.lighting,
+            self.state.environment.environment_intensity,
             0.0,
             0.0,
             1.0,
@@ -320,18 +340,6 @@ impl App {
             &gpu_sh,
             caustics_renderer.display_view(),
             caustics_renderer.sampler(),
-        );
-
-        // Create rigid body renderer + fallback depth texture
-        let rigid_body_renderer = RigidBodyRenderer::new(
-            &gpu.device,
-            &gpu.queue,
-            gpu.config.format,
-            &camera_params,
-            self.state.quality.msaa.as_u32(),
-        );
-        let rigid_body_depth_view = create_depth_texture(
-            &gpu.device, gpu.config.width, gpu.config.height,
         );
 
         // Create whitewater system and renderer
@@ -858,6 +866,51 @@ impl App {
         )
     }
 
+    /// Push SH irradiance to all consumers when the ambient source changes.
+    /// Environment mode uses the HDR map's coefficients; SolidColor mode uses
+    /// a uniform SH of the background color, so diffuse ambient agrees with
+    /// the visible surround instead of silently keeping the HDR sky's light.
+    fn refresh_sh_coefficients(&mut self) {
+        let env = &self.state.environment;
+        let key = (
+            env.background_mode,
+            [
+                env.background_color[0].to_bits(),
+                env.background_color[1].to_bits(),
+                env.background_color[2].to_bits(),
+            ],
+            self.current_hdr,
+        );
+        if self.last_sh_key == Some(key) {
+            return;
+        }
+        let coeffs = match env.background_mode {
+            BackgroundMode::Environment => match &self.sh_coefficients {
+                Some(sh) => sh.coeffs,
+                None => return,
+            },
+            BackgroundMode::SolidColor => ShCoefficients::uniform(env.background_color).coeffs,
+        };
+        let gpu_sh = GpuShCoefficients { coeffs };
+        let gpu = self.gpu.as_ref().unwrap();
+        if let Some(mc_renderer) = &self.mc_renderer {
+            mc_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
+        }
+        if let Some(ss_renderer) = &self.ss_renderer {
+            ss_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
+        }
+        if let Some(container_r) = &self.container_renderer {
+            container_r.update_sh_coefficients(&gpu.queue, &gpu_sh);
+        }
+        if let Some(rb_renderer) = &self.rigid_body_renderer {
+            rb_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
+        }
+        if let Some(spray_renderer) = &self.spray_renderer {
+            spray_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
+        }
+        self.last_sh_key = Some(key);
+    }
+
     fn reload_environment_map(&mut self) {
         let gpu = self.gpu.as_ref().unwrap();
         let selection = self.state.environment.hdr_selection;
@@ -868,14 +921,12 @@ impl App {
             selection,
         ).expect("Failed to load environment map");
 
-        // Rebuild MC renderer bind groups and update SH coefficients
+        // Rebuild MC renderer bind groups for the new env texture
         if let Some(mc_renderer) = &mut self.mc_renderer {
             mc_renderer.rebuild_env_bind_groups(&gpu.device, &env_view, &env_sampler);
-            let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
-            mc_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
         }
 
-        // Rebuild SS renderer bind groups and update SH coefficients
+        // Rebuild SS renderer bind groups for the new env texture
         if let (Some(ss_renderer), Some(mc_renderer)) =
             (&mut self.ss_renderer, &self.mc_renderer)
         {
@@ -883,17 +934,11 @@ impl App {
                 &gpu.device, &env_view, &env_sampler,
                 mc_renderer.foam_density_view(),
             );
-            let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
-            ss_renderer.update_sh_coefficients(&gpu.queue, &gpu_sh);
-        }
-
-        // Update container renderer SH coefficients
-        if let Some(container_r) = &self.container_renderer {
-            let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
-            container_r.update_sh_coefficients(&gpu.queue, &gpu_sh);
         }
 
         self.sh_coefficients = Some(sh_coefficients);
+        // SH consumers are refreshed next sync (background-mode aware)
+        self.last_sh_key = None;
 
         // Rebuild env background bind group (for Particles mode)
         if let (Some(layout), Some(renderer), Some(buf)) = (
@@ -934,6 +979,8 @@ impl App {
     }
 
     fn sync_gpu_state(&mut self) {
+        self.refresh_sh_coefficients();
+
         // Compute mouse force before borrowing sph_sim mutably
         let mouse_force = if self.right_mouse_pressed {
             let (ray_origin, ray_dir) = self.cursor_ray();
@@ -1005,6 +1052,7 @@ impl App {
                 let pool_style = GpuPoolStyle::from_config(
                     &self.state.container,
                     &self.state.lighting,
+                    self.state.environment.environment_intensity,
                     caustic_strength,
                     shadow_strength,
                     self.state.caustics.focus.max(0.1),
@@ -1049,7 +1097,20 @@ impl App {
             }
             if let Some(rb_renderer) = &mut self.rigid_body_renderer {
                 rb_renderer.update_camera(&gpu.queue, &camera_params);
-                let light_dir = self.state.lighting.sun_direction_normalized();
+                let lighting = &self.state.lighting;
+                let sun_on = if lighting.sun_enabled { 1.0 } else { 0.0 };
+                rb_renderer.update_light(&gpu.queue, &crate::render::rigid_body_renderer::GpuRbLightParams {
+                    sun_dir: lighting.sun_direction_normalized(),
+                    ibl_strength: self.state.environment.environment_intensity,
+                    sun_rgb: [
+                        lighting.sun_color[0] * lighting.sun_intensity * sun_on,
+                        lighting.sun_color[1] * lighting.sun_intensity * sun_on,
+                        lighting.sun_color[2] * lighting.sun_intensity * sun_on,
+                    ],
+                    _pad0: 0.0,
+                });
+                rb_renderer.update_container_geometry(&gpu.queue, &container_geom);
+                let light_dir = lighting.sun_direction_normalized();
                 let mut renders = Vec::new();
                 let mut draws = Vec::new();
                 for body in self.state.rigid_bodies.iter().filter(|b| b.enabled) {
@@ -1064,7 +1125,13 @@ impl App {
             if let Some(spray_renderer) = &self.spray_renderer {
                 spray_renderer.update_camera(&gpu.queue, &camera_params);
                 spray_renderer.update_params(&gpu.queue, &self.build_spray_render_params());
-                spray_renderer.update_light(&gpu.queue, &self.state.lighting.to_gpu_params());
+                spray_renderer.update_light(
+                    &gpu.queue,
+                    &self.state.lighting.to_gpu_params_with_ambient(
+                        self.state.environment.environment_intensity,
+                    ),
+                );
+                spray_renderer.update_container_geometry(&gpu.queue, &container_geom);
             }
 
             let render_params = self.state.rendering.to_gpu_params();
@@ -1693,6 +1760,15 @@ impl App {
                         // this frame's map in both background and main passes.
                         if caustics_on {
                             if let Some(caustics) = &mut self.caustics_renderer {
+                                // Enabled bodies occupy the front of the render
+                                // body array (update_bodies uploads them in order)
+                                let body_count = self
+                                    .state
+                                    .rigid_bodies
+                                    .iter()
+                                    .filter(|b| b.enabled)
+                                    .count()
+                                    .min(crate::state::MAX_RIGID_BODIES) as u32;
                                 caustics.update(
                                     &gpu.queue,
                                     &mc_geom,
@@ -1700,6 +1776,7 @@ impl App {
                                     &self.state.caustics,
                                     self.state.rendering.water_clarity,
                                     self.state.runtime.time_elapsed,
+                                    body_count,
                                 );
                                 let container_mesh = self
                                     .container_renderer
