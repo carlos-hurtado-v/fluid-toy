@@ -34,6 +34,11 @@ struct WaterParams {
     physical_refraction: f32,
     foam_coverage: f32,
     aeration_strength: f32,
+    // 1 = physical water medium (absorption + single scattering), 0 = legacy
+    physical_medium: f32,
+    _pad_m0: f32,
+    _pad_m1: f32,
+    _pad_m2: f32,
 }
 
 struct LightParams {
@@ -158,6 +163,79 @@ fn linearize_depth(d: f32, near: f32, far: f32) -> f32 {
     return near * far / (far - d * (far - near));
 }
 
+// === Physical water medium (keep in sync: mc_render.wgsl / ss_composite.wgsl) ===
+// Single scattering in a homogeneous medium along the in-water view path:
+//   interior = background * exp(-sigma_t d) + in-scattered sun + sky
+// Absorption is pure water at representative R/G/B wavelengths (Pope & Fry
+// 1997, ~620 / 550 / 460 nm, per metre). Scattering (turbidity) comes from
+// the Clarity slider, its spectral shape from the water color. The body
+// color is not set by hand: it emerges as (sigma_s / sigma_t) x light x phase.
+const WATER_ABSORPTION: vec3<f32> = vec3<f32>(0.30, 0.055, 0.015);
+// Clarity 0 -> 3 /m (murky), 1 -> 0.02 /m (very clear pool), log-mapped;
+// the 0.65 default is ~0.1 /m, a real swimming pool
+const TURBIDITY_MAX: f32 = 3.0;
+const TURBIDITY_MIN: f32 = 0.02;
+// Particle scattering is forward-peaked (Henyey-Greenstein g), with a small
+// isotropic lobe so skylight and the sun still backscatter a little
+const PHASE_G: f32 = 0.85;
+const PHASE_ISOTROPIC: f32 = 0.2;
+// Diffuse skylight under water: transmission through the surface and the
+// mean cosine of the downwelling light field
+const SKY_TRANSMISSION: f32 = 0.93;
+const SKY_MEAN_COSINE: f32 = 0.8;
+
+struct Medium {
+    transmittance: vec3<f32>,
+    inscatter: vec3<f32>,
+}
+
+fn medium_scattering() -> vec3<f32> {
+    let turbidity = TURBIDITY_MAX * pow(TURBIDITY_MIN / TURBIDITY_MAX, water.clarity);
+    let c = water.water_color;
+    return turbidity * c / max(max(c.r, c.g), max(c.b, 1e-4));
+}
+
+fn medium_phase(cos_theta: f32) -> f32 {
+    let g2 = PHASE_G * PHASE_G;
+    let hg = (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * PHASE_G * cos_theta, 1.5));
+    return mix(hg, 1.0 / (4.0 * PI), PHASE_ISOTROPIC);
+}
+
+// `d`: path length in water along the view ray. `view_in`: refracted view
+// direction inside the water (travelling away from the camera). `sun_rgb`:
+// sun irradiance (zero when off or shadowed). `sky_down`: sky irradiance on a
+// horizontal surface. Light enters through the mean (flat) surface and the
+// path is taken to start at the surface (side faces start deeper: their sun
+// in-scatter is overestimated). In-scattered radiance leaves the water
+// scaled by 1/n^2; the exit Fresnel is applied by the caller's mix.
+fn water_medium(d: f32, view_in: vec3<f32>, sun_dir: vec3<f32>, sun_rgb: vec3<f32>, sky_down: vec3<f32>) -> Medium {
+    let sigma_s = medium_scattering();
+    let sigma_t = WATER_ABSORPTION + sigma_s;
+    var m: Medium;
+    m.transmittance = exp(-sigma_t * d);
+    // Depth gained per unit of path (0 for a horizontal ray)
+    let cos_v = max(-view_in.y, 0.0);
+
+    // Skylight: diffuse downwelling field, dimming with depth
+    let k_sky = sigma_t * (1.0 + cos_v / SKY_MEAN_COSINE);
+    let sky_scalar = sky_down * (SKY_TRANSMISSION / SKY_MEAN_COSINE);
+    var inscatter = sigma_s * sky_scalar / (4.0 * PI) * (1.0 - exp(-k_sky * d)) / k_sky;
+
+    // Sun: a refracted beam, dimming along its own (steeper) path with depth
+    if (sun_dir.y > 0.0) {
+        let s_in = refract(-sun_dir, vec3<f32>(0.0, 1.0, 0.0), 1.0 / water.ior);
+        let cos_s = max(-s_in.y, 0.05);
+        let f0 = pow((water.ior - 1.0) / (water.ior + 1.0), 2.0);
+        let entry = 1.0 - (f0 + (1.0 - f0) * pow(1.0 - sun_dir.y, 5.0));
+        // Irradiance across the beam: refraction narrows it by cos_L / cos_s
+        let beam = sun_rgb * entry * sun_dir.y / cos_s;
+        let k_sun = sigma_t * (1.0 + cos_v / cos_s);
+        inscatter += sigma_s * medium_phase(dot(s_in, -view_in)) * beam * (1.0 - exp(-k_sun * d)) / k_sun;
+    }
+    m.inscatter = inscatter / (water.ior * water.ior);
+    return m;
+}
+
 // === Physical screen-space refraction ===
 // Raw depth at or past this is the environment backdrop (drawn at 0.9999) or
 // nothing at all: whatever lies behind is infinitely far.
@@ -169,13 +247,6 @@ fn texel_at(uv: vec2<f32>, dims: vec2<u32>) -> vec2<i32> {
 
 fn background_depth_at(uv: vec2<f32>) -> f32 {
     return textureLoad(background_depth_tex, texel_at(uv, textureDimensions(background_depth_tex)), 0);
-}
-
-// Screen uv (y down) where a world point lands
-fn world_to_screen(p: vec3<f32>) -> vec2<f32> {
-    let clip = camera.projection * camera.view * vec4<f32>(p, 1.0);
-    let ndc = clip.xy / max(clip.w, 1e-4);
-    return vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 }
 
 // World point seen at screen uv with raw hardware depth. Goes through the real
@@ -216,22 +287,56 @@ fn backdrop_along(dir: vec3<f32>) -> vec3<f32> {
     return clamp(sample_environment(dir) * water.env_intensity, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-// March a ray from `origin` (in or leaving the water) onto the background
-// surface first seen at `uv0`. Fixed-point on the depth buffer: step the
-// distance to the surface, re-read the surface under the landing point, repeat.
-// Converges in a couple of steps on floors and walls.
+// March a ray from `origin` (in or leaving the water) until it passes
+// behind the background depth buffer, then bisect to the crossing. Linear
+// steps reach several times the straight-line distance to the surface first
+// seen at `uv0`: a refracted ray skimming a floor lands far behind that first
+// guess, which a fixed-point iteration overshoots toward the horizon.
+const MARCH_STEPS: i32 = 20;
+const MARCH_REFINE: i32 = 5;
+const MARCH_REACH: f32 = 4.0;
+
+// Screen uv (y down) and raw depth of a world point
+fn screen_point(p: vec3<f32>) -> vec3<f32> {
+    let clip = camera.projection * camera.view * vec4<f32>(p, 1.0);
+    let w = max(clip.w, 1e-4);
+    return vec3<f32>(clip.x / w * 0.5 + 0.5, 0.5 - clip.y / w * 0.5, clip.z / w);
+}
+
 fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0: f32) -> vec2<f32> {
-    var d = distance(origin, screen_to_world(uv0, depth0));
-    var uv = uv0;
-    for (var k = 0; k < 3; k++) {
-        uv = world_to_screen(origin + dir * d);
-        let depth = background_depth_at(uv);
-        if (depth >= BACKDROP_DEPTH) {
-            break;  // walked off the surface's edge
+    let reach = MARCH_REACH * distance(origin, screen_to_world(uv0, depth0)) + 0.1;
+    var lo = 0.0;
+    var hi = -1.0;
+    for (var k = 1; k <= MARCH_STEPS; k++) {
+        let s = reach * f32(k) / f32(MARCH_STEPS);
+        let q = screen_point(origin + dir * s);
+        if (any(q.xy < vec2<f32>(0.0)) || any(q.xy > vec2<f32>(1.0))) {
+            break;  // left the screen
         }
-        d = distance(origin, screen_to_world(uv, depth));
+        if (q.z >= background_depth_at(q.xy)) {
+            hi = s;
+            break;
+        }
+        lo = s;
     }
-    return uv;
+    if (hi < 0.0) {
+        // No crossing: the ray left the screen, or rose toward the water
+        // surface from below (side faces near the rounded top edge), where it
+        // would reflect back down rather than reach anything far away. The
+        // surface first seen is the safe answer; the furthest point reached
+        // would paint the horizon into the water.
+        return uv0;
+    }
+    for (var k = 0; k < MARCH_REFINE; k++) {
+        let mid = 0.5 * (lo + hi);
+        let q = screen_point(origin + dir * mid);
+        if (q.z >= background_depth_at(q.xy)) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    return screen_point(origin + dir * hi).xy;
 }
 
 // Two-interface image-space refraction (after Wyman 2005). Snell-refract the
@@ -267,7 +372,7 @@ fn refract_scene(
 
     // Cross the body to the back face, refract out through its normal there
     let p_exit = p + t1 * distance(p, screen_to_world(screen_uv, back_depth_raw));
-    let exit_uv = world_to_screen(p_exit);
+    let exit_uv = screen_point(p_exit).xy;
     var back_n = textureLoad(back_normal_tex, texel_at(exit_uv, textureDimensions(back_normal_tex)), 0);
     if (back_n.w < 0.5) {
         // Landed outside the body's silhouette: use the exit face behind this pixel
@@ -415,9 +520,19 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     let front_linear = linearize_depth(front_depth_raw, camera.near, camera.far);
     let back_linear = linearize_depth(back_depth_raw, camera.near, camera.far);
 
-    // Thickness in world units (clamped to reasonable range)
+    // Thickness in world units (clamped to reasonable range). Legacy: this
+    // D3D-style linearization runs on a GL-style projection, so it reads
+    // ~0.5x the true distance; the legacy look was tuned on it, so it stays.
     var thickness = max(0.0, back_linear - front_linear);
     thickness = min(thickness, 5.0);  // Cap at 5 units
+
+    // True in-water path for the physical medium: to the back face, or to an
+    // opaque surface inside the water (floor, wall, body) if that is nearer
+    let path_end = min(back_depth_raw, background_depth_at(screen_uv));
+    var path_length = 10.0;  // nothing behind: treat as deep
+    if (path_end < BACKDROP_DEPTH) {
+        path_length = min(distance(input.world_position, screen_to_world(screen_uv, path_end)), 10.0);
+    }
 
     // === ABSORPTION (Beer's Law) ===
     // Light attenuates exponentially through water
@@ -482,6 +597,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         refracted_background = textureSampleLevel(background_tex, env_sampler, refract_uv, 0.0).rgb;
     }
 
+    let refracted_scene = refracted_background;
     // Apply absorption to refracted light (Beer-Lambert)
     refracted_background = refracted_background * transmittance;
 
@@ -574,6 +690,20 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     var lit_interior = interior_with_scatter
         + sun_subsurface * (1.0 - fresnel)
         + ambient_subsurface * (1.0 - fresnel);
+    if (water.physical_medium != 0.0) {
+        var sun_rgb = vec3<f32>(0.0);
+        if (light.sun_enabled == 1u) {
+            sun_rgb = light.sun_color * light.sun_intensity * rim_vis;
+        }
+        let medium = water_medium(
+            path_length,
+            refract(-view_dir, normal, 1.0 / water.ior),
+            sun_dir_ws,
+            sun_rgb,
+            evaluate_sh_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * water.env_intensity,
+        );
+        lit_interior = refracted_scene * medium.transmittance + medium.inscatter;
+    }
 
     // === AERATION (submerged whitewater) ===
     // Entrained-air density along this ray (G channel of the whitewater

@@ -20,9 +20,10 @@ use crate::gui::{self, GuiAction};
 use crate::render::{Camera, CausticsRenderer, ContainerRenderer, GpuPoolStyle, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyDraw, RigidBodyRenderer, ScreenSpaceFluidRenderer, SprayRenderer, WireframeRenderer};
 use crate::state::ContainerStyle;
 use crate::simulation::{ProbeSystem, SphSimulation3DGrid, SpraySystem, create_particle_block};
-use crate::render::environment::load_embedded_environment_map;
+use crate::render::environment::{load_embedded_environment_map, SunEstimate};
+use crate::render::container_renderer::{POOL_WALL_HEIGHT_FRACTION, WALL_THICKNESS};
 use crate::render::mesh_loader::{self, SdfData};
-use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuShCoefficients, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, RigidBodyMotion, integrate_rigid_body};
+use crate::state::{AppState, BackgroundMode, EnvironmentSun, FluidRenderMode, GroundStaging, ForceMode, GpuMouseForce, GpuShCoefficients, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, RigidBodyMotion, integrate_rigid_body};
 use crate::render::environment::ShCoefficients;
 
 pub struct App {
@@ -52,10 +53,12 @@ pub struct App {
     env_sampler: Option<wgpu::Sampler>,
     current_hdr: HdrEnvironment,
     sh_coefficients: Option<ShCoefficients>,
+    /// Sun found in the loaded HDR map (None when the map is too diffuse)
+    hdr_sun: Option<SunEstimate>,
     // Last (mode, solid color bits, hdr) the SH uniform buffers were pushed
     // for. SolidColor mode uses a uniform SH of the background color so the
     // diffuse ambient matches the visible surround instead of the HDR sky.
-    last_sh_key: Option<(BackgroundMode, [u32; 3], HdrEnvironment)>,
+    last_sh_key: Option<(BackgroundMode, [u32; 3], HdrEnvironment, bool)>,
     // Environment background rendering (for Particles mode)
     env_bg_pipeline: Option<wgpu::RenderPipeline>,
     env_bg_bind_group: Option<wgpu::BindGroup>,
@@ -159,6 +162,7 @@ impl App {
             env_sampler: None,
             current_hdr: HdrEnvironment::Farmland,
             sh_coefficients: None,
+            hdr_sun: None,
             last_sh_key: None,
             env_bg_pipeline: None,
             env_bg_bind_group: None,
@@ -447,7 +451,7 @@ impl App {
         );
 
         // Load environment map (shared by SS + MC renderers)
-        let (env_texture, env_view, env_sampler, sh_coefficients) = load_embedded_environment_map(
+        let (env_texture, env_view, env_sampler, sh_coefficients, hdr_sun) = load_embedded_environment_map(
             &gpu.device,
             &gpu.queue,
             self.state.environment.hdr_selection,
@@ -565,7 +569,7 @@ impl App {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mc_environment.wgsl").into()),
         });
 
-        let env_params_gpu = self.state.environment.to_gpu_params();
+        let env_params_gpu = self.state.environment.to_gpu_params(&self.ground_staging());
         let env_params_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Env Params Buffer"),
             contents: bytemuck::bytes_of(&env_params_gpu),
@@ -736,6 +740,7 @@ impl App {
         self.env_view = Some(env_view);
         self.env_sampler = Some(env_sampler);
         self.sh_coefficients = Some(sh_coefficients);
+        self.hdr_sun = hdr_sun;
         self.current_hdr = self.state.environment.hdr_selection;
         self.env_bg_pipeline = Some(env_bg_pipeline);
         self.env_bg_bind_group = Some(env_bg_bind_group);
@@ -1067,6 +1072,8 @@ impl App {
     /// the visible surround instead of silently keeping the HDR sky's light.
     fn refresh_sh_coefficients(&mut self) {
         let env = &self.state.environment;
+        // With the HDR sun split out (lit analytically), ambient is the sky only
+        let sky_only = self.state.lighting.sun_from_environment && self.hdr_sun.is_some();
         let key = (
             env.background_mode,
             [
@@ -1075,14 +1082,16 @@ impl App {
                 env.background_color[2].to_bits(),
             ],
             self.current_hdr,
+            sky_only,
         );
         if self.last_sh_key == Some(key) {
             return;
         }
         let coeffs = match env.background_mode {
-            BackgroundMode::Environment => match &self.sh_coefficients {
-                Some(sh) => sh.coeffs,
-                None => return,
+            BackgroundMode::Environment => match (&self.sh_coefficients, &self.hdr_sun) {
+                (_, Some(sun)) if sky_only => sun.sky_sh.coeffs,
+                (Some(sh), _) => sh.coeffs,
+                (None, _) => return,
             },
             BackgroundMode::SolidColor => ShCoefficients::uniform(env.background_color).coeffs,
         };
@@ -1106,15 +1115,46 @@ impl App {
         self.last_sh_key = Some(key);
     }
 
+    /// Where the projected ground sits and what stands on it (the pool box),
+    /// plus the sky's share of the ground's light for the box's contact occlusion
+    fn ground_staging(&self) -> GroundStaging {
+        let c = &self.state.container;
+        let (aabb_min, _) = c.tilted_aabb();
+        let pool = c.style == ContainerStyle::OpaquePool;
+        let t = if pool { WALL_THICKNESS } else { 0.0 };
+        GroundStaging {
+            // A hair below the base: coplanar with the pool's outer bottom it
+            // would z-fight. The tank's water rests on it (glass is thin).
+            ground_y: aabb_min[1] - t - 0.003,
+            occluder_half_extents: [c.half_width() + t, c.half_depth() + t],
+            occluder_height: if pool { c.height * POOL_WALL_HEIGHT_FRACTION + t } else { 0.0 },
+            sky_share: self.ground_sky_share(),
+        }
+    }
+
+    /// Sky vs sun share of the light on open ground, from the HDR's sky-only
+    /// SH and measured sun (all sky when the map has no distinct sun)
+    fn ground_sky_share(&self) -> f32 {
+        let Some(sun) = &self.hdr_sun else { return 1.0 };
+        let c = &sun.sky_sh.coeffs;
+        // SH irradiance on an upward-facing surface (n = +Y), per channel
+        let e_up = |k: usize| 0.282095 * c[0][k] + 0.488603 * c[1][k] - 0.315392 * c[6][k] - 0.546274 * c[8][k];
+        let luminance = |v: [f32; 3]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+        let sky = luminance([e_up(0), e_up(1), e_up(2)]).max(0.0);
+        let sun_e = luminance(sun.irradiance) * sun.direction[1].max(0.0);
+        if sky + sun_e > 0.0 { sky / (sky + sun_e) } else { 1.0 }
+    }
+
     fn reload_environment_map(&mut self) {
         let gpu = self.gpu.as_ref().unwrap();
         let selection = self.state.environment.hdr_selection;
 
-        let (env_texture, env_view, env_sampler, sh_coefficients) = load_embedded_environment_map(
+        let (env_texture, env_view, env_sampler, sh_coefficients, hdr_sun) = load_embedded_environment_map(
             &gpu.device,
             &gpu.queue,
             selection,
         ).expect("Failed to load environment map");
+        self.hdr_sun = hdr_sun;
 
         // Rebuild MC renderer bind groups for the new env texture
         if let Some(mc_renderer) = &mut self.mc_renderer {
@@ -1175,6 +1215,17 @@ impl App {
 
     fn sync_gpu_state(&mut self) {
         self.refresh_sh_coefficients();
+        // The analytic sun follows the visible HDR sun (when it has one)
+        let env_intensity = self.state.environment.environment_intensity;
+        self.state.lighting.environment_sun =
+            if self.state.environment.background_mode == BackgroundMode::Environment {
+                self.hdr_sun.map(|sun| EnvironmentSun {
+                    direction: sun.direction,
+                    irradiance: sun.irradiance.map(|e| e * env_intensity),
+                })
+            } else {
+                None
+            };
 
         // Compute mouse force before borrowing sph_sim mutably
         let mouse_force = if self.right_mouse_pressed {
@@ -1293,15 +1344,10 @@ impl App {
             if let Some(rb_renderer) = &mut self.rigid_body_renderer {
                 rb_renderer.update_camera(&gpu.queue, &camera_params);
                 let lighting = &self.state.lighting;
-                let sun_on = if lighting.sun_enabled { 1.0 } else { 0.0 };
                 rb_renderer.update_light(&gpu.queue, &crate::render::rigid_body_renderer::GpuRbLightParams {
                     sun_dir: lighting.sun_direction_normalized(),
                     ibl_strength: self.state.environment.environment_intensity,
-                    sun_rgb: [
-                        lighting.sun_color[0] * lighting.sun_intensity * sun_on,
-                        lighting.sun_color[1] * lighting.sun_intensity * sun_on,
-                        lighting.sun_color[2] * lighting.sun_intensity * sun_on,
-                    ],
+                    sun_rgb: lighting.sun_rgb(),
                     _pad0: 0.0,
                 });
                 rb_renderer.update_container_geometry(&gpu.queue, &container_geom);
@@ -1667,7 +1713,7 @@ impl App {
                             &self.env_params_buffer,
                         ) {
                             // Update env params
-                            let env_params = self.state.environment.to_gpu_params();
+                            let env_params = self.state.environment.to_gpu_params(&self.ground_staging());
                             gpu.queue.write_buffer(buf, 0, bytemuck::bytes_of(&env_params));
 
                             // Update camera in particle renderer (needed for inv matrices in env shader)
@@ -1781,9 +1827,11 @@ impl App {
                             _pad1: self.state.rendering.ss_debug_view as f32,
                             foam_coverage: self.state.spray.foam_coverage,
                             aeration_strength: self.state.spray.aeration_strength,
+                            physical_medium: if self.state.rendering.physical_water_medium { 1.0 } else { 0.0 },
+                            _pad_m: [0.0; 3],
                         };
                         ss_renderer.update_water_params(&gpu.queue, &water_params);
-                        let env_params = self.state.environment.to_gpu_params();
+                        let env_params = self.state.environment.to_gpu_params(&self.ground_staging());
                         ss_renderer.update_env_params(&gpu.queue, &env_params);
 
                         // Scene objects go into the SS background pass (refraction +
@@ -1867,6 +1915,7 @@ impl App {
                     }
                     // Marching cubes surface mesh rendering
                     let caustics_on = self.caustics_active();
+                    let env_params = self.state.environment.to_gpu_params(&self.ground_staging());
                     if let Some(mc_renderer) = &mut self.mc_renderer {
                         let camera_params = self.camera.to_gpu_params();
                         mc_renderer.update_camera(&gpu.queue, &camera_params);
@@ -1885,10 +1934,10 @@ impl App {
                             self.state.rendering.ripple_strength,
                             self.state.rendering.water_clarity,
                             self.state.rendering.mc_physical_refraction,
+                            self.state.rendering.physical_water_medium,
                             self.state.spray.foam_coverage,
                             self.state.spray.aeration_strength,
                         );
-                        let env_params = self.state.environment.to_gpu_params();
                         mc_renderer.update_env_params(&gpu.queue, &env_params);
                         mc_renderer.set_ssr_enabled(&gpu.queue, self.state.rendering.ssr_enabled);
 

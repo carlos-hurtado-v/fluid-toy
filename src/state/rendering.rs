@@ -72,6 +72,13 @@ pub struct EnvironmentConfig {
     pub hdr_selection: HdrEnvironment,
     /// Environment intensity/exposure multiplier
     pub environment_intensity: f32,
+    /// Project the HDR's lower hemisphere onto a ground plane under the
+    /// container (HDRI backdrop): the photographed ground gains parallax and
+    /// depth, so the scene stands on it and refraction/SSR see it as geometry
+    pub ground_projection: bool,
+    /// Height above the ground the HDR was captured from; sets the scale of
+    /// the projected ground (larger = coarser grass)
+    pub ground_capture_height: f32,
 }
 
 impl Default for EnvironmentConfig {
@@ -83,6 +90,8 @@ impl Default for EnvironmentConfig {
             background_color: [0.132, 0.153, 0.143],
             hdr_selection: HdrEnvironment::PureSky,
             environment_intensity: 1.0,
+            ground_projection: true,
+            ground_capture_height: 1.7,
         }
     }
 }
@@ -92,7 +101,9 @@ impl EnvironmentConfig {
         *self = Self::default();
     }
 
-    pub fn to_gpu_params(&self) -> GpuEnvironmentParams {
+    /// Backdrop params; the ground plane and its occluder come from the
+    /// scene (`ground`), the rest from this config
+    pub fn to_gpu_params(&self, ground: &GroundStaging) -> GpuEnvironmentParams {
         GpuEnvironmentParams {
             use_env_background: match self.background_mode {
                 BackgroundMode::Environment => 1,
@@ -102,9 +113,40 @@ impl EnvironmentConfig {
             background_g: self.background_color[1],
             background_b: self.background_color[2],
             env_intensity: self.environment_intensity,
-            _pad: [0.0; 3],
+            ground_y: ground.ground_y,
+            ground_capture_height: self.ground_capture_height,
+            ground_enabled: self.ground_projection as u32,
+            occluder_half_x: ground.occluder_half_extents[0],
+            occluder_half_z: ground.occluder_half_extents[1],
+            occluder_height: ground.occluder_height,
+            ground_sky_share: ground.sky_share,
         }
     }
+}
+
+/// The HDR map's own sun, split out of the ambient SH and lit analytically
+#[derive(Debug, Clone, Copy)]
+pub struct EnvironmentSun {
+    /// Toward the sun (normalized)
+    pub direction: [f32; 3],
+    /// Irradiance on a surface facing the sun, already scaled by the
+    /// environment intensity
+    pub irradiance: [f32; 3],
+}
+
+/// Scene-derived inputs to the ground-projected backdrop
+#[derive(Debug, Clone, Copy)]
+pub struct GroundStaging {
+    /// World height of the ground plane
+    pub ground_y: f32,
+    /// Footprint half extents (X, Z; centered at the origin) of an opaque
+    /// box standing on the ground (the pool), for its contact occlusion
+    pub occluder_half_extents: [f32; 2],
+    /// Its height above the ground; 0 = no occluder
+    pub occluder_height: f32,
+    /// Fraction of the ground's light that comes from the sky rather than
+    /// the sun: the part the occluder's contact occlusion can remove
+    pub sky_share: f32,
 }
 
 /// Lighting configuration
@@ -119,6 +161,16 @@ pub struct LightingConfig {
     pub sun_color: [f32; 3],
     /// Sun intensity multiplier
     pub sun_intensity: f32,
+    /// In Environment mode, light with the HDR map's own sun (when it has a
+    /// distinct one): its direction and measured irradiance drive the analytic
+    /// sun, and the ambient SH is computed with the sun disk removed so it is
+    /// not counted twice. Shadows, caustics and glints then match the sky.
+    /// The manual direction/color/intensity apply otherwise.
+    pub sun_from_environment: bool,
+    /// Runtime: the HDR sun while it applies (set by the app each frame;
+    /// never serialized)
+    #[serde(skip)]
+    pub environment_sun: Option<EnvironmentSun>,
 }
 
 impl Default for LightingConfig {
@@ -129,6 +181,8 @@ impl Default for LightingConfig {
             sun_direction: [0.6, 0.5, 0.3],  // lower sun, longer specular streaks
             sun_color: [0.98, 0.82, 0.6],    // Warm white sunlight
             sun_intensity: 2.0,
+            sun_from_environment: true,
+            environment_sun: None,
         }
     }
 }
@@ -138,8 +192,28 @@ impl LightingConfig {
         *self = Self::default();
     }
 
-    /// Get normalized sun direction
+    /// The HDR sun when it is in effect
+    pub fn environment_sun_active(&self) -> Option<EnvironmentSun> {
+        self.environment_sun.filter(|_| self.sun_from_environment)
+    }
+
+    /// Effective sun light (color x intensity, or the HDR sun's irradiance),
+    /// zero when the sun is off
+    pub fn sun_rgb(&self) -> [f32; 3] {
+        if !self.sun_enabled {
+            return [0.0; 3];
+        }
+        match self.environment_sun_active() {
+            Some(sun) => sun.irradiance,
+            None => self.sun_color.map(|c| c * self.sun_intensity),
+        }
+    }
+
+    /// Get normalized effective sun direction (HDR sun when active, else manual)
     pub fn sun_direction_normalized(&self) -> [f32; 3] {
+        if let Some(sun) = self.environment_sun_active() {
+            return sun.direction;
+        }
         let [x, y, z] = self.sun_direction;
         let len = (x * x + y * y + z * z).sqrt();
         if len > 0.0001 {
@@ -153,8 +227,9 @@ impl LightingConfig {
         GpuLightParams {
             sun_direction: self.sun_direction_normalized(),
             sun_enabled: if self.sun_enabled { 1 } else { 0 },
-            sun_color: self.sun_color,
-            sun_intensity: self.sun_intensity,
+            // Premultiplied: every shader uses color * intensity
+            sun_color: self.sun_rgb(),
+            sun_intensity: 1.0,
             ambient_intensity: 1.0,
             _pad0: [0.0; 3],
             _padding: [0.0; 3],
@@ -256,7 +331,12 @@ pub struct RenderConfig {
     /// the back face; rays land on the floor/walls via the depth buffer).
     /// Off = legacy screen-space UV offset scaled by `refraction_strength`.
     pub mc_physical_refraction: bool,
-    /// Deep water color - what you see looking into deep water
+    /// Physical water medium (MC + SS): pure-water absorption plus single
+    /// scattering of sun and sky light along the true in-water path. The body
+    /// color emerges from it; Clarity sets turbidity and the water color its
+    /// spectral shape. Off = legacy hand-tuned model (uses deep_water_color).
+    pub physical_water_medium: bool,
+    /// Deep water color - what you see looking into deep water (legacy medium)
     pub deep_water_color: [f32; 3],
     /// Surface smoothing - blur radius for MC density field in voxels (0 = off).
     /// Low-pass on the density texture: smooths the bulk surface but erodes thin
@@ -316,6 +396,7 @@ impl Default for RenderConfig {
             mc_anisotropy_strength: 1.0,
             refraction_strength: 0.045,
             mc_physical_refraction: true,
+            physical_water_medium: true,
             deep_water_color: [0.005, 0.03, 0.08],
             mc_blur_radius: 1,
             mc_calm_smoothing: 1.0,
@@ -471,7 +552,33 @@ pub struct GpuEnvironmentParams {
     pub background_g: f32,
     pub background_b: f32,
     pub env_intensity: f32,
-    pub _pad: [f32; 3],
+    /// Ground-projected backdrop (see `GroundStaging`)
+    pub ground_y: f32,
+    pub ground_capture_height: f32,
+    pub ground_enabled: u32,
+    pub occluder_half_x: f32,
+    pub occluder_half_z: f32,
+    pub occluder_height: f32,
+    pub ground_sky_share: f32,
+}
+
+impl Default for GpuEnvironmentParams {
+    fn default() -> Self {
+        Self {
+            use_env_background: 1,
+            background_r: 0.0,
+            background_g: 0.0,
+            background_b: 0.0,
+            env_intensity: 1.0,
+            ground_y: -1.0,
+            ground_capture_height: 1.7,
+            ground_enabled: 0,
+            occluder_half_x: 0.0,
+            occluder_half_z: 0.0,
+            occluder_height: 0.0,
+            ground_sky_share: 1.0,
+        }
+    }
 }
 
 /// GPU SSR parameters (16 bytes, uniform buffer)

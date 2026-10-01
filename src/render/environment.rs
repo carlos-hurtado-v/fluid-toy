@@ -112,13 +112,148 @@ pub fn compute_sh_irradiance(pixels: &[f32], width: u32, height: u32) -> ShCoeff
     result
 }
 
+/// The sun as found in an HDR map, split out so it can be lit analytically:
+/// direction toward it (same equirect convention as `compute_sh_irradiance`),
+/// the irradiance it delivers on a surface facing it, and SH irradiance of
+/// the map with the sun disk painted over by the surrounding sky (so ambient
+/// lighting does not count the sun a second time).
+#[derive(Debug, Clone, Copy)]
+pub struct SunEstimate {
+    pub direction: [f32; 3],
+    pub irradiance: [f32; 3],
+    pub sky_sh: ShCoefficients,
+}
+
+/// Peak-to-median luminance below which the brightest spot is treated as
+/// overcast glow, not a sun disk worth splitting out.
+const SUN_MIN_PEAK_RATIO: f32 = 30.0;
+/// Angular radius around the peak searched for the sun's core.
+const SUN_CORE_RADIUS_DEG: f32 = 5.0;
+/// Pixels this many times brighter than the median sky (inside the core
+/// radius) belong to the sun disk + tight corona.
+const SUN_CORE_RATIO: f32 = 100.0;
+/// The ring just outside the core whose mean radiance repaints the core in
+/// the sky-only map.
+const SUN_RING_RADIUS_DEG: f32 = 8.0;
+
+/// Locate the sun in an equirectangular HDR map (upper hemisphere only) and
+/// separate it from the sky. Returns None when no peak stands clearly above
+/// the sky (overcast maps keep the plain SH and the manual sun).
+pub fn estimate_sun(pixels: &[f32], width: u32, height: u32) -> Option<SunEstimate> {
+    let pi = std::f32::consts::PI;
+    let dir_of = |x: u32, y: u32| {
+        let theta = pi * (y as f32 + 0.5) / height as f32;
+        let phi = 2.0 * pi * (x as f32 + 0.5) / width as f32;
+        [theta.sin() * phi.cos(), theta.cos(), theta.sin() * phi.sin()]
+    };
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let luminance = |x: u32, y: u32| {
+        let i = ((y * width + x) * 3) as usize;
+        0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2]
+    };
+
+    let sky_rows = height / 2;
+    let mut sky: Vec<f32> = Vec::with_capacity((sky_rows * width) as usize);
+    let (mut peak, mut peak_xy) = (0.0f32, (0, 0));
+    for y in 0..sky_rows {
+        for x in 0..width {
+            let l = luminance(x, y);
+            sky.push(l);
+            if l > peak {
+                peak = l;
+                peak_xy = (x, y);
+            }
+        }
+    }
+    let mid = sky.len() / 2;
+    let median = *sky.select_nth_unstable_by(mid, |a, b| a.total_cmp(b)).1;
+    let peak_ratio = peak / median.max(1e-6);
+    if peak_ratio < SUN_MIN_PEAK_RATIO {
+        log::info!("HDR sun: peak/median ratio {:.0} - too diffuse, keeping the manual sun", peak_ratio);
+        return None;
+    }
+
+    // Core pixels (around the peak, far above the sky) and the ring around them
+    let peak_dir = dir_of(peak_xy.0, peak_xy.1);
+    let cos_core = SUN_CORE_RADIUS_DEG.to_radians().cos();
+    let cos_ring = SUN_RING_RADIUS_DEG.to_radians().cos();
+    let core_level = SUN_CORE_RATIO * median;
+    let d_theta = pi / height as f32;
+    let d_phi = 2.0 * pi / width as f32;
+    let mut core: Vec<usize> = Vec::new();
+    let mut centroid = [0.0f32; 3];
+    let mut ring_sum = [0.0f64; 3];
+    let mut ring_weight = 0.0f64;
+    for y in 0..sky_rows {
+        let sin_theta = (pi * (y as f32 + 0.5) / height as f32).sin();
+        for x in 0..width {
+            let d = dir_of(x, y);
+            let c = dot(d, peak_dir);
+            if c < cos_ring {
+                continue;
+            }
+            let i = ((y * width + x) * 3) as usize;
+            let l = luminance(x, y);
+            if c >= cos_core && l > core_level {
+                core.push(i);
+                // Solid-angle weight of an equirect pixel goes as sin(theta)
+                let w = l * sin_theta;
+                for k in 0..3 {
+                    centroid[k] += w * d[k];
+                }
+            } else if c < cos_core {
+                for k in 0..3 {
+                    ring_sum[k] += pixels[i + k] as f64 * sin_theta as f64;
+                }
+                ring_weight += sin_theta as f64;
+            }
+        }
+    }
+    let len = dot(centroid, centroid).sqrt();
+    let direction = if len > 0.0 { centroid.map(|v| v / len) } else { peak_dir };
+    let ring = ring_sum.map(|v| (v / ring_weight.max(1e-9)) as f32);
+
+    // Irradiance the core delivers on a plane facing the sun, and a sky-only
+    // copy of the map with the core repainted by the surrounding ring
+    let mut irradiance = [0.0f64; 3];
+    let mut sky_pixels = pixels.to_vec();
+    for &i in &core {
+        let px = i / 3;
+        let (x, y) = ((px as u32) % width, (px as u32) / width);
+        let theta = pi * (y as f32 + 0.5) / height as f32;
+        let d_omega = (theta.sin() * d_theta * d_phi) as f64;
+        let cos_n = dot(dir_of(x, y), direction).max(0.0) as f64;
+        for k in 0..3 {
+            irradiance[k] += (pixels[i + k] - ring[k]).max(0.0) as f64 * cos_n * d_omega;
+            sky_pixels[i + k] = ring[k];
+        }
+    }
+    let irradiance = irradiance.map(|v| v as f32);
+    let sky_sh = compute_sh_irradiance(&sky_pixels, width, height);
+
+    log::info!(
+        "HDR sun: peak/median {:.0}, {} core px, direction [{:.3}, {:.3}, {:.3}] (elevation {:.1} deg), irradiance [{:.2}, {:.2}, {:.2}]",
+        peak_ratio,
+        core.len(),
+        direction[0],
+        direction[1],
+        direction[2],
+        direction[1].asin().to_degrees(),
+        irradiance[0],
+        irradiance[1],
+        irradiance[2],
+    );
+    Some(SunEstimate { direction, irradiance, sky_sh })
+}
+
 /// Load the embedded environment map (compile-time included)
-/// Returns (texture, view, sampler, sh_coefficients)
+/// Returns (texture, view, sampler, sh_coefficients, sun)
+#[allow(clippy::type_complexity)]
 pub fn load_embedded_environment_map(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     selection: HdrEnvironment,
-) -> Result<(wgpu::Texture, wgpu::TextureView, wgpu::Sampler, ShCoefficients), String> {
+) -> Result<(wgpu::Texture, wgpu::TextureView, wgpu::Sampler, ShCoefficients, Option<SunEstimate>), String> {
     // Include both HDR files at compile time
     let hdr_bytes: &[u8] = match selection {
         HdrEnvironment::Farmland => include_bytes!("../assets/farmland.hdr"),
@@ -143,6 +278,7 @@ pub fn load_embedded_environment_map(
     // Compute SH irradiance from the full-precision f32 data (before f16 conversion)
     let raw_pixels: Vec<f32> = rgb32f.pixels().flat_map(|p| [p.0[0], p.0[1], p.0[2]]).collect();
     let sh_coefficients = compute_sh_irradiance(&raw_pixels, width, height);
+    let sun = estimate_sun(&raw_pixels, width, height);
     log::info!("SH irradiance computed (band 0 RGB: [{:.3}, {:.3}, {:.3}])",
         sh_coefficients.coeffs[0][0], sh_coefficients.coeffs[0][1], sh_coefficients.coeffs[0][2]);
 
@@ -207,5 +343,5 @@ pub fn load_embedded_environment_map(
 
     log::info!("Environment map loaded successfully");
 
-    Ok((texture, view, sampler, sh_coefficients))
+    Ok((texture, view, sampler, sh_coefficients, sun))
 }

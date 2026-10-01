@@ -38,12 +38,7 @@ impl GpuPoolStyle {
         shadow_strength: f32,
         caustic_focus: f32,
     ) -> Self {
-        let sun_on = if lighting.sun_enabled { 1.0 } else { 0.0 };
-        let sun_rgb = [
-            lighting.sun_color[0] * lighting.sun_intensity * sun_on,
-            lighting.sun_color[1] * lighting.sun_intensity * sun_on,
-            lighting.sun_color[2] * lighting.sun_intensity * sun_on,
-        ];
+        let sun_rgb = lighting.sun_rgb();
         Self {
             tile_color: config.tile_color,
             tile_scale: config.tile_scale,
@@ -480,7 +475,10 @@ impl ContainerRenderer {
 }
 
 /// Wall thickness for the opaque pool container
-const WALL_THICKNESS: f32 = 0.06;
+pub const WALL_THICKNESS: f32 = 0.06;
+/// Pool wall height as a fraction of the container height (the pool doesn't
+/// tower over the water)
+pub const POOL_WALL_HEIGHT_FRACTION: f32 = 0.5;
 
 /// Generate thick-walled pool container mesh (open top).
 /// Inner cavity matches the container config dimensions.
@@ -493,7 +491,7 @@ fn generate_container_mesh(config: &ContainerConfig, _kernel_radius: f32) -> (Ve
     let hd = config.depth / 2.0;
     let hh = config.height / 2.0;
     let y0 = -hh;                   // inner floor
-    let y1 = -hh + config.height * 0.5; // wall height (50% of container)
+    let y1 = -hh + config.height * POOL_WALL_HEIGHT_FRACTION; // wall height
     // Outer dimensions (expanded by wall thickness)
     let t = WALL_THICKNESS;
     let ohw = hw + t;

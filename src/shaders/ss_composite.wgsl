@@ -39,6 +39,11 @@ struct WaterParams {
     debug_mode: f32,  // 0=off, 1=raw depth, 2=filtered depth, 3=normals, 4=thickness
     foam_coverage: f32,
     aeration_strength: f32,
+    // 1 = physical water medium (absorption + single scattering), 0 = legacy
+    physical_medium: f32,
+    _pad_m0: f32,
+    _pad_m1: f32,
+    _pad_m2: f32,
 }
 
 struct LightParams {
@@ -149,6 +154,79 @@ fn G_Smith(NdotV: f32, NdotL: f32, roughness: f32) -> f32 {
     let r = roughness + 1.0;
     let k = (r * r) / 8.0;
     return G_SchlickGGX(NdotV, k) * G_SchlickGGX(NdotL, k);
+}
+
+// === Physical water medium (keep in sync: mc_render.wgsl / ss_composite.wgsl) ===
+// Single scattering in a homogeneous medium along the in-water view path:
+//   interior = background * exp(-sigma_t d) + in-scattered sun + sky
+// Absorption is pure water at representative R/G/B wavelengths (Pope & Fry
+// 1997, ~620 / 550 / 460 nm, per metre). Scattering (turbidity) comes from
+// the Clarity slider, its spectral shape from the water color. The body
+// color is not set by hand: it emerges as (sigma_s / sigma_t) x light x phase.
+const WATER_ABSORPTION: vec3<f32> = vec3<f32>(0.30, 0.055, 0.015);
+// Clarity 0 -> 3 /m (murky), 1 -> 0.02 /m (very clear pool), log-mapped;
+// the 0.65 default is ~0.1 /m, a real swimming pool
+const TURBIDITY_MAX: f32 = 3.0;
+const TURBIDITY_MIN: f32 = 0.02;
+// Particle scattering is forward-peaked (Henyey-Greenstein g), with a small
+// isotropic lobe so skylight and the sun still backscatter a little
+const PHASE_G: f32 = 0.85;
+const PHASE_ISOTROPIC: f32 = 0.2;
+// Diffuse skylight under water: transmission through the surface and the
+// mean cosine of the downwelling light field
+const SKY_TRANSMISSION: f32 = 0.93;
+const SKY_MEAN_COSINE: f32 = 0.8;
+
+struct Medium {
+    transmittance: vec3<f32>,
+    inscatter: vec3<f32>,
+}
+
+fn medium_scattering() -> vec3<f32> {
+    let turbidity = TURBIDITY_MAX * pow(TURBIDITY_MIN / TURBIDITY_MAX, water.clarity);
+    let c = water.water_color;
+    return turbidity * c / max(max(c.r, c.g), max(c.b, 1e-4));
+}
+
+fn medium_phase(cos_theta: f32) -> f32 {
+    let g2 = PHASE_G * PHASE_G;
+    let hg = (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * PHASE_G * cos_theta, 1.5));
+    return mix(hg, 1.0 / (4.0 * PI), PHASE_ISOTROPIC);
+}
+
+// `d`: path length in water along the view ray. `view_in`: refracted view
+// direction inside the water (travelling away from the camera). `sun_rgb`:
+// sun irradiance (zero when off or shadowed). `sky_down`: sky irradiance on a
+// horizontal surface. Light enters through the mean (flat) surface and the
+// path is taken to start at the surface (side faces start deeper: their sun
+// in-scatter is overestimated). In-scattered radiance leaves the water
+// scaled by 1/n^2; the exit Fresnel is applied by the caller's mix.
+fn water_medium(d: f32, view_in: vec3<f32>, sun_dir: vec3<f32>, sun_rgb: vec3<f32>, sky_down: vec3<f32>) -> Medium {
+    let sigma_s = medium_scattering();
+    let sigma_t = WATER_ABSORPTION + sigma_s;
+    var m: Medium;
+    m.transmittance = exp(-sigma_t * d);
+    // Depth gained per unit of path (0 for a horizontal ray)
+    let cos_v = max(-view_in.y, 0.0);
+
+    // Skylight: diffuse downwelling field, dimming with depth
+    let k_sky = sigma_t * (1.0 + cos_v / SKY_MEAN_COSINE);
+    let sky_scalar = sky_down * (SKY_TRANSMISSION / SKY_MEAN_COSINE);
+    var inscatter = sigma_s * sky_scalar / (4.0 * PI) * (1.0 - exp(-k_sky * d)) / k_sky;
+
+    // Sun: a refracted beam, dimming along its own (steeper) path with depth
+    if (sun_dir.y > 0.0) {
+        let s_in = refract(-sun_dir, vec3<f32>(0.0, 1.0, 0.0), 1.0 / water.ior);
+        let cos_s = max(-s_in.y, 0.05);
+        let f0 = pow((water.ior - 1.0) / (water.ior + 1.0), 2.0);
+        let entry = 1.0 - (f0 + (1.0 - f0) * pow(1.0 - sun_dir.y, 5.0));
+        // Irradiance across the beam: refraction narrows it by cos_L / cos_s
+        let beam = sun_rgb * entry * sun_dir.y / cos_s;
+        let k_sun = sigma_t * (1.0 + cos_v / cos_s);
+        inscatter += sigma_s * medium_phase(dot(s_in, -view_in)) * beam * (1.0 - exp(-k_sun * d)) / k_sun;
+    }
+    m.inscatter = inscatter / (water.ior * water.ior);
+    return m;
 }
 
 // Sample equirectangular environment map. Same convention as the CPU SH
@@ -321,6 +399,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     let refract_uv = clamp(input.uv + uv_offset, vec2<f32>(0.001), vec2<f32>(0.999));
     var refracted_background = textureSampleLevel(background_tex, tex_sampler, refract_uv, 0.0).rgb;
 
+    let refracted_scene = refracted_background;
     // Apply Beer-Lambert absorption
     refracted_background = refracted_background * transmittance;
 
@@ -388,6 +467,21 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     var lit_interior = interior_with_scatter
         + sun_subsurface * (1.0 - fresnel)
         + ambient_subsurface * (1.0 - fresnel);
+    if (water.physical_medium != 0.0) {
+        // Splatted thickness is already a true path length in metres
+        var sun_rgb = vec3<f32>(0.0);
+        if (light.sun_enabled == 1u) {
+            sun_rgb = light.sun_color * light.sun_intensity;
+        }
+        let medium = water_medium(
+            clamped_thickness,
+            refract(-view_dir, normal, 1.0 / water.ior),
+            normalize(light.sun_direction),
+            sun_rgb,
+            evaluate_sh_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * water.env_intensity,
+        );
+        lit_interior = refracted_scene * medium.transmittance + medium.inscatter;
+    }
 
     // === AERATION (submerged whitewater) ===
     // G channel of the whitewater field: milkiness INSIDE the water, mixed

@@ -1,0 +1,17 @@
+{
+  "_comment": "Staged scene: tiled pool standing on the Farmland HDR's projected ground, lit by the HDR's own sun (low afternoon sun - for strong caustics use pool_puresky.json).",
+  "environment": {
+    "background_mode": "Environment",
+    "hdr_selection": "Farmland",
+    "ground_projection": true
+  },
+  "container": {
+    "style": "OpaquePool"
+  },
+  "camera": {
+    "distance": 3.4,
+    "yaw": 0.5,
+    "pitch": 0.6,
+    "target": [0.0, -0.6, 0.0]
+  }
+}

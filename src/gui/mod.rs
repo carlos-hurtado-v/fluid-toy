@@ -504,13 +504,12 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         egui::Slider::new(&mut state.rendering.ripple_strength, 0.0..=0.06)
                             .text("Ripple Strength")
                     );
-                    ui.add(
-                        egui::Slider::new(&mut state.rendering.water_clarity, 0.0..=1.0)
-                            .text("Clarity")
-                    );
+                    water_medium_controls(ui, state);
                     ui.checkbox(&mut state.rendering.mc_physical_refraction, "Physical Refraction")
                         .on_hover_text(
-                            "Snell refraction at the surface and again on the way out of the                              body: the pool floor shows its true apparent depth and drops and                              crests act as lenses. Off = legacy screen-space offset",
+                            "Snell refraction at the surface and again on the way out of the \
+                             body: the pool floor shows its true apparent depth and drops and \
+                             crests act as lenses. Off = legacy screen-space offset",
                         );
                     ui.add_enabled(
                         !state.rendering.mc_physical_refraction,
@@ -518,8 +517,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                             .text("Refraction (legacy)")
                     );
                     ui.checkbox(&mut state.rendering.ssr_enabled, "Screen-Space Reflections");
-                    ui.label("Deep Water Color:");
-                    egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.deep_water_color);
+                    deep_water_color_control(ui, state);
                 }
 
                 if state.rendering.render_mode == FluidRenderMode::ScreenSpace {
@@ -572,16 +570,12 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         egui::Slider::new(&mut state.rendering.water_roughness, 0.01..=0.5)
                             .text("Roughness")
                     );
-                    ui.add(
-                        egui::Slider::new(&mut state.rendering.water_clarity, 0.0..=1.0)
-                            .text("Clarity")
-                    );
+                    water_medium_controls(ui, state);
                     ui.add(
                         egui::Slider::new(&mut state.rendering.refraction_strength, 0.0..=0.10)
                             .text("Refraction")
                     );
-                    ui.label("Deep Water Color:");
-                    egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.deep_water_color);
+                    deep_water_color_control(ui, state);
 
                     ui.add_space(4.0);
                     ui.separator();
@@ -637,6 +631,18 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                     egui::Slider::new(&mut state.environment.environment_intensity, 0.1..=3.0)
                         .text("Intensity")
                 );
+                ui.checkbox(&mut state.environment.ground_projection, "Ground Projection")
+                    .on_hover_text(
+                        "Project the HDR's ground onto a plane under the container, so \
+                         the scene stands on it (with parallax) instead of floating over \
+                         a ground at infinity",
+                    );
+                ui.add_enabled(
+                    state.environment.ground_projection,
+                    egui::Slider::new(&mut state.environment.ground_capture_height, 0.5..=4.0)
+                        .text("Ground Scale")
+                        .suffix(" m"),
+                ).on_hover_text("Height the HDR was shot from: larger = coarser ground texture");
             });
 
             ui.add_space(8.0);
@@ -648,28 +654,45 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                 if state.lighting.sun_enabled {
                     ui.add_space(8.0);
 
-                    ui.label("Sun Direction:");
-                    ui.add(
-                        egui::Slider::new(&mut state.lighting.sun_direction[0], -1.0..=1.0)
-                            .text("X")
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut state.lighting.sun_direction[1], 0.0..=1.0)
-                            .text("Y (up)")
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut state.lighting.sun_direction[2], -1.0..=1.0)
-                            .text("Z")
-                    );
+                    ui.checkbox(&mut state.lighting.sun_from_environment, "Sun Follows HDR")
+                        .on_hover_text(
+                            "In Environment mode, aim the sun at the HDR map's own sun so \
+                             shadows, caustics and glints match the sky (maps without a \
+                             distinct sun keep the manual direction)",
+                        );
+                    let following_hdr = state.lighting.environment_sun_active().is_some();
+                    ui.label(if following_hdr { "Sun Direction (following HDR):" } else { "Sun Direction:" });
+                    ui.add_enabled_ui(!following_hdr, |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut state.lighting.sun_direction[0], -1.0..=1.0)
+                                .text("X")
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut state.lighting.sun_direction[1], 0.0..=1.0)
+                                .text("Y (up)")
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut state.lighting.sun_direction[2], -1.0..=1.0)
+                                .text("Z")
+                        );
+                    });
 
                     ui.add_space(8.0);
-                    ui.label("Sun Color:");
-                    egui::color_picker::color_edit_button_rgb(ui, &mut state.lighting.sun_color);
+                    ui.add_enabled_ui(!following_hdr, |ui| {
+                        ui.label("Sun Color:");
+                        egui::color_picker::color_edit_button_rgb(ui, &mut state.lighting.sun_color);
 
-                    ui.add(
-                        egui::Slider::new(&mut state.lighting.sun_intensity, 0.0..=5.0)
-                            .text("Intensity")
-                    );
+                        ui.add(
+                            egui::Slider::new(&mut state.lighting.sun_intensity, 0.0..=5.0)
+                                .text("Intensity")
+                        );
+                    });
+                    if let Some(sun) = state.lighting.environment_sun_active() {
+                        ui.label(format!(
+                            "HDR sun irradiance: {:.2} / {:.2} / {:.2}",
+                            sun.irradiance[0], sun.irradiance[1], sun.irradiance[2],
+                        ));
+                    }
 
                 }
 
@@ -937,6 +960,33 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
         });
 
     action
+}
+
+/// Water medium controls shared by the MC and SS sections (one shared state)
+fn water_medium_controls(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.checkbox(&mut state.rendering.physical_water_medium, "Physical Water Medium")
+        .on_hover_text(
+            "Pure-water absorption plus single scattering of sun and sky light \
+             along the true in-water path: the body color comes from the light, \
+             not a hand-set deep color. Off = legacy hand-tuned model",
+        );
+    let clarity_hint = if state.rendering.physical_water_medium {
+        "Turbidity (scattering): 1 = very clear pool, 0 = murky. Particle color sets its tint"
+    } else {
+        "Optical density of the legacy model: 1 = crystal clear, 0 = murky"
+    };
+    ui.add(
+        egui::Slider::new(&mut state.rendering.water_clarity, 0.0..=1.0)
+            .text("Clarity")
+    ).on_hover_text(clarity_hint);
+}
+
+/// Legacy deep color: has no effect under the physical water medium
+fn deep_water_color_control(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.add_enabled_ui(!state.rendering.physical_water_medium, |ui| {
+        ui.label("Deep Water Color (legacy medium):");
+        egui::color_picker::color_edit_button_rgb(ui, &mut state.rendering.deep_water_color);
+    });
 }
 
 /// Actions that the GUI can trigger

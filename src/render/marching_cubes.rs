@@ -103,6 +103,9 @@ pub struct GpuWaterParams {
     pub foam_coverage: f32,
     /// Master scale on entrained-air milkiness (whitewater GUI)
     pub aeration_strength: f32,
+    /// 1 = physical water medium (absorption + single scattering), 0 = legacy
+    pub physical_medium: f32,
+    pub _pad_m: [f32; 3],
 }
 
 impl Default for GpuWaterParams {
@@ -126,6 +129,8 @@ impl Default for GpuWaterParams {
             _pad1: 0.0,
             foam_coverage: 0.8,
             aeration_strength: 0.95,
+            physical_medium: 1.0,
+            _pad_m: [0.0; 3],
         }
     }
 }
@@ -624,14 +629,7 @@ impl MarchingCubesRenderer {
         });
 
         // Environment params buffer (background mode, color, intensity)
-        let env_params = GpuEnvironmentParams {
-            use_env_background: 1,
-            background_r: 0.0,
-            background_g: 0.0,
-            background_b: 0.0,
-            env_intensity: 1.0,
-            _pad: [0.0; 3],
-        };
+        let env_params = GpuEnvironmentParams::default();
         let env_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MC Env Params"),
             contents: bytemuck::bytes_of(&env_params),
@@ -1849,7 +1847,8 @@ impl MarchingCubesRenderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &env_shader,
-                entry_point: Some("fs_main"),
+                // Writes the projected ground's depth (refraction + SSR see it)
+                entry_point: Some("fs_ground"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1889,7 +1888,8 @@ impl MarchingCubesRenderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &env_shader,
-                entry_point: Some("fs_main"),
+                // Writes the projected ground's depth (refraction + SSR see it)
+                entry_point: Some("fs_ground"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -2372,6 +2372,7 @@ impl MarchingCubesRenderer {
         ripple_strength: f32,
         clarity: f32,
         physical_refraction: bool,
+        physical_medium: bool,
         foam_coverage: f32,
         aeration_strength: f32,
     ) {
@@ -2394,6 +2395,8 @@ impl MarchingCubesRenderer {
             _pad1: if physical_refraction { 1.0 } else { 0.0 },
             foam_coverage,
             aeration_strength,
+            physical_medium: if physical_medium { 1.0 } else { 0.0 },
+            _pad_m: [0.0; 3],
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
     }

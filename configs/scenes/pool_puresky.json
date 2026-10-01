@@ -1,0 +1,17 @@
+{
+  "_comment": "Staged scene: tiled pool under the PureSky HDR's high sun (61 deg) - strongest caustics. The map has no photographed ground, so the projected floor is plain dark blue.",
+  "environment": {
+    "background_mode": "Environment",
+    "hdr_selection": "PureSky",
+    "ground_projection": true
+  },
+  "container": {
+    "style": "OpaquePool"
+  },
+  "camera": {
+    "distance": 3.4,
+    "yaw": 0.5,
+    "pitch": 0.6,
+    "target": [0.0, -0.6, 0.0]
+  }
+}

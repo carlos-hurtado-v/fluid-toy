@@ -1,0 +1,17 @@
+{
+  "_comment": "Staged scene: wireframe (glass) tank resting on the Farmland HDR's projected ground; refraction shows the field under the water.",
+  "environment": {
+    "background_mode": "Environment",
+    "hdr_selection": "Farmland",
+    "ground_projection": true
+  },
+  "container": {
+    "style": "Wireframe"
+  },
+  "camera": {
+    "distance": 3.2,
+    "yaw": 0.5,
+    "pitch": 0.35,
+    "target": [0.0, -0.6, 0.0]
+  }
+}

@@ -380,14 +380,7 @@ impl ScreenSpaceFluidRenderer {
 
         let env_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SS Env Params"),
-            contents: bytemuck::bytes_of(&crate::state::GpuEnvironmentParams {
-                use_env_background: 1,
-                background_r: 0.02,
-                background_g: 0.02,
-                background_b: 0.05,
-                env_intensity: 1.0,
-                _pad: [0.0; 3],
-            }),
+            contents: bytemuck::bytes_of(&crate::state::GpuEnvironmentParams::default()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -1016,7 +1009,8 @@ impl ScreenSpaceFluidRenderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &env_shader,
-                entry_point: Some("fs_main"),
+                // Writes the projected ground's depth (refraction sees it)
+                entry_point: Some("fs_ground"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: None,
