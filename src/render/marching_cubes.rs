@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+use super::calm_smoothing::CalmSmoothing;
 use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
 use super::ContainerRenderer;
 use super::RigidBodyRenderer;
@@ -95,7 +96,8 @@ pub struct GpuWaterParams {
     pub deep_color_b: f32,
     pub ripple_strength: f32,
     pub clarity: f32,
-    /// SS path reuses this slot as the debug-view index
+    /// Mode slot: the SS path stores its debug-view index here, the MC path
+    /// its physical-refraction flag (1 = Snell two-interface, 0 = legacy offset)
     pub _pad1: f32,
     /// Master scale on surface foam coverage response (whitewater GUI)
     pub foam_coverage: f32,
@@ -293,6 +295,10 @@ pub struct MarchingCubesRenderer {
     back_depth_texture: wgpu::Texture,
     back_depth_view: wgpu::TextureView,
     back_depth_sampler: wgpu::Sampler,
+    // Back face normals (outward, w = 1 where present): the exit interface
+    // for two-interface refraction, written alongside back_depth
+    back_normal_texture: wgpu::Texture,
+    back_normal_view: wgpu::TextureView,
     // Background texture for screen-space refraction
     background_texture: wgpu::Texture,
     background_view: wgpu::TextureView,
@@ -332,6 +338,8 @@ pub struct MarchingCubesRenderer {
     blur_params_buffers: [wgpu::Buffer; 3], // X, Y, Z directions
     // blur_bind_groups[dir][0] = a->b, blur_bind_groups[dir][1] = b->a
     blur_bind_groups: [[wgpu::BindGroup; 2]; 3],
+    // Bulk-gated smoothing of calm water (half-res helper fields + combine)
+    calm: CalmSmoothing,
 
     // Bind groups
     _density_bind_group: wgpu::BindGroup,
@@ -450,6 +458,7 @@ impl MarchingCubesRenderer {
             view_formats: &[],
         });
         let density_view_b = density_texture_b.create_view(&wgpu::TextureViewDescriptor::default());
+        let calm = CalmSmoothing::new(device, grid_size, &density_view, &density_view_b);
 
         // Create MSAA textures if sample_count > 1
         let (msaa_texture, msaa_view) = if sample_count > 1 {
@@ -474,6 +483,7 @@ impl MarchingCubesRenderer {
 
         // Create back-face depth texture for thickness calculation (samplable, always single-sampled)
         let (back_depth_texture, back_depth_view) = create_samplable_depth_texture(device, width, height);
+        let (back_normal_texture, back_normal_view) = create_normal_texture(device, width, height);
         let back_depth_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("MC Back Depth Sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -1323,6 +1333,28 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Back face normals (refraction exit interface)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Background depth (what the refracted ray lands on)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1380,9 +1412,10 @@ impl MarchingCubesRenderer {
         let back_face_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("MC Back Face BGL"),
             entries: &[
+                // Camera: fragment too, to orient back-face normals away from the eye
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -1425,14 +1458,19 @@ impl MarchingCubesRenderer {
             layout: Some(&back_face_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &back_depth_shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some("vs_normal"),
                 buffers: &[],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &back_depth_shader,
-                entry_point: Some("fs_main"),
-                targets: &[],  // Depth only, no color output
+                entry_point: Some("fs_back_normal"),
+                // Back-face normals for the refraction exit interface
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -1574,6 +1612,14 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 12,
                     resource: wgpu::BindingResource::TextureView(&foam_density_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(&back_normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(&background_depth_view),
                 },
             ],
         });
@@ -1960,6 +2006,8 @@ impl MarchingCubesRenderer {
             back_depth_texture,
             back_depth_view,
             back_depth_sampler,
+            back_normal_texture,
+            back_normal_view,
             background_texture,
             background_view,
             foam_density_texture,
@@ -1988,6 +2036,7 @@ impl MarchingCubesRenderer {
             blur_pipeline,
             blur_params_buffers,
             blur_bind_groups,
+            calm,
             _density_bind_group: density_bind_group,
             generate_bind_group,
             generate_bind_group_b,
@@ -2096,11 +2145,16 @@ impl MarchingCubesRenderer {
         queue.write_buffer(&self.sh_coefficients_buffer, 0, bytemuck::bytes_of(coeffs));
     }
 
-    pub fn update_params(&self, queue: &wgpu::Queue, kernel_radius: f32, iso_value: f32, num_particles: u32, blur_radius: u32) {
+    /// Voxel edge length: the grid's largest extent over its resolution
+    fn cell_size(&self) -> f32 {
         let extent_x = self.grid_max[0] - self.grid_min[0];
         let extent_y = self.grid_max[1] - self.grid_min[1];
         let extent_z = self.grid_max[2] - self.grid_min[2];
-        let cell_size = extent_x.max(extent_y).max(extent_z) / self.grid_size as f32;
+        extent_x.max(extent_y).max(extent_z) / self.grid_size as f32
+    }
+
+    pub fn update_params(&self, queue: &wgpu::Queue, kernel_radius: f32, iso_value: f32, num_particles: u32, blur_radius: u32) {
+        let cell_size = self.cell_size();
         let params = GpuGridParams {
             grid_min: self.grid_min,
             grid_size: self.grid_size,
@@ -2126,6 +2180,11 @@ impl MarchingCubesRenderer {
             };
             queue.write_buffer(buffer, 0, bytemuck::bytes_of(&blur_params));
         }
+    }
+
+    /// Calm-surface smoothing strength (0 = off). `kernel_radius` is the sim h.
+    pub fn update_calm_smoothing(&self, queue: &wgpu::Queue, strength: f32, kernel_radius: f32) {
+        self.calm.update(queue, strength, kernel_radius, self.cell_size());
     }
 
     /// Update anisotropic kernel parameters (Yu & Turk).
@@ -2269,6 +2328,8 @@ impl MarchingCubesRenderer {
             ]
         });
 
+        self.calm = CalmSmoothing::new(device, new_grid_size, &density_view, &density_view_b);
+
         // Store new textures and views (old ones are dropped automatically)
         self._density_texture = density_texture;
         self.density_view = density_view;
@@ -2310,6 +2371,7 @@ impl MarchingCubesRenderer {
         deep_color: &[f32; 3],
         ripple_strength: f32,
         clarity: f32,
+        physical_refraction: bool,
         foam_coverage: f32,
         aeration_strength: f32,
     ) {
@@ -2329,7 +2391,7 @@ impl MarchingCubesRenderer {
             deep_color_b: deep_color[2],
             ripple_strength,
             clarity,
-            _pad1: 0.0,
+            _pad1: if physical_refraction { 1.0 } else { 0.0 },
             foam_coverage,
             aeration_strength,
         };
@@ -2467,6 +2529,7 @@ impl MarchingCubesRenderer {
         blur_radius: u32,
         num_particles: u32,
         aniso_enabled: bool,
+        calm_smoothing: f32,
     ) {
         // Reset counter
         encoder.clear_buffer(&self.counter_buffer, 0, None);
@@ -2522,6 +2585,13 @@ impl MarchingCubesRenderer {
             pass.dispatch_workgroups(workgroups, workgroups, workgroups);
         }
 
+        // Calm-surface smoothing helper fields, from the raw field in A
+        // (before the base blur ping-pongs through it)
+        let calm = calm_smoothing > 0.0;
+        if calm {
+            self.calm.encode_helpers(encoder);
+        }
+
         // Pass 1.5: Blur density field (3 separable passes: X, Y, Z)
         // After blur: result is in texture B (odd number of passes: a->b, b->a, a->b)
         let result_in_b = if blur_radius > 0 {
@@ -2541,6 +2611,12 @@ impl MarchingCubesRenderer {
             true // result ends up in texture B
         } else {
             false // no blur, result is in texture A
+        };
+        // Pass 1.6: blend calm bulk water toward the wide half-res field
+        let result_in_b = if calm {
+            self.calm.encode_combine(encoder, result_in_b)
+        } else {
+            result_in_b
         };
 
         // Pass 2: Generate triangles (read from whichever texture has the result)
@@ -2709,10 +2785,19 @@ impl MarchingCubesRenderer {
         }
 
         // Pass 1: Render back faces to back_depth_texture (for thickness calculation)
+        // and their normals (refraction exit interface; w = 0 where no back face)
         {
             let mut back_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MC Back Face Pass"),
-                color_attachments: &[],  // Depth only
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.back_normal_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.back_depth_view,
                     depth_ops: Some(wgpu::Operations {
@@ -2888,6 +2973,9 @@ impl MarchingCubesRenderer {
         let (back_depth_texture, back_depth_view) = create_samplable_depth_texture(device, width, height);
         self.back_depth_texture = back_depth_texture;
         self.back_depth_view = back_depth_view;
+        let (back_normal_texture, back_normal_view) = create_normal_texture(device, width, height);
+        self.back_normal_texture = back_normal_texture;
+        self.back_normal_view = back_normal_view;
 
         // Recreate background depth texture (always single-sampled, samplable for SSR)
         let (background_depth_texture, background_depth_view) = create_samplable_depth_texture(device, width, height);
@@ -2981,7 +3069,13 @@ impl MarchingCubesRenderer {
         });
 
         // Recreate render bind group with new textures
-        self.render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        self.render_bind_group = self.create_render_bind_group(device, env_view, env_sampler);
+    }
+
+    /// Water render bind group over the current size-dependent views (resize)
+    /// and environment texture (HDR switch)
+    fn create_render_bind_group(&self, device: &wgpu::Device, env_view: &wgpu::TextureView, env_sampler: &wgpu::Sampler) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MC Render BG"),
             layout: &self.render_bind_group_layout,
             entries: &[
@@ -3037,8 +3131,16 @@ impl MarchingCubesRenderer {
                     binding: 12,
                     resource: wgpu::BindingResource::TextureView(&self.foam_density_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(&self.back_normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(&self.background_depth_view),
+                },
             ],
-        });
+        })
     }
 
     /// Rebuild bind groups that reference environment texture (for HDR switching)
@@ -3069,63 +3171,6 @@ impl MarchingCubesRenderer {
         });
 
         // Rebuild render_bind_group (includes env texture)
-        self.render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Render BG"),
-            layout: &self.render_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.water_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.vertex_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(env_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(env_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&self.back_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(&self.back_depth_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&self.background_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: self.light_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: self.sh_coefficients_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: wgpu::BindingResource::TextureView(&self.ssr_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: self.container_geom_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: wgpu::BindingResource::TextureView(&self.foam_density_view),
-                },
-            ],
-        });
+        self.render_bind_group = self.create_render_bind_group(device, env_view, env_sampler);
     }
 }

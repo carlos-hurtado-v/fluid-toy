@@ -250,15 +250,26 @@ pub struct RenderConfig {
     /// (eigenvalue stretch + center smoothing).
     pub mc_anisotropy_strength: f32,
     /// Refraction strength - how much the background distorts through water
+    /// (SS renderer, and the MC renderer's legacy path)
     pub refraction_strength: f32,
+    /// MC: physically based refraction (Snell at the front surface, again at
+    /// the back face; rays land on the floor/walls via the depth buffer).
+    /// Off = legacy screen-space UV offset scaled by `refraction_strength`.
+    pub mc_physical_refraction: bool,
     /// Deep water color - what you see looking into deep water
     pub deep_water_color: [f32; 3],
     /// Surface smoothing - blur radius for MC density field in voxels (0 = off).
     /// Low-pass on the density texture: smooths the bulk surface but erodes thin
     /// features (sheets/droplets) whose field width is comparable to the window.
-    /// With anisotropic kernels on, 0-1 is plenty; higher values trade splash
-    /// detail for roundness.
+    /// Default 1: keeps splash droplets and sheets. Still water's particle-scale
+    /// lumps ("orbeez") are handled by `mc_calm_smoothing` instead; raising this
+    /// to 3 calms them only partly and erases most droplets (A/B'd 2026-10-01).
     pub mc_blur_radius: u32,
+    /// Calm-surface smoothing strength (0 = off, 1 = full): bulk-gated wide
+    /// low-pass of the MC density field. Flattens the particle-scale lumps on
+    /// still water where it is thick, leaving splash sheets and droplets to
+    /// `mc_blur_radius` alone.
+    pub mc_calm_smoothing: f32,
     /// Water surface roughness for PBR specular (0.01 = mirror, 0.5 = rough)
     pub water_roughness: f32,
     /// Micro-ripple normal perturbation strength (0 = glass-smooth, 1 = choppy)
@@ -304,8 +315,10 @@ impl Default for RenderConfig {
             mc_anisotropy: true,
             mc_anisotropy_strength: 1.0,
             refraction_strength: 0.045,
+            mc_physical_refraction: true,
             deep_water_color: [0.005, 0.03, 0.08],
             mc_blur_radius: 1,
+            mc_calm_smoothing: 1.0,
             water_roughness: 0.1,
             ripple_strength: 0.011,
             water_clarity: 0.65,

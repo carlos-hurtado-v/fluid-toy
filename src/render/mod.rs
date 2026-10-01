@@ -1,5 +1,6 @@
 //! Rendering module
 
+pub mod calm_smoothing;
 pub mod camera;
 pub mod caustics;
 pub mod container_renderer;

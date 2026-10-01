@@ -55,12 +55,15 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-// Sample equirectangular environment map
+// Sample equirectangular environment map. Same convention as the CPU SH
+// projection (compute_sh_irradiance in environment.rs): row 0 = +Y, and
+// u = phi / 2pi for dir = (sin t cos phi, cos t, sin t sin phi). (The old
+// mapping, v = 1 - t/pi with u offset by pi, sampled the antipode -dir.)
 fn sample_environment(dir: vec3<f32>) -> vec3<f32> {
     let phi = atan2(dir.z, dir.x);
     let theta = acos(clamp(dir.y, -1.0, 1.0));
-    let u = (phi + PI) / (2.0 * PI);
-    let v = 1.0 - theta / PI;  // Flip V to match screen-space shader
+    let u = fract(phi / (2.0 * PI) + 1.0);
+    let v = theta / PI;
     return textureSample(env_tex, env_sampler, vec2<f32>(u, v)).rgb;
 }
 
@@ -71,8 +74,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(env_params.background_r, env_params.background_g, env_params.background_b, 1.0);
     }
 
-    // Compute world-space ray direction using inverse matrices (same as screen-space shader)
-    let ndc = vec2<f32>(input.uv.x * 2.0 - 1.0, 1.0 - 2.0 * input.uv.y);
+    // Compute world-space ray direction using inverse matrices. uv comes from
+    // the fullscreen triangle's clip xy, so it is already y-up: no flip.
+    let ndc = input.uv * 2.0 - 1.0;
     let view_ray = normalize((camera.inv_projection * vec4<f32>(ndc, 1.0, 1.0)).xyz);
     let world_ray = normalize((camera.inv_view * vec4<f32>(view_ray, 0.0)).xyz);
 

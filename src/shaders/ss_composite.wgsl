@@ -151,12 +151,15 @@ fn G_Smith(NdotV: f32, NdotL: f32, roughness: f32) -> f32 {
     return G_SchlickGGX(NdotV, k) * G_SchlickGGX(NdotL, k);
 }
 
-// Sample equirectangular environment map
+// Sample equirectangular environment map. Same convention as the CPU SH
+// projection (compute_sh_irradiance in environment.rs): row 0 = +Y, and
+// u = phi / 2pi for dir = (sin t cos phi, cos t, sin t sin phi). (The old
+// mapping, v = 1 - t/pi with u offset by pi, sampled the antipode -dir.)
 fn sample_environment(dir: vec3<f32>) -> vec3<f32> {
     let phi = atan2(dir.z, dir.x);
     let theta = acos(clamp(dir.y, -1.0, 1.0));
-    let u = (phi + PI) / (2.0 * PI);
-    let v = 1.0 - theta / PI;
+    let u = fract(phi / (2.0 * PI) + 1.0);
+    let v = theta / PI;
     return textureSample(env_tex, tex_sampler, vec2<f32>(u, v)).rgb;
 }
 

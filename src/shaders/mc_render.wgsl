@@ -30,7 +30,8 @@ struct WaterParams {
     deep_color_b: f32,
     ripple_strength: f32,
     clarity: f32,
-    _pad1: f32,
+    // 1 = physical (Snell, two-interface) refraction, 0 = legacy UV offset
+    physical_refraction: f32,
     foam_coverage: f32,
     aeration_strength: f32,
 }
@@ -61,6 +62,11 @@ struct Vertex {
 @group(0) @binding(9) var<uniform> sh_coeffs: array<vec4<f32>, 9>;
 @group(0) @binding(10) var ssr_tex: texture_2d<f32>;
 @group(0) @binding(12) var foam_density_tex: texture_2d<f32>;
+// Exit interface for refraction: outward normal of the nearest back face (w = 1
+// where one exists), written by the back-face pass alongside back_depth_tex
+@group(0) @binding(13) var back_normal_tex: texture_2d<f32>;
+// Depth of everything behind the water (backdrop, container, bodies)
+@group(0) @binding(14) var background_depth_tex: texture_depth_2d;
 
 @group(0) @binding(11) var<uniform> container: ContainerGeometry;
 
@@ -115,13 +121,18 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-// Sample equirectangular environment map
+// Sample equirectangular environment map. Same convention as the CPU SH
+// projection (compute_sh_irradiance in environment.rs): row 0 = +Y, and
+// u = phi / 2pi for dir = (sin t cos phi, cos t, sin t sin phi). (The old
+// mapping, v = 1 - t/pi with u offset by pi, sampled the antipode -dir.)
 fn sample_environment(dir: vec3<f32>) -> vec3<f32> {
     let phi = atan2(dir.z, dir.x);
     let theta = acos(clamp(dir.y, -1.0, 1.0));
-    let u = (phi + PI) / (2.0 * PI);
-    let v = 1.0 - theta / PI;
-    return textureSample(env_tex, env_sampler, vec2<f32>(u, v)).rgb;
+    let u = fract(phi / (2.0 * PI) + 1.0);
+    let v = theta / PI;
+    // Explicit LOD 0 (the map has a single mip) so refraction can call this
+    // from per-pixel branches
+    return textureSampleLevel(env_tex, env_sampler, vec2<f32>(u, v), 0.0).rgb;
 }
 
 // Evaluate order-2 spherical harmonics irradiance
@@ -145,6 +156,142 @@ fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
 // Linearize depth from depth buffer (reverse-Z or standard)
 fn linearize_depth(d: f32, near: f32, far: f32) -> f32 {
     return near * far / (far - d * (far - near));
+}
+
+// === Physical screen-space refraction ===
+// Raw depth at or past this is the environment backdrop (drawn at 0.9999) or
+// nothing at all: whatever lies behind is infinitely far.
+const BACKDROP_DEPTH: f32 = 0.9998;
+
+fn texel_at(uv: vec2<f32>, dims: vec2<u32>) -> vec2<i32> {
+    return clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), vec2<i32>(dims) - 1);
+}
+
+fn background_depth_at(uv: vec2<f32>) -> f32 {
+    return textureLoad(background_depth_tex, texel_at(uv, textureDimensions(background_depth_tex)), 0);
+}
+
+// Screen uv (y down) where a world point lands
+fn world_to_screen(p: vec3<f32>) -> vec2<f32> {
+    let clip = camera.projection * camera.view * vec4<f32>(p, 1.0);
+    let ndc = clip.xy / max(clip.w, 1e-4);
+    return vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+}
+
+// World point seen at screen uv with raw hardware depth. Goes through the real
+// inverse matrices, so it holds whatever depth convention the projection uses.
+fn screen_to_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    let view = camera.inv_projection * ndc;
+    return (camera.inv_view * vec4<f32>(view.xyz / view.w, 1.0)).xyz;
+}
+
+// Background at a refracted uv. If what sits there is in front of the water
+// (e.g. the pool's near wall), the refracted ray can't have reached it — keep
+// the straight-through sample instead of leaking the occluder into the water.
+fn background_at(uv: vec2<f32>, front_depth_raw: f32, straight: vec3<f32>) -> vec3<f32> {
+    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))
+        || background_depth_at(uv) < front_depth_raw) {
+        return straight;
+    }
+    return textureSampleLevel(background_tex, env_sampler, uv, 0.0).rgb;
+}
+
+// Radiance from infinitely far along a world direction: the background texture
+// where that direction lands on screen (matches the displayed backdrop exactly),
+// else the backdrop evaluated directly.
+fn backdrop_along(dir: vec3<f32>) -> vec3<f32> {
+    let clip = camera.projection * camera.view * vec4<f32>(dir, 0.0);
+    if (clip.w > 1e-4) {
+        let ndc = clip.xy / clip.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if (all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0))) {
+            return textureSampleLevel(background_tex, env_sampler, uv, 0.0).rgb;
+        }
+    }
+    if (water.use_env_background == 0u) {
+        return vec3<f32>(water.background_r, water.background_g, water.background_b);
+    }
+    // Same clamp as the backdrop pass (mc_environment.wgsl)
+    return clamp(sample_environment(dir) * water.env_intensity, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// March a ray from `origin` (in or leaving the water) onto the background
+// surface first seen at `uv0`. Fixed-point on the depth buffer: step the
+// distance to the surface, re-read the surface under the landing point, repeat.
+// Converges in a couple of steps on floors and walls.
+fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0: f32) -> vec2<f32> {
+    var d = distance(origin, screen_to_world(uv0, depth0));
+    var uv = uv0;
+    for (var k = 0; k < 3; k++) {
+        uv = world_to_screen(origin + dir * d);
+        let depth = background_depth_at(uv);
+        if (depth >= BACKDROP_DEPTH) {
+            break;  // walked off the surface's edge
+        }
+        d = distance(origin, screen_to_world(uv, depth));
+    }
+    return uv;
+}
+
+// Two-interface image-space refraction (after Wyman 2005). Snell-refract the
+// view ray at the front surface. If an opaque surface (floor, wall, body) sits
+// inside the water behind this pixel, the ray ends on it — this is the
+// apparent-depth shift that makes a pool look shallower than it is. Otherwise
+// the ray crosses the body (front-to-back distance), refracts out through the
+// back-face normal where it lands, and we look up what the exit ray reaches.
+// Curved bodies (drops, crests) bend the exit ray: they act as lenses.
+// Returns the radiance arriving from behind, before absorption.
+fn refract_scene(
+    p: vec3<f32>,
+    n: vec3<f32>,
+    view_dir: vec3<f32>,
+    screen_uv: vec2<f32>,
+    front_depth_raw: f32,
+    back_depth_raw: f32,
+) -> vec3<f32> {
+    let straight = textureSampleLevel(background_tex, env_sampler, screen_uv, 0.0).rgb;
+    // n faces the camera; entering the denser medium never totally reflects
+    let t1 = refract(-view_dir, n, 1.0 / water.ior);
+    let bg_depth = background_depth_at(screen_uv);
+
+    // Opaque surface inside the water: the ray ends on it
+    if (bg_depth < BACKDROP_DEPTH && bg_depth <= back_depth_raw) {
+        return background_at(march_to_background(p, t1, screen_uv, bg_depth), front_depth_raw, straight);
+    }
+    // No back face behind this pixel (mesh clipped open): treat the body as
+    // deep and let the refracted ray run out to the backdrop
+    if (back_depth_raw >= 1.0) {
+        return backdrop_along(t1);
+    }
+
+    // Cross the body to the back face, refract out through its normal there
+    let p_exit = p + t1 * distance(p, screen_to_world(screen_uv, back_depth_raw));
+    let exit_uv = world_to_screen(p_exit);
+    var back_n = textureLoad(back_normal_tex, texel_at(exit_uv, textureDimensions(back_normal_tex)), 0);
+    if (back_n.w < 0.5) {
+        // Landed outside the body's silhouette: use the exit face behind this pixel
+        back_n = textureLoad(back_normal_tex, texel_at(screen_uv, textureDimensions(back_normal_tex)), 0);
+    }
+    let n_exit = normalize(back_n.xyz);
+    let t2 = refract(t1, -n_exit, water.ior);
+    if (dot(t2, t2) < 0.5) {
+        // Total internal reflection (typically a flat ray that came in through a
+        // side face meeting the bottom past the 48.6 deg critical angle). In a
+        // slab the ray then zig-zags between the parallel top and bottom like a
+        // light guide and leaves through the far side close to its original
+        // heading, so straight-through is the right picture — following the
+        // single mirrored bounce instead paints the sky over the whole face.
+        return straight;
+    }
+
+    // What the exit ray reaches: the surface behind the exit point, if any,
+    // else the backdrop far along it
+    let bg_exit_depth = background_depth_at(exit_uv);
+    if (bg_exit_depth < BACKDROP_DEPTH) {
+        return background_at(march_to_background(p_exit, t2, exit_uv, bg_exit_depth), front_depth_raw, straight);
+    }
+    return backdrop_along(t2);
 }
 
 // === Foam field compositing ===
@@ -296,8 +443,9 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         var env_reflection = mix(sharp_env, diffuse_env, roughness_sq);
 
         // Fade env reflection when reflect direction points below horizon.
-        // The env map only contains sky — it can't represent nearby scene geometry
-        // (walls, floor). Downward reflections would show incorrect sky colors.
+        // The env map is a distant panorama — it can't represent nearby scene
+        // geometry (walls, floor, other water). Downward reflections would show
+        // the far-off ground of the HDRI instead.
         // SSR handles these directions; without SSR, the faded share is filled
         // with the water's own body color once it's known (below).
         let horizon_fade = smoothstep(-0.15, 0.1, reflect_dir.y);
@@ -314,19 +462,25 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     reflection_color = mix(reflection_color, ssr_sample.rgb, ssr_confidence);
 
     // === SCREEN-SPACE REFRACTION ===
-    // Use normal deviation from a flat surface — a perfectly flat water surface
-    // should have zero screen-space distortion (you see straight through).
-    // Only waves and ripples create visible refraction distortion.
-    let flat_normal_view = normalize((camera.view * vec4<f32>(0.0, 1.0, 0.0, 0.0)).xyz);
-    let normal_view = normalize((camera.view * vec4<f32>(normal, 0.0)).xyz);
-    let normal_deviation = normal_view - flat_normal_view;
+    var refracted_background: vec3<f32>;
+    if (water.physical_refraction != 0.0) {
+        refracted_background = refract_scene(
+            input.world_position, normal, view_dir, screen_uv, front_depth_raw, back_depth_raw,
+        );
+    } else {
+        // Legacy: offset by the normal's deviation from flat up (a flat surface
+        // shows no shift at all), scaled by the Refraction slider
+        let flat_normal_view = normalize((camera.view * vec4<f32>(0.0, 1.0, 0.0, 0.0)).xyz);
+        let normal_view = normalize((camera.view * vec4<f32>(normal, 0.0)).xyz);
+        let normal_deviation = normal_view - flat_normal_view;
 
-    let refract_strength = water.refraction_strength * (1.0 + thickness * 0.5);
-    let uv_offset = normal_deviation.xy * refract_strength;
+        let refract_strength = water.refraction_strength * (1.0 + thickness * 0.5);
+        let uv_offset = normal_deviation.xy * refract_strength;
 
-    // Sample background with distorted UVs (clamp to avoid sampling outside)
-    let refract_uv = clamp(screen_uv + uv_offset, vec2<f32>(0.001), vec2<f32>(0.999));
-    var refracted_background = textureSample(background_tex, env_sampler, refract_uv).rgb;
+        // Sample background with distorted UVs (clamp to avoid sampling outside)
+        let refract_uv = clamp(screen_uv + uv_offset, vec2<f32>(0.001), vec2<f32>(0.999));
+        refracted_background = textureSampleLevel(background_tex, env_sampler, refract_uv, 0.0).rgb;
+    }
 
     // Apply absorption to refracted light (Beer-Lambert)
     refracted_background = refracted_background * transmittance;

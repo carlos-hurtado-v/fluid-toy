@@ -464,9 +464,18 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         "Post-blur of the density field (radius in voxels).\n\
                          Rounds the bulk surface but erases thin sheets and droplets\n\
                          — every step roughly halves the smallest surviving feature.\n\
-                         With Anisotropic Kernels on, 0-1 is recommended.",
+                         Default 1; Calm Surface Smoothing handles still water.",
                     );
                     state.rendering.mc_blur_radius = blur_val as u32;
+                    ui.add(
+                        egui::Slider::new(&mut state.rendering.mc_calm_smoothing, 0.0..=1.0)
+                            .text("Calm Surface Smoothing")
+                    ).on_hover_text(
+                        "Wide smoothing applied only where the water is thick (bulk\n\
+                         surfaces): flattens the particle-scale lumps on still water\n\
+                         while splash sheets and droplets keep Surface Smoothing alone.\n\
+                         0 = off.",
+                    );
                     ui.add(
                         egui::Slider::new(&mut state.rendering.mc_density_radius_scale, 1.0..=3.0)
                             .text("Density Radius Scale")
@@ -499,9 +508,14 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                         egui::Slider::new(&mut state.rendering.water_clarity, 0.0..=1.0)
                             .text("Clarity")
                     );
-                    ui.add(
+                    ui.checkbox(&mut state.rendering.mc_physical_refraction, "Physical Refraction")
+                        .on_hover_text(
+                            "Snell refraction at the surface and again on the way out of the                              body: the pool floor shows its true apparent depth and drops and                              crests act as lenses. Off = legacy screen-space offset",
+                        );
+                    ui.add_enabled(
+                        !state.rendering.mc_physical_refraction,
                         egui::Slider::new(&mut state.rendering.refraction_strength, 0.0..=0.10)
-                            .text("Refraction")
+                            .text("Refraction (legacy)")
                     );
                     ui.checkbox(&mut state.rendering.ssr_enabled, "Screen-Space Reflections");
                     ui.label("Deep Water Color:");

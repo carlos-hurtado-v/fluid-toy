@@ -1884,6 +1884,7 @@ impl App {
                             &self.state.rendering.deep_water_color,
                             self.state.rendering.ripple_strength,
                             self.state.rendering.water_clarity,
+                            self.state.rendering.mc_physical_refraction,
                             self.state.spray.foam_coverage,
                             self.state.spray.aeration_strength,
                         );
@@ -1932,6 +1933,11 @@ impl App {
                             sph_sim.num_particles(),
                             blur_radius,
                         );
+                        mc_renderer.update_calm_smoothing(
+                            &gpu.queue,
+                            self.state.rendering.mc_calm_smoothing,
+                            self.state.sph.kernel_radius,
+                        );
                         mc_renderer.update_aniso_params(
                             &gpu.queue,
                             self.state.rendering.mc_anisotropy,
@@ -1949,6 +1955,7 @@ impl App {
                             blur_radius,
                             sph_sim.num_particles(),
                             self.state.rendering.mc_anisotropy,
+                            self.state.rendering.mc_calm_smoothing,
                         );
                         // Splat foam into the density field the water shader
                         // composites (cleared even when spray is off so no

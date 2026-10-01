@@ -55,6 +55,26 @@ fn fs_main(in: FragmentInput) {
     }
 }
 
+// === Back face pass with normal output (exit interface for refraction) ===
+
+@fragment
+fn fs_back_normal(in: NormalFragmentInput) -> @location(0) vec4<f32> {
+    if (container.clip_enabled != 0u) {
+        let local = world_to_local(container, in.world_position);
+        if (!is_inside_box(container, local, container.clip_margin)) {
+            discard;
+        }
+    }
+
+    // A back face looks away from the camera, so its outward normal does too;
+    // orienting by that holds even where MC winding is locally inconsistent
+    var n = normalize(in.world_normal);
+    if (dot(n, in.world_position - camera.camera_pos) < 0.0) {
+        n = -n;
+    }
+    return vec4<f32>(n, 1.0);
+}
+
 // === Front face pass with normal output (for SSR) ===
 
 struct NormalVertexOutput {
