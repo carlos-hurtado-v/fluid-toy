@@ -36,7 +36,8 @@ struct WaterParams {
     aeration_strength: f32,
     // 1 = physical water medium (absorption + single scattering), 0 = legacy
     physical_medium: f32,
-    _pad_m0: f32,
+    // Enabled rigid bodies at the front of `rigid_bodies`
+    body_count: u32,
     _pad_m1: f32,
     _pad_m2: f32,
 }
@@ -105,6 +106,23 @@ struct FoamMapParams {
 @group(0) @binding(18) var foam_coords_tex: texture_2d<f32>;
 
 @group(0) @binding(11) var<uniform> container: ContainerGeometry;
+
+// Mirrors GpuRigidBodyRender (rigid_body.wgsl RigidBodyParams, 112 bytes)
+struct RigidBodyParams {
+    position: vec3<f32>,
+    half_extent: f32,
+    color: vec4<f32>,
+    light_dir: vec3<f32>,
+    shape: u32,
+    rot_row0: vec4<f32>,
+    rot_row1: vec4<f32>,
+    rot_row2: vec4<f32>,
+    prop_blades: u32,
+    prop_pitch: f32,
+    _pad0: f32,
+    _pad1: f32,
+}
+@group(0) @binding(19) var<storage, read> rigid_bodies: array<RigidBodyParams>;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -311,6 +329,132 @@ fn depth_smooth(tex: texture_depth_2d, uv: vec2<f32>) -> f32 {
     return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
 }
 
+// === Rigid bodies as exact occluders ===
+// The depth buffer holds only the camera-facing side of a body, so a refracted
+// or mirrored ray that meets a body's far side (seen from the camera) finds
+// nothing there: the body turns into a hollow outline. Spheres and boxes are
+// intersected exactly instead; the hit point's screen position supplies the
+// colour (the visible side, a fair stand-in for the hidden one). Other shapes
+// are left to the depth buffer.
+const SHAPE_CUBE: u32 = 0u;
+const SHAPE_SPHERE: u32 = 1u;
+// Water wets a body, but the MC surface stops about a particle radius short of
+// it. A ray leaving the water this close in front of a body hits the body:
+// refracting into that air film painted ragged fringes around submerged
+// bodies (m)
+const BODY_WET_GAP: f32 = 0.05;
+// How far a ray that has left the water may travel to a body (m)
+const BODY_MAX_REACH: f32 = 50.0;
+
+// Distance along the ray to the nearest enabled sphere or box within
+// max_dist, or -1. Rays starting inside a body ignore it.
+fn ray_body_hit(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> f32 {
+    var best = -1.0;
+    let n = min(water.body_count, 8u);
+    for (var i = 0u; i < n; i++) {
+        let body = rigid_bodies[i];
+        var t = -1.0;
+        if (body.shape == SHAPE_SPHERE) {
+            let oc = origin - body.position;
+            let b = dot(oc, dir);
+            let c = dot(oc, oc) - body.half_extent * body.half_extent;
+            let disc = b * b - c;
+            if (c > 0.0 && disc >= 0.0) {
+                t = -b - sqrt(disc);
+            }
+        } else if (body.shape == SHAPE_CUBE) {
+            // Slab test in body-local space (rotation rows map world -> local)
+            let q = origin - body.position;
+            let ro = vec3<f32>(dot(body.rot_row0.xyz, q), dot(body.rot_row1.xyz, q), dot(body.rot_row2.xyz, q));
+            let rd = vec3<f32>(dot(body.rot_row0.xyz, dir), dot(body.rot_row1.xyz, dir), dot(body.rot_row2.xyz, dir));
+            let he = vec3<f32>(body.half_extent);
+            let safe_rd = select(rd, vec3<f32>(1e-6), abs(rd) < vec3<f32>(1e-6));
+            let inv = vec3<f32>(1.0) / safe_rd;
+            let t1 = (-he - ro) * inv;
+            let t2 = (he - ro) * inv;
+            let t_near = max(max(min(t1.x, t2.x), min(t1.y, t2.y)), min(t1.z, t2.z));
+            let t_far = min(min(max(t1.x, t2.x), max(t1.y, t2.y)), max(t1.z, t2.z));
+            if (t_near > 0.0 && t_near <= t_far) {
+                t = t_near;
+            }
+        }
+        if (t > 0.0 && t <= max_dist && (best < 0.0 || t < best)) {
+            best = t;
+        }
+    }
+    return best;
+}
+
+// Distance from an exactly intersected body within which a depth-buffer
+// surface point is taken to be that body (tessellation + depth precision) (m)
+const BODY_SURFACE_EPS: f32 = 0.02;
+
+// Signed distance from a world point to the nearest body that ray_body_hit
+// handles (negative inside), or a large value if there is none
+fn analytic_body_distance(p: vec3<f32>) -> f32 {
+    var best = 1e6;
+    let n = min(water.body_count, 8u);
+    for (var i = 0u; i < n; i++) {
+        let body = rigid_bodies[i];
+        if (body.shape == SHAPE_SPHERE) {
+            best = min(best, distance(p, body.position) - body.half_extent);
+        } else if (body.shape == SHAPE_CUBE) {
+            let q = p - body.position;
+            let lp = vec3<f32>(dot(body.rot_row0.xyz, q), dot(body.rot_row1.xyz, q), dot(body.rot_row2.xyz, q));
+            let d = abs(lp) - vec3<f32>(body.half_extent);
+            best = min(best, length(max(d, vec3<f32>(0.0))) + min(max(d.x, max(d.y, d.z)), 0.0));
+        }
+    }
+    return best;
+}
+
+// Is this world point on the surface of a body that ray_body_hit handles?
+fn on_analytic_body(p: vec3<f32>) -> bool {
+    return abs(analytic_body_distance(p)) < BODY_SURFACE_EPS;
+}
+
+// Back-face normal at a screen point, bilinear between texel centres over the
+// texels that hold one (w = 1 if any did). Per-texel normals snapped every
+// exit a trace finds to the texel grid, which a reflection that magnifies the
+// surface stretched into stripes.
+fn back_normal_smooth(uv: vec2<f32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(back_normal_tex));
+    let p = uv * vec2<f32>(dims) - 0.5;
+    let f = fract(p);
+    let i0 = clamp(vec2<i32>(floor(p)), vec2<i32>(0), dims - 1);
+    let i1 = clamp(vec2<i32>(floor(p)) + 1, vec2<i32>(0), dims - 1);
+    let n00 = textureLoad(back_normal_tex, i0, 0);
+    let n10 = textureLoad(back_normal_tex, vec2<i32>(i1.x, i0.y), 0);
+    let n01 = textureLoad(back_normal_tex, vec2<i32>(i0.x, i1.y), 0);
+    let n11 = textureLoad(back_normal_tex, i1, 0);
+    let w00 = (1.0 - f.x) * (1.0 - f.y) * step(0.5, n00.w);
+    let w10 = f.x * (1.0 - f.y) * step(0.5, n10.w);
+    let w01 = (1.0 - f.x) * f.y * step(0.5, n01.w);
+    let w11 = f.x * f.y * step(0.5, n11.w);
+    let n = n00.xyz * w00 + n10.xyz * w10 + n01.xyz * w01 + n11.xyz * w11;
+    if (w00 + w10 + w01 + w11 <= 0.0 || dot(n, n) < 1e-8) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(normalize(n), 1.0);
+}
+
+// How close to the depth-buffer surface at its pixel a point must be to count
+// as touching it, relative to its distance from the camera ((1 - raw depth)
+// is ~ 1 / view distance)
+const SURFACE_CONTACT_REL: f32 = 0.05;
+
+// Is screen point q (uv, raw depth) behind the opaque surface seen at its
+// pixel, i.e. has a march reached it? The depth buffer has no thickness, so
+// for a body this would also catch rays passing BEHIND it (as the camera sees
+// it) and land them on its silhouette edge: whole regions of a reflection or
+// refraction then sampled those edge pixels (dithered stripes). Spheres and
+// boxes are intersected exactly instead (ray_body_hit), so their pixels are
+// skipped here. Floors, walls and the ground are solid: behind is a hit.
+fn behind_background(q: vec3<f32>) -> bool {
+    let bg = depth_smooth(background_depth_tex, q.xy);
+    return q.z >= bg && (water.body_count == 0u || !on_analytic_body(screen_to_world(q.xy, bg)));
+}
+
 // World point seen at screen uv with raw hardware depth. Goes through the real
 // inverse matrices, so it holds whatever depth convention the projection uses.
 fn screen_to_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
@@ -330,15 +474,41 @@ fn background_at(uv: vec2<f32>, front_depth_raw: f32, straight: vec3<f32>) -> ve
     return textureSampleLevel(background_tex, env_sampler, uv, 0.0).rgb;
 }
 
+// Distance around the container box that still counts as its walls, rim or
+// contents (pool shell is 6 cm) (m)
+const BACKDROP_OBJECT_MARGIN: f32 = 0.1;
+
+// Does the background image at this uv show the backdrop (sky, or the
+// projected ground) rather than an object at finite distance? A body or the
+// pool walls sitting where a direction vanishes on screen are not what lies
+// infinitely far along that direction: rays leaving the water toward the sky
+// picked up the floating ball there, striped by whichever rays landed on it.
+fn shows_backdrop(uv: vec2<f32>) -> bool {
+    let depth = background_depth_at(uv);
+    if (depth >= BACKDROP_DEPTH) {
+        return true;
+    }
+    let p = screen_to_world(uv, depth);
+    if (water.body_count > 0u && on_analytic_body(p)) {
+        return false;
+    }
+    // In or around the container box, but not the ground plane at (tank) or
+    // below (pool) its floor
+    let l = world_to_local(container, p);
+    let m = BACKDROP_OBJECT_MARGIN;
+    return !(abs(l.x) <= container.half_width + m && abs(l.z) <= container.half_depth + m
+        && l.y > -container.half_height + 0.01 && l.y <= container.half_height + m);
+}
+
 // Radiance from infinitely far along a world direction: the background texture
-// where that direction lands on screen (matches the displayed backdrop exactly),
-// else the backdrop evaluated directly.
+// where that direction lands on screen (matches the displayed backdrop exactly)
+// when the backdrop is what shows there, else the backdrop evaluated directly.
 fn backdrop_along(dir: vec3<f32>) -> vec3<f32> {
     let clip = camera.projection * camera.view * vec4<f32>(dir, 0.0);
     if (clip.w > 1e-4) {
         let ndc = clip.xy / clip.w;
         let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        if (all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0))) {
+        if (all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0)) && shows_backdrop(uv)) {
             return textureSampleLevel(background_tex, env_sampler, uv, 0.0).rgb;
         }
     }
@@ -354,6 +524,8 @@ fn backdrop_along(dir: vec3<f32>) -> vec3<f32> {
 // steps reach several times the straight-line distance to the surface first
 // seen at `uv0`: a refracted ray skimming a floor lands far behind that first
 // guess, which a fixed-point iteration overshoots toward the horizon.
+// Returns xy = screen uv of the surface reached, z = 1 if the ray reached one
+// (0: no crossing, xy = uv0).
 const MARCH_STEPS: i32 = 20;
 const MARCH_REFINE: i32 = 8;
 const MARCH_REACH: f32 = 4.0;
@@ -365,8 +537,13 @@ fn screen_point(p: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(clip.x / w * 0.5 + 0.5, 0.5 - clip.y / w * 0.5, clip.z / w);
 }
 
-fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0: f32) -> vec2<f32> {
-    let reach = MARCH_REACH * distance(origin, screen_to_world(uv0, depth0)) + 0.1;
+fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0: f32) -> vec3<f32> {
+    var reach = MARCH_REACH * distance(origin, screen_to_world(uv0, depth0)) + 0.1;
+    // A body on the way ends the ray exactly where the depth buffer can't see
+    let t_body = ray_body_hit(origin, dir, reach);
+    if (t_body > 0.0) {
+        reach = t_body;
+    }
     var lo = 0.0;
     var hi = -1.0;
     for (var k = 1; k <= MARCH_STEPS; k++) {
@@ -375,30 +552,27 @@ fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0
         if (any(q.xy < vec2<f32>(0.0)) || any(q.xy > vec2<f32>(1.0))) {
             break;  // left the screen
         }
-        if (q.z >= depth_smooth(background_depth_tex, q.xy)) {
+        if (behind_background(q)) {
             hi = s;
             break;
         }
         lo = s;
     }
+    if (hi < 0.0 && t_body > 0.0) {
+        return vec3<f32>(screen_point(origin + dir * t_body).xy, 1.0);
+    }
     if (hi < 0.0) {
-        // No crossing: the ray left the screen, or rose toward the water
-        // surface from below (side faces near the rounded top edge), where it
-        // would reflect back down rather than reach anything far away. The
-        // surface first seen is the safe answer; the furthest point reached
-        // would paint the horizon into the water.
-        return uv0;
+        return vec3<f32>(uv0, 0.0);
     }
     for (var k = 0; k < MARCH_REFINE; k++) {
         let mid = 0.5 * (lo + hi);
-        let q = screen_point(origin + dir * mid);
-        if (q.z >= depth_smooth(background_depth_tex, q.xy)) {
+        if (behind_background(screen_point(origin + dir * mid))) {
             hi = mid;
         } else {
             lo = mid;
         }
     }
-    return screen_point(origin + dir * hi).xy;
+    return vec3<f32>(screen_point(origin + dir * hi).xy, 1.0);
 }
 
 // === Container walls as optical interfaces ===
@@ -467,8 +641,8 @@ fn box_interior_exit(o: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
 }
 
 // What a point inside the water would run into, at screen point q (uv, raw
-// depth): 2 = an opaque surface (floor or ground, a body, pool walls),
-// 1 = it's out of the water, 0 = still in it. In-water is judged against the
+// depth): 2 = an opaque surface (floor or ground, a body, pool walls), 1 = it's
+// out of the water, 0 = still in it. In-water is judged against the
 // nearest back face behind q's pixel, which ends the first stretch of water
 // the camera sees there. With no front depth to check against, that only
 // holds for points on rays heading away from the camera: true of every ray
@@ -476,7 +650,16 @@ fn box_interior_exit(o: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
 // off walls, floor and surface (each keeps the component that leads away).
 // Rays bent by drops and crests can break it.
 fn trace_event(q: vec3<f32>) -> f32 {
-    if (q.z >= depth_smooth(background_depth_tex, q.xy)) {
+    let bg = depth_smooth(background_depth_tex, q.xy);
+    if (q.z >= bg) {
+        // Hidden behind a sphere or box: ray_body_hit owns hits on it, and the
+        // back face at this pixel is the water in front of the body (where the
+        // camera sees the body through it), not the water the sample is in.
+        // Read as "out of the water", rays passing behind a floating body
+        // exited there with that surface's normal and scattered.
+        if (water.body_count > 0u && on_analytic_body(screen_to_world(q.xy, bg))) {
+            return 0.0;
+        }
         return 2.0;
     }
     let back = depth_smooth(back_depth_tex, q.xy);
@@ -554,15 +737,23 @@ struct WaterExit {
 // or not at all because something opaque is in the way.
 fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
     let wall = box_interior_exit(world_to_local(container, origin), world_dir_to_local(container, dir));
-    let ev = trace_in_water(origin, dir, wall.w);
+    let t_body = ray_body_hit(origin, dir, wall.w);
+    let ev = trace_in_water(origin, dir, select(wall.w, t_body, t_body > 0.0));
     var out: WaterExit;
+    // Reached the body with nothing in between, or left the water through the
+    // film just in front of it
+    if (t_body > 0.0 && (ev.kind < 0.5 || (ev.kind < 1.5 && t_body - ev.dist < BODY_WET_GAP))) {
+        out.blocked = true;
+        out.blocked_uv = screen_point(origin + dir * t_body).xy;
+        return out;
+    }
     out.blocked = ev.kind > 1.5;
     out.blocked_uv = ev.uv;
     var crossing = ev.kind > 0.5 && ev.dist < wall.w - (container.clip_margin + WALL_SNAP_TOLERANCE);
     if (crossing) {
-        let back_n = textureLoad(back_normal_tex, texel_at(ev.uv, textureDimensions(back_normal_tex)), 0);
+        let back_n = back_normal_smooth(ev.uv);
         if (back_n.w > 0.5) {
-            out.normal = normalize(back_n.xyz);
+            out.normal = back_n.xyz;
         } else {
             // Crossing on a silhouette edge with no normal written: the free
             // surface is the likely interface
@@ -584,6 +775,19 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
         out.inside = out.point;
         out.normal = local_dir_to_world(container, wall.xyz);
         out.on_wall = true;
+        // A tank standing on something (the projected ground): its floor is in
+        // contact with whatever the depth buffer shows right there, not a
+        // window onto air. Treated as air, grazing rays reflected off it and
+        // zig-zagged between floor and surface until some leaked out to the
+        // sky, painting sky into the side faces.
+        if (!out.blocked && wall.y < -0.5) {
+            let qf = screen_point(out.point);
+            let bgf = depth_smooth(background_depth_tex, qf.xy);
+            if (abs(qf.z - bgf) <= SURFACE_CONTACT_REL * (1.0 - bgf)) {
+                out.blocked = true;
+                out.blocked_uv = qf.xy;
+            }
+        }
     }
     return out;
 }
@@ -594,7 +798,18 @@ fn scene_from(p_out: vec3<f32>, dir: vec3<f32>, front_depth_raw: f32, straight: 
     let uv = screen_point(p_out).xy;
     let depth = background_depth_at(uv);
     if (depth < BACKDROP_DEPTH) {
-        return background_at(march_to_background(p_out, dir, uv, depth), front_depth_raw, straight);
+        // Nothing reached: the ray passes the surface behind the exit point
+        // (e.g. leaves through the free surface toward the sky while a body
+        // sits behind the exit point on screen) and escapes
+        let m = march_to_background(p_out, dir, uv, depth);
+        if (m.z > 0.5) {
+            return background_at(m.xy, front_depth_raw, straight);
+        }
+        return backdrop_along(dir);
+    }
+    let t_body = ray_body_hit(p_out, dir, BODY_MAX_REACH);
+    if (t_body > 0.0) {
+        return background_at(screen_point(p_out + dir * t_body).xy, front_depth_raw, straight);
     }
     return backdrop_along(dir);
 }
@@ -658,7 +873,12 @@ fn refract_scene(
 
     // Opaque surface inside the water: the ray ends on it
     if (bg_depth < BACKDROP_DEPTH && bg_depth <= back_depth_raw) {
-        return background_at(march_to_background(p, t1, screen_uv, bg_depth), front_depth_raw, straight);
+        // No crossing: the ray left the screen, or rose toward the water
+        // surface from below (side faces near the rounded top edge), where it
+        // would reflect back down rather than reach anything far away. The
+        // surface first seen is the safe answer; the furthest point reached
+        // would paint the horizon into the water.
+        return background_at(march_to_background(p, t1, screen_uv, bg_depth).xy, front_depth_raw, straight);
     }
     // No back face behind this pixel (mesh clipped open): treat the body as
     // deep and let the refracted ray run out to the backdrop

@@ -1375,6 +1375,9 @@ impl App {
                     });
                 }
                 rb_renderer.update_bodies(&gpu.queue, &renders, &draws);
+                if let Some(mc_renderer) = &self.mc_renderer {
+                    mc_renderer.update_bodies(&gpu.queue, &renders);
+                }
             }
             if let Some(spray_renderer) = &self.spray_renderer {
                 spray_renderer.update_camera(&gpu.queue, &camera_params);
@@ -1872,7 +1875,8 @@ impl App {
                             foam_coverage: self.state.spray.foam_coverage,
                             aeration_strength: self.state.spray.aeration_strength,
                             physical_medium: if self.state.rendering.physical_water_medium { 1.0 } else { 0.0 },
-                            _pad_m: [0.0; 3],
+                            body_count: 0,
+                            _pad_m: [0.0; 2],
                         };
                         ss_renderer.update_water_params(&gpu.queue, &water_params);
                         let env_params = self.state.environment.to_gpu_params(&self.ground_staging());
@@ -1981,6 +1985,13 @@ impl App {
                             self.state.rendering.physical_water_medium,
                             self.state.spray.foam_coverage,
                             self.state.spray.aeration_strength,
+                            // Enabled bodies occupy the front of the body array
+                            self.state
+                                .rigid_bodies
+                                .iter()
+                                .filter(|b| b.enabled)
+                                .count()
+                                .min(crate::state::MAX_RIGID_BODIES) as u32,
                         );
                         mc_renderer.update_env_params(&gpu.queue, &env_params);
                         mc_renderer.set_ssr_enabled(&gpu.queue, self.state.rendering.ssr_enabled);

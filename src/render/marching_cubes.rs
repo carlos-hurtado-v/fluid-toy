@@ -105,7 +105,10 @@ pub struct GpuWaterParams {
     pub aeration_strength: f32,
     /// 1 = physical water medium (absorption + single scattering), 0 = legacy
     pub physical_medium: f32,
-    pub _pad_m: [f32; 3],
+    /// Enabled rigid bodies at the front of the MC body array (refraction
+    /// rays intersect them exactly; the SS path leaves it 0)
+    pub body_count: u32,
+    pub _pad_m: [f32; 2],
 }
 
 impl Default for GpuWaterParams {
@@ -130,7 +133,8 @@ impl Default for GpuWaterParams {
             foam_coverage: 0.8,
             aeration_strength: 0.95,
             physical_medium: 1.0,
-            _pad_m: [0.0; 3],
+            body_count: 0,
+            _pad_m: [0.0; 2],
         }
     }
 }
@@ -326,6 +330,10 @@ pub struct MarchingCubesRenderer {
     vertex_buffer: wgpu::Buffer,
     camera_buffer: wgpu::Buffer,
     water_params_buffer: wgpu::Buffer,
+    // Render-side rigid body array (same layout as the body renderer uses),
+    // for exact ray-body hits in refraction: the depth buffer only holds the
+    // camera-facing side of a body
+    bodies_buffer: wgpu::Buffer,
     light_params_buffer: wgpu::Buffer,
     env_params_buffer: wgpu::Buffer,
     sh_coefficients_buffer: wgpu::Buffer,
@@ -613,6 +621,13 @@ impl MarchingCubesRenderer {
             label: Some("MC Water Params"),
             contents: bytemuck::bytes_of(&water_params),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bodies_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MC Rigid Bodies"),
+            contents: bytemuck::cast_slice(
+                &[crate::state::GpuRigidBodyRender::default(); crate::state::MAX_RIGID_BODIES],
+            ),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         // Container geometry buffer (shared struct: geometry, rotation, physics, clip)
@@ -1407,6 +1422,17 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Rigid bodies (exact refraction hits)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 19,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1688,6 +1714,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 18,
                     resource: wgpu::BindingResource::TextureView(&foam_coords_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: bodies_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -2093,6 +2123,7 @@ impl MarchingCubesRenderer {
             vertex_buffer,
             camera_buffer,
             water_params_buffer,
+            bodies_buffer,
             light_params_buffer,
             env_params_buffer,
             sh_coefficients_buffer,
@@ -2449,6 +2480,7 @@ impl MarchingCubesRenderer {
         physical_medium: bool,
         foam_coverage: f32,
         aeration_strength: f32,
+        body_count: u32,
     ) {
         let params = GpuWaterParams {
             water_color: *water_color,
@@ -2470,9 +2502,19 @@ impl MarchingCubesRenderer {
             foam_coverage,
             aeration_strength,
             physical_medium: if physical_medium { 1.0 } else { 0.0 },
-            _pad_m: [0.0; 3],
+            body_count,
+            _pad_m: [0.0; 2],
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
+    }
+
+    /// Upload this frame's enabled rigid bodies (render layout, in order; the
+    /// count rides in GpuWaterParams::body_count)
+    pub fn update_bodies(&self, queue: &wgpu::Queue, bodies: &[crate::state::GpuRigidBodyRender]) {
+        let count = bodies.len().min(crate::state::MAX_RIGID_BODIES);
+        if count > 0 {
+            queue.write_buffer(&self.bodies_buffer, 0, bytemuck::cast_slice(&bodies[..count]));
+        }
     }
 
     /// Set whether SSR is enabled and update GPU params
@@ -3231,6 +3273,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 18,
                     resource: wgpu::BindingResource::TextureView(&self.foam_coords_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: self.bodies_buffer.as_entire_binding(),
                 },
             ],
         })
