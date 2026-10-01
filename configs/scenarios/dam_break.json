@@ -1,0 +1,23 @@
+{
+  "_comment": "Classic dam break (Martin & Moyce 1952 layout): water column of width a=0.5 m, height 2a=1.0 m against the -X wall, full tank depth. Instant release at t=0. Front position over time = fluid_max_x in --stats; compare x(t)/a vs t*sqrt(2g/a) against published data. ~99k particles.",
+  "scenario": {
+    "fluid_blocks": [
+      {
+        "center": [-0.855, -0.395, 0.0],
+        "size": [0.5, 1.0, 1.79],
+        "velocity": [0.0, 0.0, 0.0]
+      }
+    ],
+    "probes": [
+      { "x": -0.855, "z": 0.0, "radius": 0.06 },
+      { "x": 0.0, "z": 0.0, "radius": 0.06 },
+      { "x": 0.8, "z": 0.0, "radius": 0.06 }
+    ]
+  },
+  "camera": {
+    "distance": 3.6,
+    "yaw": 0.0,
+    "pitch": 0.12,
+    "target": [0.0, -0.35, 0.0]
+  }
+}

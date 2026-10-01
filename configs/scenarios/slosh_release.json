@@ -1,0 +1,26 @@
+{
+  "_comment": "Sloshing via timed events: shallow 0.3 m lake; at t=1.0 s the tank tilts to 0.28 rad, at t=2.5 s it releases back to level, exciting a sloshing mode. End-wall probes are wave gauges - plot probe0_h/probe1_h from --stats to see the oscillation and its decay. First sloshing natural frequency for L=2.22, h=0.3: f = sqrt(g k tanh(k h)) / 2pi with k = pi/L, about 0.375 Hz (period ~2.7 s).",
+  "scenario": {
+    "fluid_blocks": [
+      {
+        "center": [0.0, -0.75, 0.0],
+        "size": [2.21, 0.3, 1.79],
+        "velocity": [0.0, 0.0, 0.0]
+      }
+    ],
+    "events": [
+      { "time": 1.0, "set": "container.tilt_z_target=0.28" },
+      { "time": 2.5, "set": "container.tilt_z_target=0.0" }
+    ],
+    "probes": [
+      { "x": -1.0, "z": 0.0, "radius": 0.07 },
+      { "x": 1.0, "z": 0.0, "radius": 0.07 }
+    ]
+  },
+  "camera": {
+    "distance": 3.6,
+    "yaw": 0.0,
+    "pitch": 0.15,
+    "target": [0.0, -0.45, 0.0]
+  }
+}

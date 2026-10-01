@@ -61,7 +61,7 @@ pub fn create_particle_block(spacing: f32, cube_size: u32) -> Vec<SphParticle3D>
 }
 
 /// Simple pseudo-random float (not cryptographic, just for jitter)
-fn rand_f32() -> f32 {
+pub(crate) fn rand_f32() -> f32 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};

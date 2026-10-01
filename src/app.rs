@@ -19,7 +19,7 @@ use crate::launch::LaunchOptions;
 use crate::gui::{self, GuiAction};
 use crate::render::{Camera, CausticsRenderer, ContainerRenderer, GpuPoolStyle, GtaoRenderer, MarchingCubesRenderer, ParticleRenderer3D, PostProcessRenderer, RigidBodyDraw, RigidBodyRenderer, ScreenSpaceFluidRenderer, SprayRenderer, WireframeRenderer};
 use crate::state::ContainerStyle;
-use crate::simulation::{SphSimulation3DGrid, SpraySystem, create_particle_block};
+use crate::simulation::{ProbeSystem, SphSimulation3DGrid, SpraySystem, create_particle_block};
 use crate::render::environment::load_embedded_environment_map;
 use crate::render::mesh_loader::{self, SdfData};
 use crate::state::{AppState, BackgroundMode, FluidRenderMode, ForceMode, GpuMouseForce, GpuShCoefficients, GpuSprayParams, GpuSprayRenderParams, HdrEnvironment, RigidBodyMotion, integrate_rigid_body};
@@ -62,9 +62,12 @@ pub struct App {
     env_bg_bind_group_layout: Option<wgpu::BindGroupLayout>,
     env_params_buffer: Option<wgpu::Buffer>,
     sph_simulation: Option<SphSimulation3DGrid>,
+    probe_system: Option<ProbeSystem>,
     sdf_data: Option<SdfData>,
     camera: Camera,
     state: AppState,
+    /// Per-event fired flags for scenario events (reset replays the schedule)
+    scenario_fired: Vec<bool>,
     // Frame timing
     last_frame_time: Instant,
     // Mouse state for camera control (left button)
@@ -108,8 +111,14 @@ impl App {
                 std::process::exit(1);
             });
             let mut writer = std::io::BufWriter::new(file);
-            let _ = writer
-                .write_all(b"frame,sim_time,particles,mc_vertices,spray_total,spray,foam,bubbles,fps,ta_limit,wc_limit\n");
+            let mut header = String::from(
+                "frame,sim_time,particles,mc_vertices,spray_total,spray,foam,bubbles,fps,ta_limit,wc_limit,fluid_max_x,fluid_min_x,fluid_max_y",
+            );
+            for i in 0..state.scenario.probes.len().min(crate::state::MAX_PROBES) {
+                header.push_str(&format!(",probe{i}_h"));
+            }
+            header.push('\n');
+            let _ = writer.write_all(header.as_bytes());
             writer
         });
 
@@ -125,6 +134,7 @@ impl App {
 
         let pending_captures: VecDeque<u64> = launch.capture_frames.iter().copied().collect();
         let had_captures = !pending_captures.is_empty();
+        let scenario_fired = vec![false; state.scenario.events.len()];
 
         Self {
             window: None,
@@ -155,9 +165,11 @@ impl App {
             env_bg_bind_group_layout: None,
             env_params_buffer: None,
             sph_simulation: None,
+            probe_system: None,
             sdf_data: None,
             camera: Camera::default(),
             state,
+            scenario_fired,
             last_frame_time: Instant::now(),
             mouse_pressed: false,
             last_mouse_pos: None,
@@ -183,6 +195,17 @@ impl App {
     }
 
     fn create_initial_particles(&self) -> Vec<crate::simulation::SphParticle3D> {
+        // Scenario fluid blocks take precedence over the legacy centered cube
+        if !self.state.scenario.fluid_blocks.is_empty() {
+            let particles = self.create_scenario_particles();
+            if !particles.is_empty() {
+                return particles;
+            }
+            eprintln!(
+                "[scenario] fluid_blocks produced no particles; falling back to the initial cube"
+            );
+        }
+
         // Keep the original lattice spacing (solver tuning depends on this),
         // but place the block low enough to avoid immediate ceiling collisions.
         let spacing = self.state.sph.kernel_radius * 0.6;
@@ -202,6 +225,154 @@ impl App {
         }
 
         particles
+    }
+
+    /// Build particles from scenario fluid blocks: world-space boxes filled on
+    /// the standard lattice (0.6 × kernel radius — solver tuning depends on
+    /// it), clamped into the container interior, capped at max_particles.
+    fn create_scenario_particles(&self) -> Vec<crate::simulation::SphParticle3D> {
+        use crate::simulation::particle::rand_f32;
+
+        let spacing = self.state.sph.kernel_radius * 0.6;
+        let cap = self.state.simulation.max_particles as usize;
+        let container = &self.state.container;
+        let (forward, inverse) = container.rotation_matrices();
+        let center_y = container.floor_y + container.height / 2.0;
+        let margin = self.state.rendering.visual_margin() + spacing * 0.25;
+        let lim = [
+            (container.width / 2.0 - margin).max(0.0),
+            (container.height / 2.0 - margin).max(0.0),
+            (container.depth / 2.0 - margin).max(0.0),
+        ];
+        let rot = |m: &[[f32; 4]; 3], v: [f32; 3]| {
+            [
+                m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+                m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+                m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+            ]
+        };
+
+        let mut particles = Vec::new();
+        let mut requested = 0usize;
+        'blocks: for block in &self.state.scenario.fluid_blocks {
+            // Points per axis: lattice-quantized, at least one
+            let counts: [u32; 3] = std::array::from_fn(|a| {
+                (block.size[a].max(0.0) / spacing + 1e-4) as u32 + 1
+            });
+            requested += counts.iter().map(|&c| c as usize).product::<usize>();
+
+            for iy in 0..counts[1] {
+                for iz in 0..counts[2] {
+                    for ix in 0..counts[0] {
+                        if particles.len() >= cap {
+                            break 'blocks;
+                        }
+                        let jitter = 0.0005 * rand_f32();
+                        let idx = [ix, iy, iz];
+                        let mut world = [0.0f32; 3];
+                        for a in 0..3 {
+                            let span = (counts[a] - 1) as f32 * spacing;
+                            world[a] = block.center[a] - span / 2.0
+                                + idx[a] as f32 * spacing
+                                + jitter;
+                        }
+                        // Clamp into the (possibly tilted) container interior
+                        let rel = [world[0], world[1] - center_y, world[2]];
+                        let mut local = rot(&inverse, rel);
+                        for a in 0..3 {
+                            local[a] = local[a].clamp(-lim[a], lim[a]);
+                        }
+                        let clamped = rot(&forward, local);
+                        let mut p = crate::simulation::SphParticle3D::new(
+                            clamped[0],
+                            clamped[1] + center_y,
+                            clamped[2],
+                        );
+                        p.velocity = block.velocity;
+                        particles.push(p);
+                    }
+                }
+            }
+        }
+        if requested > particles.len() {
+            eprintln!(
+                "[scenario] fluid_blocks request {requested} particles; capped at max_particles = {cap}"
+            );
+        }
+        particles
+    }
+
+    /// Fire scenario events whose time has come, once each per reset.
+    /// Runs on the deterministic sim clock, so automation runs replay exactly.
+    fn pump_scenario_events(&mut self) {
+        // Events list can change size if an event edits the scenario itself;
+        // keep flags aligned (new entries start unfired)
+        if self.scenario_fired.len() != self.state.scenario.events.len() {
+            self.scenario_fired
+                .resize(self.state.scenario.events.len(), false);
+        }
+
+        let mut due: Vec<usize> = (0..self.state.scenario.events.len())
+            .filter(|&i| {
+                !self.scenario_fired[i]
+                    && f64::from(self.state.scenario.events[i].time) <= self.sim_time
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        // Same-frame events fire in time order
+        due.sort_by(|&a, &b| {
+            self.state.scenario.events[a]
+                .time
+                .partial_cmp(&self.state.scenario.events[b].time)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for i in due {
+            self.scenario_fired[i] = true;
+            let event = self.state.scenario.events[i].clone();
+            let Some((path, raw)) = event.set.split_once('=') else {
+                eprintln!(
+                    "[scenario] t={:.3}: bad event '{}' (expected path=value)",
+                    event.time, event.set
+                );
+                continue;
+            };
+            match self.apply_state_set(path, raw) {
+                Ok(()) => {
+                    self.state.runtime.scenario_events_fired += 1;
+                    println!(
+                        "[scenario] t={:.3}s (frame {}): set {}",
+                        event.time, self.sim_frame_index, event.set
+                    );
+                }
+                Err(e) => eprintln!("[scenario] t={:.3}: {e}", event.time),
+            }
+        }
+    }
+
+    /// Apply a `--set`-style `path=value` to the live state (the scenario
+    /// event mechanism). Round-trips through the JSON config form, so it
+    /// accepts exactly what the CLI accepts; serde-skipped runtime fields are
+    /// carried over from the live state afterwards.
+    fn apply_state_set(&mut self, path: &str, raw: &str) -> Result<(), String> {
+        let mut tree = serde_json::to_value(&self.state)
+            .map_err(|e| format!("state to json failed: {e}"))?;
+        crate::launch::apply_set(&mut tree, path, raw)?;
+        let mut new_state: AppState = serde_json::from_value(tree)
+            .map_err(|e| format!("'{path}={raw}' produces an invalid config: {e}"))?;
+
+        new_state.runtime = self.state.runtime.clone();
+        for (nb, ob) in new_state
+            .rigid_bodies
+            .iter_mut()
+            .zip(&self.state.rigid_bodies)
+        {
+            nb.spin_angle = ob.spin_angle;
+        }
+        self.state = new_state;
+        Ok(())
     }
 
     fn initialize(&mut self, window: Arc<Window>) {
@@ -267,6 +438,12 @@ impl App {
             container_geom,
             self.state.simulation.max_particles,
             sdf_data.as_ref(),
+        );
+
+        let probe_system = ProbeSystem::new(
+            &gpu.device,
+            sph_simulation.particle_buffer(),
+            &self.state.scenario.probes,
         );
 
         // Load environment map (shared by SS + MC renderers)
@@ -565,12 +742,21 @@ impl App {
         self.env_bg_bind_group_layout = Some(env_bg_bind_group_layout);
         self.env_params_buffer = Some(env_params_buffer);
         self.sph_simulation = Some(sph_simulation);
+        self.probe_system = Some(probe_system);
         self.sdf_data = sdf_data;
         self.egui_winit = Some(egui_winit);
         self.egui_renderer = Some(egui_renderer);
     }
 
     fn reset_simulation(&mut self) {
+        // Replay the scenario from t=0: rewind the deterministic sim clock
+        // and re-arm every timed event
+        self.scenario_fired = vec![false; self.state.scenario.events.len()];
+        self.state.runtime.scenario_events_fired = 0;
+        self.state.runtime.measurements = None;
+        self.sim_frame_index = 0;
+        self.sim_time = 0.0;
+
         // Reset dynamic rigid body velocity and rotation (keep position);
         // Static/Kinematic bodies re-derive their pose from euler/spin anyway
         for body in &mut self.state.rigid_bodies {
@@ -652,6 +838,15 @@ impl App {
                 }
                 self.spray_renderer = Some(spray_renderer);
                 self.spray_system = Some(spray_system);
+            }
+
+            // Probes bind the new simulation's particle buffer
+            if let Some(sph_sim) = &self.sph_simulation {
+                self.probe_system = Some(ProbeSystem::new(
+                    &gpu.device,
+                    sph_sim.particle_buffer(),
+                    &self.state.scenario.probes,
+                ));
             }
             self.state.runtime.frame_count = 0;
         }
@@ -1264,6 +1459,9 @@ impl App {
             egui_renderer.update_texture(&gpu.device, &gpu.queue, *id, image_delta);
         }
 
+        // Fire due scenario events before this frame's state reaches the GPU
+        self.pump_scenario_events();
+
         // Sync state to GPU
         self.sync_gpu_state();
 
@@ -1370,6 +1568,14 @@ impl App {
         if stepped {
             self.sim_frame_index += 1;
             self.sim_time += frame_dt as f64;
+        }
+
+        // Measure fluid extents + probe heights on the post-integrate state
+        if stepped {
+            if let Some(probe) = self.probe_system.as_mut() {
+                probe.collect(&gpu.device);
+                probe.encode(&gpu.queue, &mut encoder, self.state.runtime.particle_count);
+            }
         }
 
         // Prepare a swapchain readback if a capture is due this frame
@@ -2062,6 +2268,21 @@ impl App {
             }
         }
 
+        // Probe readback mirrors the same policy: blocking for exact stats
+        // rows, async map for interactive frames
+        if let Some(probe) = self.probe_system.as_mut() {
+            if self.stats_file.is_some() {
+                if stepped {
+                    self.state.runtime.measurements = probe.read_blocking(&gpu.device);
+                }
+            } else {
+                probe.arm_map();
+                if let Some(m) = probe.latest() {
+                    self.state.runtime.measurements = Some(m.clone());
+                }
+            }
+        }
+
         // Finish any pending capture (map readback, write PNG)
         if let Some((buffer, padded_bytes_per_row)) = capture {
             self.save_capture(&buffer, padded_bytes_per_row);
@@ -2083,8 +2304,8 @@ impl App {
             } else {
                 0
             };
-            let row = format!(
-                "{},{:.4},{},{},{},{},{},{},{:.1},{:.4},{:.4}\n",
+            let mut row = format!(
+                "{},{:.4},{},{},{},{},{},{},{:.1},{:.4},{:.4}",
                 self.sim_frame_index,
                 self.sim_time,
                 self.state.runtime.particle_count,
@@ -2097,6 +2318,20 @@ impl App {
                 self.state.runtime.spray_ta_limit,
                 self.state.runtime.spray_wc_limit,
             );
+            // Measurement columns (empty cell = no fluid in range)
+            let fmt = |v: Option<f32>| v.map_or(String::new(), |v| format!("{v:.5}"));
+            let m = self.state.runtime.measurements.as_ref();
+            row.push_str(&format!(
+                ",{},{},{}",
+                fmt(m.and_then(|m| m.max_x)),
+                fmt(m.and_then(|m| m.min_x)),
+                fmt(m.and_then(|m| m.max_y)),
+            ));
+            for k in 0..self.state.scenario.probes.len().min(crate::state::MAX_PROBES) {
+                let h = m.and_then(|m| m.probe_heights.get(k).copied().flatten());
+                row.push_str(&format!(",{}", fmt(h)));
+            }
+            row.push('\n');
             if let Some(file) = self.stats_file.as_mut() {
                 let _ = file.write_all(row.as_bytes());
                 let _ = file.flush();

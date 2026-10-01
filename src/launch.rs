@@ -170,8 +170,42 @@ impl LaunchOptions {
                 .map_err(|e| format!("--set produced an invalid config: {e}"))?;
         }
 
+        validate_scenario(&state)?;
         Ok(state)
     }
+}
+
+/// Fail fast on scenario mistakes: bad event paths surface at launch (with
+/// the same helpful key listing as `--set` typos), not minutes into a run.
+fn validate_scenario(state: &AppState) -> Result<(), String> {
+    if state.scenario.probes.len() > crate::state::MAX_PROBES {
+        return Err(format!(
+            "scenario.probes: {} probes configured, max is {}",
+            state.scenario.probes.len(),
+            crate::state::MAX_PROBES
+        ));
+    }
+    if state.scenario.events.is_empty() {
+        return Ok(());
+    }
+    let tree = serde_json::to_value(state)
+        .map_err(|e| format!("internal: state to json failed: {e}"))?;
+    for (i, event) in state.scenario.events.iter().enumerate() {
+        let (path, raw) = event.set.split_once('=').ok_or_else(|| {
+            format!(
+                "scenario.events.{i}: set expects path=value, got '{}'",
+                event.set
+            )
+        })?;
+        // Dry-run against a scratch copy; events applying to the evolved
+        // live state later can only differ in array lengths, not keys.
+        let mut scratch = tree.clone();
+        apply_set(&mut scratch, path, raw)
+            .map_err(|e| format!("scenario.events.{i}: {e}"))?;
+        serde_json::from_value::<AppState>(scratch)
+            .map_err(|e| format!("scenario.events.{i}: '{}' produces an invalid config: {e}", event.set))?;
+    }
+    Ok(())
 }
 
 /// Migrate legacy config keys so old export files keep loading:
@@ -203,7 +237,8 @@ fn migrate_legacy_config(tree: &mut serde_json::Value) {
 /// typos); numeric path parts index into arrays (e.g.
 /// `rigid_bodies.0.enabled=false`). The value is parsed as JSON, falling back
 /// to a bare string so enum variants can be written without quotes.
-fn apply_set(root: &mut serde_json::Value, path: &str, raw: &str) -> Result<(), String> {
+/// Shared by CLI `--set` overrides and runtime scenario events.
+pub(crate) fn apply_set(root: &mut serde_json::Value, path: &str, raw: &str) -> Result<(), String> {
     let parts: Vec<&str> = path.split('.').collect();
     let (last, walk) = parts
         .split_last()

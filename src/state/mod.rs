@@ -5,12 +5,14 @@ pub mod simulation;
 pub mod rendering;
 pub mod rigid_body;
 pub mod interaction;
+pub mod scenario;
 
 pub use post_process::{AoDebugMode, PostProcessConfig};
 pub use simulation::*;
 pub use rendering::*;
 pub use rigid_body::*;
 pub use interaction::*;
+pub use scenario::*;
 
 /// Complete application state - GUI binds to this.
 /// Serializes to the JSON config format (`--config` / Export Config);
@@ -31,6 +33,7 @@ pub struct AppState {
     pub rigid_bodies: Vec<RigidBodyConfig>,
     pub spray: SprayConfig,
     pub mouse_force: MouseForceConfig,
+    pub scenario: ScenarioConfig,
     #[serde(skip)]
     pub runtime: RuntimeState,
 }
@@ -85,6 +88,23 @@ pub struct RuntimeState {
     /// Live auto-calibrated whitewater potential ceilings (GUI readout)
     pub spray_ta_limit: f32,
     pub spray_wc_limit: f32,
+    /// Scenario events fired so far this run (GUI readout)
+    pub scenario_events_fired: u32,
+    /// Latest probe measurements (GUI readout; None until first readback)
+    pub measurements: Option<FluidMeasurements>,
+}
+
+/// Fluid measurements read back from the GPU probe pass (world coordinates)
+#[derive(Debug, Clone)]
+pub struct FluidMeasurements {
+    /// Fluid extremes over all particles: None when no particles
+    pub max_x: Option<f32>,
+    pub min_x: Option<f32>,
+    pub max_y: Option<f32>,
+    pub max_z: Option<f32>,
+    pub min_z: Option<f32>,
+    /// Highest particle per configured probe column; None = no fluid in column
+    pub probe_heights: Vec<Option<f32>>,
 }
 
 impl Default for RuntimeState {
@@ -97,6 +117,8 @@ impl Default for RuntimeState {
             last_export: None,
             spray_ta_limit: 0.0,
             spray_wc_limit: 0.0,
+            scenario_events_fired: 0,
+            measurements: None,
         }
     }
 }

@@ -1,0 +1,30 @@
+{
+  "_comment": "Droplet impact: a 0.2 m cube of water hits a calm 0.35 m pool at 3 m/s. Crown splash + whitewater; pool style shows caustics. Center probe reads the crater/rebound jet.",
+  "scenario": {
+    "fluid_blocks": [
+      {
+        "center": [0.0, -0.725, 0.0],
+        "size": [2.21, 0.35, 1.79],
+        "velocity": [0.0, 0.0, 0.0]
+      },
+      {
+        "center": [0.0, 0.25, 0.0],
+        "size": [0.2, 0.2, 0.2],
+        "velocity": [0.0, -3.0, 0.0]
+      }
+    ],
+    "probes": [
+      { "x": 0.0, "z": 0.0, "radius": 0.08 },
+      { "x": 0.7, "z": 0.0, "radius": 0.06 }
+    ]
+  },
+  "container": {
+    "style": "OpaquePool"
+  },
+  "camera": {
+    "distance": 3.4,
+    "yaw": 0.5,
+    "pitch": 0.45,
+    "target": [0.0, -0.45, 0.0]
+  }
+}

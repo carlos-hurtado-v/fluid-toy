@@ -874,6 +874,50 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
             }
 
             ui.add_space(8.0);
+
+            // Live fluid measurements (probe pass) + scenario status
+            ui.collapsing("Measurements", |ui| {
+                if !state.scenario.is_empty() {
+                    ui.label(format!(
+                        "Scenario: {} fluid blocks, {}/{} events fired",
+                        state.scenario.fluid_blocks.len(),
+                        state.runtime.scenario_events_fired,
+                        state.scenario.events.len(),
+                    ));
+                    if !state.scenario.fluid_blocks.is_empty() {
+                        ui.label("(Initial Cube Size is ignored; Reset replays the scenario)");
+                    }
+                    ui.separator();
+                }
+                match &state.runtime.measurements {
+                    Some(m) => {
+                        let f = |v: Option<f32>| {
+                            v.map_or("-".to_string(), |v| format!("{v:.3}"))
+                        };
+                        ui.label(format!("Fluid X: [{}, {}]", f(m.min_x), f(m.max_x)));
+                        ui.label(format!("Fluid Z: [{}, {}]", f(m.min_z), f(m.max_z)));
+                        ui.label(format!("Surface max Y: {}", f(m.max_y)));
+                        for (i, (h, p)) in m
+                            .probe_heights
+                            .iter()
+                            .zip(&state.scenario.probes)
+                            .enumerate()
+                        {
+                            ui.label(format!(
+                                "Probe {i} at ({:.2}, {:.2}): {}",
+                                p.x,
+                                p.z,
+                                f(*h)
+                            ));
+                        }
+                    }
+                    None => {
+                        ui.label("No measurements yet (runs while simulating)");
+                    }
+                }
+            });
+
+            ui.add_space(8.0);
             ui.label(format!("Particles: {}", state.runtime.particle_count));
             ui.label(format!("FPS: {:.0}", state.runtime.fps));
         });
