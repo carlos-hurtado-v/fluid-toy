@@ -38,7 +38,8 @@ struct WaterParams {
     physical_medium: f32,
     // Enabled rigid bodies at the front of `rigid_bodies`
     body_count: u32,
-    _pad_m1: f32,
+    // rendering.mc_debug_view (McDebugView::as_u32, 0 = off)
+    debug_view: u32,
     _pad_m2: f32,
 }
 
@@ -466,11 +467,44 @@ fn screen_to_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 // Background at a refracted uv. If what sits there is in front of the water
 // (e.g. the pool's near wall), the refracted ray can't have reached it — keep
 // the straight-through sample instead of leaking the occluder into the water.
+// === Refraction debug record (rendering.mc_debug_view) ===
+// What the refraction code did for this pixel, written at each decision and
+// shown instead of the shaded color when a debug view is on. The ids are
+// decoded by scripts/debug_decode.py: keep the two tables in sync.
+// Route (dbg_path)
+const DBG_PATH_LEGACY: u32 = 1u;       // physical refraction off
+const DBG_PATH_INSIDE: u32 = 2u;       // opaque surface inside the water: marched onto it
+const DBG_PATH_NO_BACK: u32 = 3u;      // no back face behind the pixel: straight out to the backdrop
+const DBG_PATH_BLOCKED: u32 = 4u;      // something opaque before the water ends
+const DBG_PATH_THIN_TIR: u32 = 5u;     // total internal reflection in a thin body: straight through
+const DBG_PATH_EXIT: u32 = 6u;         // refracted out of the water
+const DBG_PATH_TIR_BLOCKED: u32 = 7u;  // mirrored, then something opaque
+const DBG_PATH_TIR_EXIT: u32 = 8u;     // mirrored, then refracted out
+const DBG_PATH_TIR_SPENT: u32 = 9u;    // mirrored until out of bounces
+const DBG_PATH_TIR_POOL: u32 = 10u;    // mirrored onto an opaque pool wall: straight through
+// Final lookup (dbg_end)
+const DBG_END_STRAIGHT: u32 = 1u;      // the view straight through (occluded or fallback)
+const DBG_END_SURFACE: u32 = 2u;       // background texture where the ray met a surface
+const DBG_END_SCREEN_SKY: u32 = 3u;    // backdrop read on screen at the direction's vanishing point
+const DBG_END_ENV: u32 = 4u;           // environment map along the direction
+const DBG_END_SOLID: u32 = 5u;         // solid background color
+const DBG_END_BODY: u32 = 6u;          // exact sphere/box hit (ray_body_hit)
+var<private> dbg_path: u32 = 0u;
+var<private> dbg_end: u32 = 0u;
+var<private> dbg_body: bool = false;
+var<private> dbg_bounces: u32 = 0u;
+var<private> dbg_uv: vec2<f32> = vec2<f32>(-1.0);
+var<private> dbg_exit_cos: f32 = 0.0;
+var<private> dbg_water_path: f32 = 0.0;
+
 fn background_at(uv: vec2<f32>, front_depth_raw: f32, straight: vec3<f32>) -> vec3<f32> {
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))
         || background_depth_at(uv) < front_depth_raw) {
+        dbg_end = DBG_END_STRAIGHT;
         return straight;
     }
+    dbg_end = DBG_END_SURFACE;
+    dbg_uv = uv;
     return textureSampleLevel(background_tex, env_sampler, uv, 0.0).rgb;
 }
 
@@ -509,13 +543,17 @@ fn backdrop_along(dir: vec3<f32>) -> vec3<f32> {
         let ndc = clip.xy / clip.w;
         let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
         if (all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0)) && shows_backdrop(uv)) {
+            dbg_end = DBG_END_SCREEN_SKY;
+            dbg_uv = uv;
             return textureSampleLevel(background_tex, env_sampler, uv, 0.0).rgb;
         }
     }
     if (water.use_env_background == 0u) {
+        dbg_end = DBG_END_SOLID;
         return vec3<f32>(water.background_r, water.background_g, water.background_b);
     }
     // Same radiance as the backdrop pass (mc_environment.wgsl)
+    dbg_end = DBG_END_ENV;
     return max(sample_environment(dir) * water.env_intensity, vec3<f32>(0.0));
 }
 
@@ -559,6 +597,7 @@ fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0
         lo = s;
     }
     if (hi < 0.0 && t_body > 0.0) {
+        dbg_body = true;
         return vec3<f32>(screen_point(origin + dir * t_body).xy, 1.0);
     }
     if (hi < 0.0) {
@@ -743,6 +782,7 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
     // Reached the body with nothing in between, or left the water through the
     // film just in front of it
     if (t_body > 0.0 && (ev.kind < 0.5 || (ev.kind < 1.5 && t_body - ev.dist < BODY_WET_GAP))) {
+        dbg_body = true;
         out.blocked = true;
         out.blocked_uv = screen_point(origin + dir * t_body).xy;
         return out;
@@ -809,6 +849,7 @@ fn scene_from(p_out: vec3<f32>, dir: vec3<f32>, front_depth_raw: f32, straight: 
     }
     let t_body = ray_body_hit(p_out, dir, BODY_MAX_REACH);
     if (t_body > 0.0) {
+        dbg_body = true;
         return background_at(screen_point(p_out + dir * t_body).xy, front_depth_raw, straight);
     }
     return backdrop_along(dir);
@@ -829,15 +870,21 @@ fn follow_internal_reflection(
     var d = dir;
     for (var bounce = 0; bounce < TIR_MAX_BOUNCES; bounce++) {
         let ex = water_exit(o, d);
+        dbg_bounces = u32(bounce + 1);
         if (ex.blocked) {
+            dbg_path = DBG_PATH_TIR_BLOCKED;
             return background_at(ex.blocked_uv, front_depth_raw, straight);
         }
         if (container.is_pool != 0u && ex.on_wall) {
             // Opaque pool walls should have blocked the ray already
+            dbg_path = DBG_PATH_TIR_POOL;
+            dbg_end = DBG_END_STRAIGHT;
             return straight;
         }
         let out_dir = refract(d, -ex.normal, water.ior);
         if (dot(out_dir, out_dir) > 0.5) {
+            dbg_path = DBG_PATH_TIR_EXIT;
+            dbg_exit_cos = dot(out_dir, ex.normal);
             return scene_from(ex.point, out_dir, front_depth_raw, straight);
         }
         // Reflects again: continue inside the water
@@ -847,6 +894,7 @@ fn follow_internal_reflection(
     // Out of bounces: wherever the ray is heading beats the view straight
     // through (which would paint what lies behind the tank, often sky, into
     // the mirror)
+    dbg_path = DBG_PATH_TIR_SPENT;
     return scene_from(o, d, front_depth_raw, straight);
 }
 
@@ -878,11 +926,13 @@ fn refract_scene(
         // would reflect back down rather than reach anything far away. The
         // surface first seen is the safe answer; the furthest point reached
         // would paint the horizon into the water.
+        dbg_path = DBG_PATH_INSIDE;
         return background_at(march_to_background(p, t1, screen_uv, bg_depth).xy, front_depth_raw, straight);
     }
     // No back face behind this pixel (mesh clipped open): treat the body as
     // deep and let the refracted ray run out to the backdrop
     if (back_depth_raw >= 1.0) {
+        dbg_path = DBG_PATH_NO_BACK;
         return backdrop_along(t1);
     }
 
@@ -897,6 +947,7 @@ fn refract_scene(
         // front wall's normal, runs on to the back wall (or vice versa)
         let ex = water_exit(p, t1);
         if (ex.blocked) {
+            dbg_path = DBG_PATH_BLOCKED;
             return background_at(ex.blocked_uv, front_depth_raw, straight);
         }
         p_exit = ex.point;
@@ -914,15 +965,20 @@ fn refract_scene(
         }
         n_exit = normalize(back_n.xyz);
     }
+    dbg_water_path = distance(p, p_exit);
     let t2 = refract(t1, -n_exit, water.ior);
     if (dot(t2, t2) < 0.5) {
         // Total internal reflection: in bulk water, follow the mirror bounce;
         // inside a thin drop or crest the next interface isn't knowable here
         if (distance(p, p_exit) < TIR_MIN_BODY) {
+            dbg_path = DBG_PATH_THIN_TIR;
+            dbg_end = DBG_END_STRAIGHT;
             return straight;
         }
         return follow_internal_reflection(p_inside, reflect(t1, n_exit), front_depth_raw, straight);
     }
+    dbg_path = DBG_PATH_EXIT;
+    dbg_exit_cos = dot(t2, n_exit);
     return scene_from(p_exit, t2, front_depth_raw, straight);
 }
 
@@ -1167,6 +1223,32 @@ fn ripple_normal(world_pos: vec3<f32>, t: f32) -> vec3<f32> {
     return vec3<f32>(grad.x, 0.0, grad.y);
 }
 
+// Encoding per McDebugView (state/rendering.rs) - decoded by scripts/debug_decode.py
+fn debug_view_output() -> vec3<f32> {
+    var end = dbg_end;
+    if (dbg_body) {
+        end = DBG_END_BODY;
+    }
+    let bounces = f32(dbg_bounces + 1u) / 8.0;
+    switch (water.debug_view) {
+        case 1u: {
+            return vec3<f32>(f32(dbg_path) / 16.0, f32(end) / 8.0, bounces);
+        }
+        case 2u: {
+            return vec3<f32>(max(dbg_uv, vec2<f32>(0.0)), f32(end) / 8.0);
+        }
+        case 3u: {
+            // Lookup jump between neighbouring pixels, in background texels
+            let dims = vec2<f32>(textureDimensions(background_tex));
+            let jump = max(length(dpdx(dbg_uv) * dims), length(dpdy(dbg_uv) * dims));
+            return vec3<f32>(clamp(log2(1.0 + jump) / 8.0, 0.0, 1.0));
+        }
+        default: {
+            return vec3<f32>(clamp(dbg_exit_cos, 0.0, 1.0), clamp(dbg_water_path / 4.0, 0.0, 1.0), bounces);
+        }
+    }
+}
+
 @fragment
 fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     // Clip to container bounds with margin (MC interpolation can place vertices
@@ -1300,6 +1382,9 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         // Sample background with distorted UVs (clamp to avoid sampling outside)
         let refract_uv = clamp(screen_uv + uv_offset, vec2<f32>(0.001), vec2<f32>(0.999));
         refracted_background = textureSampleLevel(background_tex, env_sampler, refract_uv, 0.0).rgb;
+        dbg_path = DBG_PATH_LEGACY;
+        dbg_end = DBG_END_SURFACE;
+        dbg_uv = refract_uv;
     }
 
     let refracted_scene = refracted_background;
@@ -1493,6 +1578,13 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
             let albedo = mix(FOAM_VEIL_ALBEDO, FOAM_ALBEDO, smoothstep(0.3, 2.0, map.density));
             color = mix(color, albedo * grain * raft_light, alpha);
         }
+    }
+
+    // Refraction debug view: data instead of color (the app bypasses post
+    // processing, so these values reach the screen as written; uniform branch,
+    // so the derivatives are legal)
+    if (water.debug_view != 0u) {
+        return vec4<f32>(debug_view_output(), 1.0);
     }
 
     // Output linear HDR — post-process pipeline handles tone mapping + gamma.

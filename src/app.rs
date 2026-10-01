@@ -96,6 +96,8 @@ pub struct App {
     sim_time: f64,
     pending_captures: VecDeque<u64>,
     had_captures: bool,
+    /// F12: save the next frame (GUI-free) together with its exact config
+    snapshot_requested: bool,
     stats_file: Option<std::io::BufWriter<std::fs::File>>,
     should_exit: bool,
 }
@@ -192,6 +194,7 @@ impl App {
             sim_time: 0.0,
             pending_captures,
             had_captures,
+            snapshot_requested: false,
             stats_file,
             should_exit: false,
         }
@@ -1048,6 +1051,10 @@ impl ApplicationHandler for App {
                                 self.state.container.tilt_x_target = std::f32::consts::PI;
                                 self.state.container.tilt_z_target = 0.0;
                             }
+                            // F12: snapshot (frame + exact config, same instant)
+                            KeyCode::F12 => {
+                                self.snapshot_requested = true;
+                            }
                             _ => {}
                         }
                     }
@@ -1684,6 +1691,8 @@ impl App {
             self.pending_captures.pop_front();
             capture_due = true;
         }
+        let snapshot = std::mem::take(&mut self.snapshot_requested);
+        capture_due |= snapshot;
         let capture = if capture_due {
             let unpadded_bytes_per_row = gpu.config.width * 4;
             let padded_bytes_per_row = unpadded_bytes_per_row
@@ -1736,7 +1745,11 @@ impl App {
 
         // Scene renderers always draw into the HDR scene buffer (HDR_FORMAT);
         // post-processing (or its passthrough when disabled) writes the screen
-        let post_process_enabled = self.state.post_process.enabled;
+        // A refraction debug view writes data, not color: no exposure, tonemap,
+        // bloom or FXAA may touch it
+        let debug_view_on = self.state.rendering.render_mode == FluidRenderMode::MarchingCubes
+            && self.state.rendering.mc_debug_view != crate::state::McDebugView::Off;
+        let post_process_enabled = self.state.post_process.enabled && !debug_view_on;
         let render_target = self
             .post_process_renderer
             .as_ref()
@@ -1876,7 +1889,8 @@ impl App {
                             aeration_strength: self.state.spray.aeration_strength,
                             physical_medium: if self.state.rendering.physical_water_medium { 1.0 } else { 0.0 },
                             body_count: 0,
-                            _pad_m: [0.0; 2],
+                            debug_view: 0,
+                            _pad_m: 0.0,
                         };
                         ss_renderer.update_water_params(&gpu.queue, &water_params);
                         let env_params = self.state.environment.to_gpu_params(&self.ground_staging());
@@ -1992,6 +2006,7 @@ impl App {
                                 .filter(|b| b.enabled)
                                 .count()
                                 .min(crate::state::MAX_RIGID_BODIES) as u32,
+                            self.state.rendering.mc_debug_view.as_u32(),
                         );
                         mc_renderer.update_env_params(&gpu.queue, &env_params);
                         mc_renderer.set_ssr_enabled(&gpu.queue, self.state.rendering.ssr_enabled);
@@ -2272,7 +2287,7 @@ impl App {
                 pp.render(&mut encoder, &view, self.state.post_process.bloom_enabled, self.state.post_process.streaks_enabled, self.state.quality.fxaa_enabled);
             } else {
                 pp.update_params(&gpu.queue, &crate::state::PostProcessConfig::passthrough_gpu_params());
-                pp.render(&mut encoder, &view, false, false, self.state.quality.fxaa_enabled);
+                pp.render(&mut encoder, &view, false, false, self.state.quality.fxaa_enabled && !debug_view_on);
             }
         }
 
@@ -2400,7 +2415,15 @@ impl App {
 
         // Finish any pending capture (map readback, write PNG)
         if let Some((buffer, padded_bytes_per_row)) = capture {
-            self.save_capture(&buffer, padded_bytes_per_row);
+            if snapshot {
+                self.save_snapshot(&buffer, padded_bytes_per_row);
+            } else {
+                let path = self
+                    .launch
+                    .out_dir
+                    .join(format!("frame_{:05}.png", self.sim_frame_index));
+                self.save_capture(&buffer, padded_bytes_per_row, &path);
+            }
         }
 
         // Append a stats row for every simulated frame
@@ -2490,7 +2513,7 @@ impl App {
 
     /// Map a completed swapchain readback and write it out as a PNG named
     /// after the current simulation frame.
-    fn save_capture(&self, buffer: &wgpu::Buffer, padded_bytes_per_row: u32) {
+    fn save_capture(&self, buffer: &wgpu::Buffer, padded_bytes_per_row: u32, path: &std::path::Path) -> bool {
         let gpu = self.gpu.as_ref().unwrap();
         let (width, height) = (gpu.config.width, gpu.config.height);
 
@@ -2521,17 +2544,66 @@ impl App {
             px[3] = 255;
         }
 
-        let path = self
-            .launch
-            .out_dir
-            .join(format!("frame_{:05}.png", self.sim_frame_index));
         match image::RgbaImage::from_raw(width, height, pixels) {
-            Some(img) => match img.save(&path) {
-                Ok(()) => println!("Captured {}", path.display()),
-                Err(e) => eprintln!("error: failed to save capture {}: {e}", path.display()),
+            Some(img) => match img.save(path) {
+                Ok(()) => {
+                    println!("Captured {}", path.display());
+                    true
+                }
+                Err(e) => {
+                    eprintln!("error: failed to save capture {}: {e}", path.display());
+                    false
+                }
             },
-            None => eprintln!("error: capture buffer size mismatch"),
+            None => {
+                eprintln!("error: capture buffer size mismatch");
+                false
+            }
         }
+    }
+
+    /// F12 snapshot: this frame as captures/snapshots/snap_NNN_WxH.png plus the
+    /// exact state (live camera included) as snap_NNN_WxH.json, so a report
+    /// can be reproduced with `--config <json> --size WxH`.
+    fn save_snapshot(&mut self, buffer: &wgpu::Buffer, padded_bytes_per_row: u32) {
+        let (width, height) = {
+            let gpu = self.gpu.as_ref().unwrap();
+            (gpu.config.width, gpu.config.height)
+        };
+        let dir = std::path::PathBuf::from("captures").join("snapshots");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("error: cannot create {}: {e}", dir.display());
+            return;
+        }
+        let mut n = 1u32;
+        let stem = loop {
+            let stem = format!("snap_{n:03}_{width}x{height}");
+            if !dir.join(format!("{stem}.png")).exists() {
+                break stem;
+            }
+            n += 1;
+        };
+        let png = dir.join(format!("{stem}.png"));
+        let json = dir.join(format!("{stem}.json"));
+        if !self.save_capture(buffer, padded_bytes_per_row, &png) {
+            return;
+        }
+        let mut state = self.state.clone();
+        state.camera.distance = self.camera.distance;
+        state.camera.yaw = self.camera.yaw;
+        state.camera.pitch = self.camera.pitch;
+        state.camera.target = self.camera.target;
+        state.camera.fov = self.camera.fov;
+        let message = match std::fs::write(&json, crate::launch::config_to_json(&state)) {
+            Ok(()) => format!(
+                "snapshot {} (repro: --config {} --size {width}x{height})",
+                png.display(),
+                json.display(),
+            ),
+            Err(e) => format!("snapshot config failed: {e}"),
+        };
+        println!("{message}");
+        self.state.runtime.last_export = Some(message);
     }
 
     /// Write the current state (including the live camera pose) to

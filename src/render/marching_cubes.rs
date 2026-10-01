@@ -108,7 +108,9 @@ pub struct GpuWaterParams {
     /// Enabled rigid bodies at the front of the MC body array (refraction
     /// rays intersect them exactly; the SS path leaves it 0)
     pub body_count: u32,
-    pub _pad_m: [f32; 2],
+    /// McDebugView::as_u32 (0 = off)
+    pub debug_view: u32,
+    pub _pad_m: f32,
 }
 
 impl Default for GpuWaterParams {
@@ -134,7 +136,8 @@ impl Default for GpuWaterParams {
             aeration_strength: 0.95,
             physical_medium: 1.0,
             body_count: 0,
-            _pad_m: [0.0; 2],
+            debug_view: 0,
+            _pad_m: 0.0,
         }
     }
 }
@@ -2481,6 +2484,7 @@ impl MarchingCubesRenderer {
         foam_coverage: f32,
         aeration_strength: f32,
         body_count: u32,
+        debug_view: u32,
     ) {
         let params = GpuWaterParams {
             water_color: *water_color,
@@ -2503,7 +2507,8 @@ impl MarchingCubesRenderer {
             aeration_strength,
             physical_medium: if physical_medium { 1.0 } else { 0.0 },
             body_count,
-            _pad_m: [0.0; 2],
+            debug_view,
+            _pad_m: 0.0,
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
     }

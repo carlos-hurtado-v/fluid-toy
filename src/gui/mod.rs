@@ -532,6 +532,22 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                             .text("Refraction (legacy)")
                     );
                     ui.checkbox(&mut state.rendering.ssr_enabled, "Screen-Space Reflections");
+                    egui::ComboBox::from_label("Refraction Debug")
+                        .selected_text(state.rendering.mc_debug_view.label())
+                        .show_ui(ui, |ui| {
+                            for view in crate::state::McDebugView::ALL {
+                                ui.selectable_value(&mut state.rendering.mc_debug_view, view, view.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Water pixels show what physical refraction did, as data \
+                             (post-processing off while active). Paths: route taken (R), \
+                             final lookup (G), mirror bounces (B). Lookup: lookup uv. \
+                             Jump: lookup jump between pixels (bright = banding/aliasing). \
+                             Exit: exit angle cosine, water path, bounces. \
+                             Decode captures with scripts/debug_decode.py",
+                        );
                     deep_water_color_control(ui, state);
                 }
 

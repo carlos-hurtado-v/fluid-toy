@@ -13,6 +13,57 @@ pub enum FluidRenderMode {
 }
 
 
+/// MC refraction debug views: the water pixels show what the refraction code
+/// did instead of the shaded result. Values are written as plain numbers (post
+/// processing and FXAA are bypassed while one is on) so captures can be read
+/// back exactly: `scripts/debug_decode.py` holds the encoding and the id
+/// tables, and turns a capture into a false-color map + per-region histogram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum McDebugView {
+    #[default]
+    Off,
+    /// R = refraction path id / 16, G = final lookup kind / 8, B = (mirror bounces + 1) / 8
+    Paths,
+    /// R, G = screen uv of the final background-texture lookup, B = lookup kind / 8
+    Lookup,
+    /// How far the lookup jumps between neighbouring pixels: log2(1 + texels) / 8
+    /// in all channels. Banding, staircases and aliasing show up as speckle
+    Jump,
+    /// R = cos of the final exit angle (0 = grazing / near critical), G = water
+    /// path to the first exit / 4 m, B = (mirror bounces + 1) / 8
+    Exit,
+}
+
+impl McDebugView {
+    pub const ALL: [McDebugView; 5] = [
+        McDebugView::Off,
+        McDebugView::Paths,
+        McDebugView::Lookup,
+        McDebugView::Jump,
+        McDebugView::Exit,
+    ];
+
+    pub fn as_u32(self) -> u32 {
+        match self {
+            McDebugView::Off => 0,
+            McDebugView::Paths => 1,
+            McDebugView::Lookup => 2,
+            McDebugView::Jump => 3,
+            McDebugView::Exit => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            McDebugView::Off => "Off",
+            McDebugView::Paths => "Paths",
+            McDebugView::Lookup => "Lookup",
+            McDebugView::Jump => "Jump",
+            McDebugView::Exit => "Exit",
+        }
+    }
+}
+
 /// Marching cubes grid resolution presets
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum McGridResolution {
@@ -336,6 +387,8 @@ pub struct RenderConfig {
     /// color emerges from it; Clarity sets turbidity and the water color its
     /// spectral shape. Off = legacy hand-tuned model (uses deep_water_color).
     pub physical_water_medium: bool,
+    /// MC refraction debug view (see McDebugView); bypasses post-processing
+    pub mc_debug_view: McDebugView,
     /// Deep water color - what you see looking into deep water (legacy medium)
     pub deep_water_color: [f32; 3],
     /// Surface smoothing - blur radius for MC density field in voxels (0 = off).
@@ -397,6 +450,7 @@ impl Default for RenderConfig {
             refraction_strength: 0.045,
             mc_physical_refraction: true,
             physical_water_medium: true,
+            mc_debug_view: McDebugView::Off,
             deep_water_color: [0.005, 0.03, 0.08],
             mc_blur_radius: 1,
             mc_calm_smoothing: 1.0,
