@@ -282,6 +282,35 @@ fn background_depth_at(uv: vec2<f32>) -> f32 {
     return textureLoad(background_depth_tex, texel_at(uv, textureDimensions(background_depth_tex)), 0);
 }
 
+// Neighbouring texels whose raw depths differ by more than this fraction of
+// (1 - depth), roughly the relative distance, belong to different surfaces
+const DEPTH_EDGE_REL: f32 = 0.05;
+
+// Depth at a screen point for ray-march crossing tests, bilinear between texel
+// centres. Raw depth of a plane is affine in screen space, so floors, walls and
+// the ground come back exact. With per-texel depth every crossing a march finds
+// snaps to the texel grid, and a refraction that magnifies repeats the same
+// lookup on neighbouring pixel rows: a staircase that beats against the pixel
+// grid as banding. Across a silhouette, interpolating would invent a surface
+// in between, so there it falls back to the nearest texel.
+fn depth_smooth(tex: texture_depth_2d, uv: vec2<f32>) -> f32 {
+    let dims = vec2<i32>(textureDimensions(tex));
+    let p = uv * vec2<f32>(dims) - 0.5;
+    let f = fract(p);
+    let i0 = clamp(vec2<i32>(floor(p)), vec2<i32>(0), dims - 1);
+    let i1 = clamp(vec2<i32>(floor(p)) + 1, vec2<i32>(0), dims - 1);
+    let d00 = textureLoad(tex, i0, 0);
+    let d10 = textureLoad(tex, vec2<i32>(i1.x, i0.y), 0);
+    let d01 = textureLoad(tex, vec2<i32>(i0.x, i1.y), 0);
+    let d11 = textureLoad(tex, i1, 0);
+    let d_min = min(min(d00, d10), min(d01, d11));
+    let d_max = max(max(d00, d10), max(d01, d11));
+    if (d_max - d_min > DEPTH_EDGE_REL * max(1.0 - d_min, 1e-6)) {
+        return textureLoad(tex, texel_at(uv, vec2<u32>(dims)), 0);
+    }
+    return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
+
 // World point seen at screen uv with raw hardware depth. Goes through the real
 // inverse matrices, so it holds whatever depth convention the projection uses.
 fn screen_to_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
@@ -326,7 +355,7 @@ fn backdrop_along(dir: vec3<f32>) -> vec3<f32> {
 // seen at `uv0`: a refracted ray skimming a floor lands far behind that first
 // guess, which a fixed-point iteration overshoots toward the horizon.
 const MARCH_STEPS: i32 = 20;
-const MARCH_REFINE: i32 = 5;
+const MARCH_REFINE: i32 = 8;
 const MARCH_REACH: f32 = 4.0;
 
 // Screen uv (y down) and raw depth of a world point
@@ -346,7 +375,7 @@ fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0
         if (any(q.xy < vec2<f32>(0.0)) || any(q.xy > vec2<f32>(1.0))) {
             break;  // left the screen
         }
-        if (q.z >= background_depth_at(q.xy)) {
+        if (q.z >= depth_smooth(background_depth_tex, q.xy)) {
             hi = s;
             break;
         }
@@ -363,13 +392,247 @@ fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0
     for (var k = 0; k < MARCH_REFINE; k++) {
         let mid = 0.5 * (lo + hi);
         let q = screen_point(origin + dir * mid);
-        if (q.z >= background_depth_at(q.xy)) {
+        if (q.z >= depth_smooth(background_depth_tex, q.xy)) {
             hi = mid;
         } else {
             lo = mid;
         }
     }
     return screen_point(origin + dir * hi).xy;
+}
+
+// === Container walls as optical interfaces ===
+// In a wireframe (glass-less) tank the water's sides and bottom ARE the
+// container walls, like water against glass: flat planes. The MC surface
+// there is a soft particle bulge — deeper water presses further into the wall
+// (~1.7 cm bulge near the top, ~2.8 cm near the floor), so its normals lean
+// and a flat slab turns into a weak prism; seen at eye level that is enough to
+// bend the horizon down onto the ground. Fragments on a wall use the plane.
+// Distance beyond the clip margin that still counts as "on the wall" (m)
+const WALL_SNAP_TOLERANCE: f32 = 0.02;
+const WALL_SNAP_MIN_COS: f32 = 0.7;
+// Total internal reflection inside a thin body (drop, crest) has no
+// meaningful next interface in screen space: only follow it in bulk water
+const TIR_MIN_BODY: f32 = 0.1;
+const TIR_MAX_BOUNCES: i32 = 3;
+// Ray tracing inside the water, in screen space (see trace_in_water)
+const TRACE_STEPS: i32 = 16;
+const TRACE_REFINE: i32 = 6;
+
+// Outward plane normal (local, .w = 1) of the wall or floor this point lies on
+// with a matching outward MC normal, else .w = 0. Never the open top.
+fn wall_plane(local: vec3<f32>, n_local: vec3<f32>) -> vec4<f32> {
+    if (container.is_pool != 0u) {
+        return vec4<f32>(0.0);
+    }
+    let h = vec3<f32>(container.half_width, container.half_height, container.half_depth);
+    let tol = container.clip_margin + WALL_SNAP_TOLERANCE;
+    var best = vec4<f32>(0.0);
+    var best_dist = tol;
+    let planes = array<vec3<f32>, 5>(
+        vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0),
+        vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0),
+        vec3<f32>(0.0, -1.0, 0.0),
+    );
+    for (var i = 0; i < 5; i++) {
+        let pn = planes[i];
+        let dist = abs(dot(local, pn) - dot(h, abs(pn)));
+        if (dist < best_dist && dot(n_local, pn) > WALL_SNAP_MIN_COS) {
+            best_dist = dist;
+            best = vec4<f32>(pn, 1.0);
+        }
+    }
+    return best;
+}
+
+// Ray from inside the container box to its walls/floor (local space; the
+// top is open): xyz = outward normal of the plane hit, w = distance
+fn box_interior_exit(o: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
+    let h = vec3<f32>(container.half_width, container.half_height, container.half_depth);
+    var best = vec4<f32>(0.0, 0.0, 0.0, 1e6);
+    if (abs(d.x) > 1e-5) {
+        let t = (sign(d.x) * h.x - o.x) / d.x;
+        if (t < best.w) { best = vec4<f32>(sign(d.x), 0.0, 0.0, t); }
+    }
+    if (abs(d.z) > 1e-5) {
+        let t = (sign(d.z) * h.z - o.z) / d.z;
+        if (t < best.w) { best = vec4<f32>(0.0, 0.0, sign(d.z), t); }
+    }
+    if (d.y < -1e-5) {
+        let t = (-h.y - o.y) / d.y;
+        if (t < best.w) { best = vec4<f32>(0.0, -1.0, 0.0, t); }
+    }
+    best.w = max(best.w, 0.0);
+    return best;
+}
+
+// What a point inside the water would run into, at screen point q (uv, raw
+// depth): 2 = an opaque surface (floor or ground, a body, pool walls),
+// 1 = it's out of the water, 0 = still in it. In-water is judged against the
+// nearest back face behind q's pixel, which ends the first stretch of water
+// the camera sees there. With no front depth to check against, that only
+// holds for points on rays heading away from the camera: true of every ray
+// refracted in through the tank's walls or free surface, and of its bounces
+// off walls, floor and surface (each keeps the component that leads away).
+// Rays bent by drops and crests can break it.
+fn trace_event(q: vec3<f32>) -> f32 {
+    if (q.z >= depth_smooth(background_depth_tex, q.xy)) {
+        return 2.0;
+    }
+    let back = depth_smooth(back_depth_tex, q.xy);
+    if (back >= 1.0 || q.z > back) {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+struct TraceEvent {
+    // trace_event kind of the first event (0 = none: the ray reaches max_dist)
+    kind: f32,
+    // Last distance still in the water, and first distance at the event
+    dist_in: f32,
+    dist: f32,
+    // Screen uv at the event
+    uv: vec2<f32>,
+}
+
+// First event along a ray inside the water, within max_dist. Samples are
+// spaced quadratically: ~1 cm apart at the start, where thin drops and crests
+// need them, coarse toward the far walls.
+fn trace_in_water(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> TraceEvent {
+    var lo = 0.0;
+    var hi = -1.0;
+    var kind = 0.0;
+    for (var k = 1; k <= TRACE_STEPS; k++) {
+        let f = f32(k) / f32(TRACE_STEPS);
+        let s = max_dist * f * f;
+        let q = screen_point(origin + dir * s);
+        if (any(q.xy < vec2<f32>(0.0)) || any(q.xy > vec2<f32>(1.0))) {
+            break;
+        }
+        kind = trace_event(q);
+        if (kind > 0.5) {
+            hi = s;
+            break;
+        }
+        lo = s;
+    }
+    if (hi < 0.0) {
+        return TraceEvent(0.0, max_dist, max_dist, vec2<f32>(0.0));
+    }
+    for (var k = 0; k < TRACE_REFINE; k++) {
+        let mid = 0.5 * (lo + hi);
+        let e = trace_event(screen_point(origin + dir * mid));
+        if (e > 0.5) {
+            hi = mid;
+            kind = e;
+        } else {
+            lo = mid;
+        }
+    }
+    return TraceEvent(kind, lo, hi, screen_point(origin + dir * hi).xy);
+}
+
+struct WaterExit {
+    // Where the ray leaves the water, and the interface's outward normal
+    point: vec3<f32>,
+    normal: vec3<f32>,
+    // Last point found still in the water: where a mirrored ray continues
+    // (the exit point itself lies just outside a back-face crossing)
+    inside: vec3<f32>,
+    // Left through a container wall or the floor (exact plane)
+    on_wall: bool,
+    // Something opaque came first, at this screen uv: the ray ends there
+    blocked: bool,
+    blocked_uv: vec2<f32>,
+}
+
+// How a ray inside the water leaves it, decided along the ray itself: through
+// the free surface or a drop's far side (where it crosses a back face, which
+// supplies the normal), through a container wall or the floor (where the box
+// bounds it: exact plane, and the MC bulge past a wall counts as the wall),
+// or not at all because something opaque is in the way.
+fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
+    let wall = box_interior_exit(world_to_local(container, origin), world_dir_to_local(container, dir));
+    let ev = trace_in_water(origin, dir, wall.w);
+    var out: WaterExit;
+    out.blocked = ev.kind > 1.5;
+    out.blocked_uv = ev.uv;
+    var crossing = ev.kind > 0.5 && ev.dist < wall.w - (container.clip_margin + WALL_SNAP_TOLERANCE);
+    if (crossing) {
+        let back_n = textureLoad(back_normal_tex, texel_at(ev.uv, textureDimensions(back_normal_tex)), 0);
+        if (back_n.w > 0.5) {
+            out.normal = normalize(back_n.xyz);
+        } else {
+            // Crossing on a silhouette edge with no normal written: the free
+            // surface is the likely interface
+            out.normal = local_dir_to_world(container, vec3<f32>(0.0, 1.0, 0.0));
+        }
+        // A ray can only leave through a face it is heading out of. A crossing
+        // whose outward normal points back against the ray is the in-water
+        // test misreading a wavy surface seen edge-on (a trough between the
+        // camera and a point just under the surface reads as dry): ignore it
+        // and let the box bound the ray
+        crossing = dot(out.normal, dir) > 0.0;
+    }
+    if (crossing) {
+        out.point = origin + dir * ev.dist;
+        out.inside = origin + dir * ev.dist_in;
+        out.on_wall = false;
+    } else {
+        out.point = origin + dir * wall.w;
+        out.inside = out.point;
+        out.normal = local_dir_to_world(container, wall.xyz);
+        out.on_wall = true;
+    }
+    return out;
+}
+
+// What a ray leaving the water at `p_out` along `dir` reaches: the surface
+// behind that point, if any, else the backdrop far along it
+fn scene_from(p_out: vec3<f32>, dir: vec3<f32>, front_depth_raw: f32, straight: vec3<f32>) -> vec3<f32> {
+    let uv = screen_point(p_out).xy;
+    let depth = background_depth_at(uv);
+    if (depth < BACKDROP_DEPTH) {
+        return background_at(march_to_background(p_out, dir, uv, depth), front_depth_raw, straight);
+    }
+    return backdrop_along(dir);
+}
+
+// Total internal reflection: the interface is a mirror. Follow the reflected
+// ray through the bulk to where it next leaves the water (a container wall or
+// the floor, or the free surface from below) and either get out there or
+// reflect again. This is the aquarium look: side walls and the underside of
+// the surface mirror the tank interior.
+fn follow_internal_reflection(
+    start: vec3<f32>,
+    dir: vec3<f32>,
+    front_depth_raw: f32,
+    straight: vec3<f32>,
+) -> vec3<f32> {
+    var o = start;
+    var d = dir;
+    for (var bounce = 0; bounce < TIR_MAX_BOUNCES; bounce++) {
+        let ex = water_exit(o, d);
+        if (ex.blocked) {
+            return background_at(ex.blocked_uv, front_depth_raw, straight);
+        }
+        if (container.is_pool != 0u && ex.on_wall) {
+            // Opaque pool walls should have blocked the ray already
+            return straight;
+        }
+        let out_dir = refract(d, -ex.normal, water.ior);
+        if (dot(out_dir, out_dir) > 0.5) {
+            return scene_from(ex.point, out_dir, front_depth_raw, straight);
+        }
+        // Reflects again: continue inside the water
+        o = ex.inside;
+        d = reflect(d, ex.normal);
+    }
+    // Out of bounces: wherever the ray is heading beats the view straight
+    // through (which would paint what lies behind the tank, often sky, into
+    // the mirror)
+    return scene_from(o, d, front_depth_raw, straight);
 }
 
 // Two-interface image-space refraction (after Wyman 2005). Snell-refract the
@@ -403,33 +666,44 @@ fn refract_scene(
         return backdrop_along(t1);
     }
 
-    // Cross the body to the back face, refract out through its normal there
-    let p_exit = p + t1 * distance(p, screen_to_world(screen_uv, back_depth_raw));
-    let exit_uv = screen_point(p_exit).xy;
-    var back_n = textureLoad(back_normal_tex, texel_at(exit_uv, textureDimensions(back_normal_tex)), 0);
-    if (back_n.w < 0.5) {
-        // Landed outside the body's silhouette: use the exit face behind this pixel
-        back_n = textureLoad(back_normal_tex, texel_at(screen_uv, textureDimensions(back_normal_tex)), 0);
+    var p_exit: vec3<f32>;
+    var p_inside: vec3<f32>;
+    var n_exit: vec3<f32>;
+    if (container.is_pool == 0u) {
+        // Wireframe tank: find the exit along the refracted ray itself. The
+        // back face behind this pixel is where the VIEW ray leaves, and the
+        // refracted ray can leave somewhere else entirely: near the sides the
+        // view ray meets a side wall while the refracted ray, bent toward the
+        // front wall's normal, runs on to the back wall (or vice versa)
+        let ex = water_exit(p, t1);
+        if (ex.blocked) {
+            return background_at(ex.blocked_uv, front_depth_raw, straight);
+        }
+        p_exit = ex.point;
+        p_inside = ex.inside;
+        n_exit = ex.normal;
+    } else {
+        // Cross the body to the back face, refract out through its normal there
+        p_exit = p + t1 * distance(p, screen_to_world(screen_uv, back_depth_raw));
+        p_inside = p_exit;
+        let exit_uv = screen_point(p_exit).xy;
+        var back_n = textureLoad(back_normal_tex, texel_at(exit_uv, textureDimensions(back_normal_tex)), 0);
+        if (back_n.w < 0.5) {
+            // Landed outside the body's silhouette: use the exit face behind this pixel
+            back_n = textureLoad(back_normal_tex, texel_at(screen_uv, textureDimensions(back_normal_tex)), 0);
+        }
+        n_exit = normalize(back_n.xyz);
     }
-    let n_exit = normalize(back_n.xyz);
     let t2 = refract(t1, -n_exit, water.ior);
     if (dot(t2, t2) < 0.5) {
-        // Total internal reflection (typically a flat ray that came in through a
-        // side face meeting the bottom past the 48.6 deg critical angle). In a
-        // slab the ray then zig-zags between the parallel top and bottom like a
-        // light guide and leaves through the far side close to its original
-        // heading, so straight-through is the right picture — following the
-        // single mirrored bounce instead paints the sky over the whole face.
-        return straight;
+        // Total internal reflection: in bulk water, follow the mirror bounce;
+        // inside a thin drop or crest the next interface isn't knowable here
+        if (distance(p, p_exit) < TIR_MIN_BODY) {
+            return straight;
+        }
+        return follow_internal_reflection(p_inside, reflect(t1, n_exit), front_depth_raw, straight);
     }
-
-    // What the exit ray reaches: the surface behind the exit point, if any,
-    // else the backdrop far along it
-    let bg_exit_depth = background_depth_at(exit_uv);
-    if (bg_exit_depth < BACKDROP_DEPTH) {
-        return background_at(march_to_background(p_exit, t2, exit_uv, bg_exit_depth), front_depth_raw, straight);
-    }
-    return backdrop_along(t2);
+    return scene_from(p_exit, t2, front_depth_raw, straight);
 }
 
 // === Foam field compositing ===
@@ -693,17 +967,32 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         normal = -normal;
     }
 
-    if (water.physical_refraction != 0.0) { let lp = world_to_local(container, input.world_position); return vec4<f32>(0.5 + 2.0 * normal.y, 0.5 + 2.0 * view_dir.y, 0.5 + (lp.z - container.half_depth) * 10.0, 1.0); } // DEBUG
-    // Mesh normal (camera-facing) before ripples: the foam map's top test
-    let surface_up = world_dir_to_local(container, normal).y;
+    let local_pos = world_to_local(container, input.world_position);
     // Pixel footprint on the surface (m), for the foam lace's antialiasing.
     // Taken here, in uniform control flow, where derivatives are valid.
-    let local_pos = world_to_local(container, input.world_position);
     let foam_px = max(length(dpdx(local_pos.xz)), length(dpdy(local_pos.xz)));
 
-    // Micro-ripple perturbation: adds small-scale surface detail the MC mesh can't capture.
-    let ripple_grad = ripple_normal(input.world_position, water.time);
-    normal = normalize(normal + ripple_grad * water.ripple_strength);
+    // Water against a wireframe container wall is flat like water against
+    // glass: use the wall plane, not the MC bulge (physical refraction only,
+    // so the legacy path stays as it was)
+    var on_wall = false;
+    if (water.physical_refraction != 0.0) {
+        let wall = wall_plane(local_pos, world_dir_to_local(container, normal));
+        if (wall.w > 0.5) {
+            normal = local_dir_to_world(container, wall.xyz);
+            on_wall = true;
+        }
+    }
+
+    // Mesh normal (camera-facing) before ripples: the foam map's top test
+    let surface_up = world_dir_to_local(container, normal).y;
+
+    // Micro-ripple perturbation: adds small-scale surface detail the MC mesh
+    // can't capture (a free-surface effect: not on water held flat by a wall)
+    if (!on_wall) {
+        let ripple_grad = ripple_normal(input.world_position, water.time);
+        normal = normalize(normal + ripple_grad * water.ripple_strength);
+    }
 
     // === THICKNESS CALCULATION ===
     // Sample back face depth at this screen position
