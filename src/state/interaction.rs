@@ -62,6 +62,13 @@ pub struct SprayConfig {
     pub foam_coverage: f32,
     /// Master scale on entrained-air milkiness in the water (1 = calibrated)
     pub aeration_strength: f32,
+    /// Surface foam map (MC mode): foam settling on the top surface moves into
+    /// an advected 2D layer instead of staying particles (coherent patches and
+    /// strands instead of per-particle snow). Off = particle foam everywhere.
+    pub foam_map: bool,
+    /// Surface foam half-life in the map (s) for thick foam; thin foam also
+    /// bursts away within a couple of seconds. Clean water ~1-2, pool/sea 5+
+    pub foam_persistence: f32,
 }
 
 impl Default for SprayConfig {
@@ -84,6 +91,8 @@ impl Default for SprayConfig {
             bubbles_visible: true,
             foam_coverage: 0.8,
             aeration_strength: 0.95,
+            foam_map: true,
+            foam_persistence: 3.0,
         }
     }
 }

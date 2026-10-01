@@ -1,5 +1,10 @@
 //! Rendering module
 
+/// Format of the HDR scene buffer every scene renderer draws into (and of
+/// their MSAA/background copies). Linear radiance, unclipped: post_process
+/// applies exposure, bloom and ACES before the display-format output.
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
 pub mod calm_smoothing;
 pub mod camera;
 pub mod caustics;

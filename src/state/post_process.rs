@@ -95,7 +95,9 @@ impl Default for PostProcessConfig {
             // Bloom
             bloom_enabled: true,
             bloom_intensity: 0.40,
-            bloom_threshold: 0.85,
+            // HDR scene luminance (pre-exposure): only real highlights — sun
+            // glints, the sun disk, caustic hot spots — not sunlit white walls
+            bloom_threshold: 4.0,
 
             // Chromatic aberration
             chromatic_aberration_enabled: true,
@@ -104,7 +106,7 @@ impl Default for PostProcessConfig {
             // Anamorphic streaks (cyan tint by default for sci-fi look)
             streaks_enabled: true,
             streaks_intensity: 0.15,
-            streaks_threshold: 0.75,
+            streaks_threshold: 8.0,
             streaks_tint: [0.1, 0.17, 0.25], // Slight cyan/blue tint
 
             // Ambient Occlusion
@@ -168,6 +170,26 @@ pub struct GpuPostProcessParams {
 }
 
 impl PostProcessConfig {
+    /// Composite params that only move the HDR scene to the screen (used when
+    /// post-processing is disabled): unit exposure, no tonemap, no effects
+    pub fn passthrough_gpu_params() -> GpuPostProcessParams {
+        let off = Self {
+            exposure: 1.0,
+            saturation: 1.0,
+            contrast: 1.0,
+            brightness: 0.0,
+            temperature: 0.0,
+            vignette_enabled: false,
+            chromatic_aberration_enabled: false,
+            bloom_enabled: false,
+            tonemapping_enabled: false,
+            streaks_enabled: false,
+            ao_enabled: false,
+            ..Self::default()
+        };
+        off.to_gpu_params()
+    }
+
     pub fn to_gpu_params(&self) -> GpuPostProcessParams {
         GpuPostProcessParams {
             exposure: self.exposure,

@@ -1,10 +1,12 @@
 //! Simulation module - physics computation on GPU
 
+pub mod foam_map;
 pub mod particle;
 pub mod probes;
 pub mod spray;
 pub mod sph_3d_grid;
 
+pub use foam_map::FoamMap;
 pub use particle::{SphParticle3D, create_particle_block};
 pub use probes::ProbeSystem;
 pub use spray::SpraySystem;

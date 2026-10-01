@@ -372,8 +372,10 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                             .text("Foam Lifetime")
                             .suffix("s")
                     ).on_hover_text(
-                        "Only foam ages out (energy-scaled per particle at birth); \
-                         spray persists until it lands, bubbles until they surface",
+                        "Lifetime of foam PARTICLES (energy-scaled per particle at birth); \
+                         spray persists until it lands, bubbles until they surface. With the \
+                         Surface Foam Map on, top-surface foam lives in the map instead \
+                         (Foam Persistence) and this only covers foam on walls and overhangs",
                     );
                     ui.add(
                         egui::Slider::new(&mut state.spray.lifetime_variation, 0.0..=1.0)
@@ -418,6 +420,19 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                             .text("Aeration")
                     ).on_hover_text("Entrained-air milkiness inside the water (vortex cores, plunge plumes); 1 = calibrated");
                     ui.checkbox(&mut state.spray.bubbles_visible, "Show Bubbles");
+                    ui.checkbox(&mut state.spray.foam_map, "Surface Foam Map")
+                        .on_hover_text(
+                            "Marching Cubes: foam settling on the top surface moves into an \
+                             advected 2D layer that the surface flow stretches into patches \
+                             and strands. Off = every foam particle rendered individually",
+                        );
+                    ui.add_enabled(
+                        state.spray.foam_map,
+                        egui::Slider::new(&mut state.spray.foam_persistence, 0.5..=60.0)
+                            .logarithmic(true)
+                            .text("Foam Persistence")
+                            .suffix(" s"),
+                    ).on_hover_text("Half-life of surface foam: clean water ~1-3 s, pool or sea water 10 s and up");
                 }
             });
 
@@ -792,7 +807,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                                 .text("Intensity")
                         );
                         ui.add(
-                            egui::Slider::new(&mut state.post_process.bloom_threshold, 0.0..=2.0)
+                            egui::Slider::new(&mut state.post_process.bloom_threshold, 0.0..=16.0)
                                 .text("Threshold")
                         );
                     }
@@ -836,7 +851,7 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                                 .text("Intensity")
                         );
                         ui.add(
-                            egui::Slider::new(&mut state.post_process.streaks_threshold, 0.0..=1.5)
+                            egui::Slider::new(&mut state.post_process.streaks_threshold, 0.0..=32.0)
                                 .text("Threshold")
                         );
                         ui.label("Streak Tint:");

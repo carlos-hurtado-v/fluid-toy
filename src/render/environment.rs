@@ -246,6 +246,9 @@ pub fn estimate_sun(pixels: &[f32], width: u32, height: u32) -> Option<SunEstima
     Some(SunEstimate { direction, irradiance, sky_sh })
 }
 
+/// Upper bound on environment texels uploaded to the GPU (see the upload loop)
+const ENV_RADIANCE_CAP: f32 = 64.0;
+
 /// Load the embedded environment map (compile-time included)
 /// Returns (texture, view, sampler, sh_coefficients, sun)
 #[allow(clippy::type_complexity)]
@@ -283,12 +286,17 @@ pub fn load_embedded_environment_map(
         sh_coefficients.coeffs[0][0], sh_coefficients.coeffs[0][1], sh_coefficients.coeffs[0][2]);
 
     // Convert to RGBA f16 for GPU (filterable format)
-    // Store as u16 (the bit representation of f16) for bytemuck compatibility
+    // Store as u16 (the bit representation of f16) for bytemuck compatibility.
+    // Sun disks exceed the f16 range (Farmland peaks near 69k, PureSky 99k):
+    // they would become inf, and inf texels turn into NaN under filtering.
+    // Capped instead — the sun's light is measured from the full-precision data
+    // above, and the shown/reflected disk only needs to read far above white.
+    let cap = |v: f32| f16::from_f32(v.min(ENV_RADIANCE_CAP)).to_bits();
     let mut rgba_data: Vec<u16> = Vec::with_capacity((width * height * 4) as usize);
     for pixel in rgb32f.pixels() {
-        rgba_data.push(f16::from_f32(pixel.0[0]).to_bits());
-        rgba_data.push(f16::from_f32(pixel.0[1]).to_bits());
-        rgba_data.push(f16::from_f32(pixel.0[2]).to_bits());
+        rgba_data.push(cap(pixel.0[0]));
+        rgba_data.push(cap(pixel.0[1]));
+        rgba_data.push(cap(pixel.0[2]));
         rgba_data.push(f16::from_f32(1.0).to_bits());
     }
 

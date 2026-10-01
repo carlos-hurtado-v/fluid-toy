@@ -73,6 +73,37 @@ struct Vertex {
 // Depth of everything behind the water (backdrop, container, bodies)
 @group(0) @binding(14) var background_depth_tex: texture_depth_2d;
 
+// Surface foam map (foam_map.wgsl): advected 2D foam layer in container-local
+// XZ, plus the coarse surface grid whose .a is each column's top fluid height
+struct FoamMapParams {
+    origin_x: f32,
+    origin_z: f32,
+    fine_cell: f32,
+    coarse_cell: f32,
+    fine_dim: u32,
+    coarse_dim: u32,
+    num_particles: u32,
+    max_spray: u32,
+    dt: f32,
+    decay: f32,
+    surface_band: f32,
+    deposit_amount: f32,
+    deposit_sigma: f32,
+    grace_age: f32,
+    blur_sigma: f32,
+    flags: u32,
+    flow_phase: f32,
+    burst: f32,
+    _pad0: f32,
+    _pad1: f32,
+}
+@group(0) @binding(15) var foam_map_tex: texture_2d<f32>;
+@group(0) @binding(16) var foam_surface_tex: texture_2d<f32>;
+@group(0) @binding(17) var<uniform> foam_map: FoamMapParams;
+// Flow-map coordinates: (phase A xy, phase B xy) = where the foam at this
+// map texel was when that phase restarted (the lace pattern rides the flow)
+@group(0) @binding(18) var foam_coords_tex: texture_2d<f32>;
+
 @group(0) @binding(11) var<uniform> container: ContainerGeometry;
 
 struct VertexOutput {
@@ -89,6 +120,8 @@ struct FragmentInput {
 }
 
 const PI: f32 = 3.14159265359;
+// Ceiling on written radiance (far above display white, well inside f16)
+const HDR_OUTPUT_MAX: f32 = 4096.0;
 
 // === PBR: GGX/Cook-Torrance BRDF ===
 
@@ -283,8 +316,8 @@ fn backdrop_along(dir: vec3<f32>) -> vec3<f32> {
     if (water.use_env_background == 0u) {
         return vec3<f32>(water.background_r, water.background_g, water.background_b);
     }
-    // Same clamp as the backdrop pass (mc_environment.wgsl)
-    return clamp(sample_environment(dir) * water.env_intensity, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Same radiance as the backdrop pass (mc_environment.wgsl)
+    return max(sample_environment(dir) * water.env_intensity, vec3<f32>(0.0));
 }
 
 // March a ray from `origin` (in or leaving the water) until it passes
@@ -428,6 +461,161 @@ const FOAM_THICK_HI: f32 = 0.85;
 const AERATION_K: f32 = 0.15;
 const AERATION_ALBEDO: vec3<f32> = vec3<f32>(0.22, 0.27, 0.31);
 
+// Coarse surface grid .a for a column without fluid (foam_map.wgsl NO_FLUID)
+const MAP_NO_FLUID: f32 = -99.0;
+
+// === Surface foam (map) appearance ===
+// Real surface foam is a raft of bubbles, not a cream: it thins by bursting,
+// which opens holes until only a lace network of bubble strings is left. The
+// map's density sets how much of the surface the raft covers; WHERE it covers
+// is a cellular lace pattern (Voronoi cell walls) carried by the flow map, so
+// thick foam is a near-solid raft, thinning foam opens growing holes, and the
+// last of it is strings along the cell walls.
+// Lace cell sizes (m): large holes + finer secondary network
+const LACE_CELL: f32 = 0.045;
+const LACE_CELL_FINE: f32 = 0.017;
+// Bubble grain inside the raft (m)
+const BUBBLE_CELL: f32 = 0.0045;
+// Uneven bursting: coverage jitter frequency (1/m, ~12 cm patches)
+const LACE_PATCH_FREQ: f32 = 8.0;
+// Map density below which no raft is drawn (sparse leftover bubbles)
+const RAFT_DENSITY_LO: f32 = 0.2;
+// String breakup frequency (1/m, ~3 cm fragments)
+const LACE_SNAP_FREQ: f32 = 33.0;
+// Coverage response to map density: fraction of surface the raft covers
+const RAFT_COVERAGE_K: f32 = 0.9;
+// Opacity of the raft itself: a thin monolayer is see-through, a thick
+// multilayer raft nearly opaque
+const RAFT_ALPHA_THIN: f32 = 0.35;
+const RAFT_ALPHA_THICK: f32 = 0.92;
+const RAFT_ALPHA_K: f32 = 0.7;
+
+struct MapFoam {
+    density: f32,
+    on_top: f32,
+    // Flow-map coordinates of this point (phase A xy, phase B xy)
+    coords: vec4<f32>,
+}
+
+// Surface-map foam at a fragment: bilinear map reads (density + flow-map
+// coordinates), weighted by whether the fragment is the top surface of its
+// column (overhang undersides, wave and body sides keep particle foam only).
+// `n_local_y`: camera-facing normal's container-local up component.
+fn sample_map_foam(local: vec3<f32>, n_local_y: f32) -> MapFoam {
+    var out: MapFoam;
+    out.density = 0.0;
+    out.on_top = 0.0;
+    out.coords = vec4<f32>(local.xz, local.xz);
+    if ((foam_map.flags & 1u) == 0u) {
+        return out;
+    }
+    let m = local.xz - vec2<f32>(foam_map.origin_x, foam_map.origin_z);
+    // Column top, bilinear over the columns that hold fluid (a nearest-cell
+    // top switches the test on and off in cell-sized blocks on rough water)
+    let cd = i32(foam_map.coarse_dim);
+    let gc = m / foam_map.coarse_cell - 0.5;
+    let c0 = vec2<i32>(floor(gc));
+    let fc = gc - floor(gc);
+    var top_sum = 0.0;
+    var top_w = 0.0;
+    for (var k = 0; k < 4; k++) {
+        let o = vec2<i32>(k & 1, k >> 1);
+        let c = clamp(c0 + o, vec2<i32>(0), vec2<i32>(cd - 1));
+        let h = textureLoad(foam_surface_tex, c, 0).a;
+        let w = select(1.0 - fc, fc, o == vec2<i32>(1));
+        if (h > MAP_NO_FLUID) {
+            top_sum += h * w.x * w.y;
+            top_w += w.x * w.y;
+        }
+    }
+    if (top_w < 1e-4) {
+        return out;
+    }
+    let top = top_sum / top_w;
+    let band = foam_map.surface_band;
+    out.on_top = smoothstep(top - band, top - 0.5 * band, local.y) * smoothstep(0.15, 0.45, n_local_y);
+    if (out.on_top <= 0.0) {
+        return out;
+    }
+    let g = m / foam_map.fine_cell - 0.5;
+    let t0 = vec2<i32>(floor(g));
+    let f = g - floor(g);
+    let fd = i32(foam_map.fine_dim);
+    var foam = 0.0;
+    var coords = vec4<f32>(0.0);
+    for (var k = 0; k < 4; k++) {
+        let o = vec2<i32>(k & 1, k >> 1);
+        let t = clamp(t0 + o, vec2<i32>(0), vec2<i32>(fd - 1));
+        let w = select(1.0 - f, f, o == vec2<i32>(1));
+        foam += textureLoad(foam_map_tex, t, 0).r * (w.x * w.y);
+        coords += textureLoad(foam_coords_tex, t, 0) * (w.x * w.y);
+    }
+    out.density = foam;
+    out.coords = coords;
+    return out;
+}
+
+fn hash22(p: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(hash2(p), hash2(p + vec2<f32>(19.19, 73.31)));
+}
+
+// Worley distances in cell units: x = F1 (nearest feature), y = F2 - F1
+// (distance-to-cell-wall proxy: 0 on the Voronoi walls)
+fn worley(p: vec2<f32>) -> vec2<f32> {
+    let cell = floor(p);
+    let fr = p - cell;
+    var f1 = 8.0;
+    var f2 = 8.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let o = vec2<f32>(f32(x), f32(y));
+            let d = length(o + hash22(cell + o) - fr);
+            if (d < f1) {
+                f2 = f1;
+                f1 = d;
+            } else if (d < f2) {
+                f2 = d;
+            }
+        }
+    }
+    return vec2<f32>(f1, f2 - f1);
+}
+
+// Raft mask at one flow-map position: covered where the distance to the lace
+// network's walls is under a threshold that grows with coverage (thick foam:
+// everything; thinning: holes open from the cell centres; last: strings).
+// Bursting is uneven, so the local coverage is jittered at the patch scale:
+// some areas hold a raft while neighbours are already down to strings.
+// `px`: pixel footprint (m) for antialiasing / distance fade.
+fn raft_mask(p: vec2<f32>, coverage: f32, px: f32) -> f32 {
+    let patch_noise = value_noise_grad(p * LACE_PATCH_FREQ).x;
+    let cov = clamp(coverage * (0.45 + 1.1 * patch_noise), 0.0, 1.0);
+    let coarse = worley(p / LACE_CELL).y;
+    let fine = worley(p / LACE_CELL_FINE + vec2<f32>(5.3, 1.7)).y;
+    // The fine network only subdivides holes while the raft is still dense:
+    // thin foam is a few coarse strings, not a uniform net
+    let fine_weight = mix(3.5, 1.4, smoothstep(0.3, 0.8, cov));
+    let wall = min(coarse, fine * fine_weight);
+    let threshold = -log(max(1.0 - cov * 0.985, 1e-3)) * 0.22;
+    let soft = max(px / LACE_CELL_FINE * 1.5, 0.03);
+    var mask = 1.0 - smoothstep(threshold - soft, threshold + soft, wall);
+    // Thin lace is broken, not a connected net: strings snap into fragments
+    // as the foam thins (gate a string-scale noise by coverage)
+    let snap = value_noise_grad(p * LACE_SNAP_FREQ + vec2<f32>(3.1, 7.9)).x;
+    let keep = clamp(cov * 1.8, 0.0, 1.0);
+    mask *= smoothstep(1.0 - keep - 0.12, 1.0 - keep + 0.12, snap);
+    // Below a pixel the lace can't resolve: converge to its mean coverage
+    return mix(mask, cov, smoothstep(0.25, 0.8, px / LACE_CELL_FINE));
+}
+
+// Bubble grain: bright bubble walls, darker cell interiors; fades to its mean
+// when bubbles shrink below a pixel
+fn bubble_grain(p: vec2<f32>, px: f32) -> f32 {
+    let w = worley(p / BUBBLE_CELL + vec2<f32>(11.1, 3.7));
+    let grain = 0.85 + 0.3 * (1.0 - smoothstep(0.0, 0.25, w.y));
+    return mix(grain, 0.93, smoothstep(0.3, 1.0, px / BUBBLE_CELL));
+}
+
 // GPU-friendly hash → pseudo-random [0,1]
 fn hash2(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
@@ -504,6 +692,14 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     if (dot(normal, view_dir) < 0.0) {
         normal = -normal;
     }
+
+    if (water.physical_refraction != 0.0) { let lp = world_to_local(container, input.world_position); return vec4<f32>(0.5 + 2.0 * normal.y, 0.5 + 2.0 * view_dir.y, 0.5 + (lp.z - container.half_depth) * 10.0, 1.0); } // DEBUG
+    // Mesh normal (camera-facing) before ripples: the foam map's top test
+    let surface_up = world_dir_to_local(container, normal).y;
+    // Pixel footprint on the surface (m), for the foam lace's antialiasing.
+    // Taken here, in uniform control flow, where derivatives are valid.
+    let local_pos = world_to_local(container, input.world_position);
+    let foam_px = max(length(dpdx(local_pos.xz)), length(dpdy(local_pos.xz)));
 
     // Micro-ripple perturbation: adds small-scale surface detail the MC mesh can't capture.
     let ripple_grad = ripple_normal(input.world_position, water.time);
@@ -767,7 +963,31 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Output linear HDR — post-process pipeline handles tone mapping + gamma
+    // Surface foam from the map: a bubble raft whose lace pattern rides the
+    // flow (two flow-map phases crossfaded so each restart is invisible)
+    let map = sample_map_foam(local_pos, surface_up);
+    if (map.density > 0.01 && map.on_top > 0.0) {
+        let raft_cover = 1.0 - exp(-RAFT_COVERAGE_K * water.foam_coverage * max(map.density - RAFT_DENSITY_LO, 0.0));
+        let w_a = 1.0 - abs(2.0 * foam_map.flow_phase - 1.0);
+        let mask = w_a * raft_mask(map.coords.xy, raft_cover, foam_px)
+            + (1.0 - w_a) * raft_mask(map.coords.zw, raft_cover, foam_px);
+        let grain = w_a * bubble_grain(map.coords.xy, foam_px)
+            + (1.0 - w_a) * bubble_grain(map.coords.zw, foam_px);
+        let raft_alpha = mix(RAFT_ALPHA_THIN, RAFT_ALPHA_THICK, 1.0 - exp(-RAFT_ALPHA_K * map.density));
+        let alpha = mask * raft_alpha * map.on_top;
+        if (alpha > 0.002) {
+            var raft_light = evaluate_sh_irradiance(normal) * water.env_intensity;
+            if (light.sun_enabled == 1u) {
+                raft_light += light.sun_color * light.sun_intensity
+                    * max(dot(normal, sun_dir_ws), 0.0) * rim_vis;
+            }
+            let albedo = mix(FOAM_VEIL_ALBEDO, FOAM_ALBEDO, smoothstep(0.3, 2.0, map.density));
+            color = mix(color, albedo * grain * raft_light, alpha);
+        }
+    }
 
-    return vec4<f32>(color, 1.0);
+    // Output linear HDR — post-process pipeline handles tone mapping + gamma.
+    // Bounded: a grazing sun glint off a near-mirror surface can exceed the
+    // f16 scene buffer's range
+    return vec4<f32>(min(color, vec3<f32>(HDR_OUTPUT_MAX)), 1.0);
 }

@@ -38,6 +38,7 @@ pub struct PostProcessRenderer {
     // Pipelines
     composite_pipeline: wgpu::RenderPipeline,
     bloom_threshold_pipeline: wgpu::RenderPipeline,
+    streak_threshold_pipeline: wgpu::RenderPipeline,
     bloom_blur_pipeline: wgpu::RenderPipeline,
     streak_blur_pipeline: wgpu::RenderPipeline,
     fxaa_pipeline: wgpu::RenderPipeline,
@@ -69,7 +70,8 @@ pub struct PostProcessRenderer {
     fxaa_bind_group_layout: wgpu::BindGroupLayout,
 
     // Surface format for scene texture (must match what fluid renderers output)
-    scene_format: wgpu::TextureFormat,
+    /// Display format of the composite/FXAA output
+    output_format: wgpu::TextureFormat,
 
     width: u32,
     height: u32,
@@ -85,8 +87,9 @@ impl PostProcessRenderer {
         params: &GpuPostProcessParams,
     ) -> Self {
         // Create textures
-        // Scene texture uses surface format to match fluid renderer output
-        let (scene_texture, scene_view) = Self::create_texture(device, width, height, "Scene", surface_format);
+        // Scene texture is HDR: renderers write unclipped linear radiance, which
+        // exposure, bloom and ACES need (an 8-bit scene clipped it at 1.0)
+        let (scene_texture, scene_view) = Self::create_texture(device, width, height, "Scene", super::HDR_FORMAT);
         // Bloom textures use HDR format for better quality
         let (bloom_texture_a, bloom_view_a) = Self::create_texture(device, width / 2, height / 2, "Bloom A", wgpu::TextureFormat::Rgba16Float);
         let (bloom_texture_b, bloom_view_b) = Self::create_texture(device, width / 2, height / 2, "Bloom B", wgpu::TextureFormat::Rgba16Float);
@@ -313,6 +316,36 @@ impl PostProcessRenderer {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_bloom_threshold"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Streak threshold pipeline (own threshold: streaks_threshold)
+        let streak_threshold_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Streak Threshold Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_streak_threshold"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
@@ -569,6 +602,7 @@ impl PostProcessRenderer {
             sampler,
             composite_pipeline,
             bloom_threshold_pipeline,
+            streak_threshold_pipeline,
             bloom_blur_pipeline,
             streak_blur_pipeline,
             fxaa_pipeline,
@@ -588,7 +622,7 @@ impl PostProcessRenderer {
             blur_v_buffer,
             bind_group_layout,
             fxaa_bind_group_layout,
-            scene_format: surface_format,
+            output_format: surface_format,
             width,
             height,
         }
@@ -796,7 +830,7 @@ impl PostProcessRenderer {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                pass.set_pipeline(&self.bloom_threshold_pipeline);
+                pass.set_pipeline(&self.streak_threshold_pipeline);
                 pass.set_bind_group(0, &self.streak_threshold_bind_group, &[]);
                 pass.set_bind_group(1, &self.ao_bind_group, &[]);
                 pass.draw(0..3, 0..1);
@@ -911,12 +945,12 @@ impl PostProcessRenderer {
         self.height = height;
 
         // Recreate textures
-        let (scene_texture, scene_view) = Self::create_texture(device, width, height, "Scene", self.scene_format);
+        let (scene_texture, scene_view) = Self::create_texture(device, width, height, "Scene", super::HDR_FORMAT);
         let (bloom_texture_a, bloom_view_a) = Self::create_texture(device, width / 2, height / 2, "Bloom A", wgpu::TextureFormat::Rgba16Float);
         let (bloom_texture_b, bloom_view_b) = Self::create_texture(device, width / 2, height / 2, "Bloom B", wgpu::TextureFormat::Rgba16Float);
         let (streak_texture_a, streak_view_a) = Self::create_texture(device, width / 4, height / 4, "Streak A", wgpu::TextureFormat::Rgba16Float);
         let (streak_texture_b, streak_view_b) = Self::create_texture(device, width / 4, height / 4, "Streak B", wgpu::TextureFormat::Rgba16Float);
-        let (fxaa_texture, fxaa_view) = Self::create_texture(device, width, height, "FXAA", self.scene_format);
+        let (fxaa_texture, fxaa_view) = Self::create_texture(device, width, height, "FXAA", self.output_format);
 
         self.scene_texture = scene_texture;
         self.scene_view = scene_view;

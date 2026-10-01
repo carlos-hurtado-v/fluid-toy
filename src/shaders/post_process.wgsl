@@ -241,15 +241,35 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 // === Bloom extraction shader ===
 // Separate entry point for bloom threshold pass
 
+// Scene luminance is unclipped HDR: a sun glint or the sun disk can sit
+// thousands of times above white. Capping what feeds the blur keeps a single
+// glint from flooding the frame (and f16 from overflowing in the blur).
+const BLOOM_MAX_LUMINANCE: f32 = 32.0;
+
+// Bright-pass with a soft knee (half the threshold wide): the part of each
+// pixel above the threshold, so bloom grows smoothly with brightness instead
+// of switching on whole surfaces
+fn bright_pass(uv: vec2<f32>, threshold: f32) -> vec3<f32> {
+    var color = textureSample(scene_texture, texture_sampler, uv).rgb;
+    let luma = luminance(color);
+    if (luma > BLOOM_MAX_LUMINANCE) {
+        color *= BLOOM_MAX_LUMINANCE / luma;
+    }
+    let l = min(luma, BLOOM_MAX_LUMINANCE);
+    let knee = 0.5 * threshold;
+    let soft = clamp(l - threshold + knee, 0.0, 2.0 * knee);
+    let contribution = max(soft * soft / (4.0 * knee + 1e-4), l - threshold);
+    return color * (contribution / max(l, 1e-4));
+}
+
 @fragment
 fn fs_bloom_threshold(input: VertexOutput) -> @location(0) vec4<f32> {
-    let color = textureSample(scene_texture, texture_sampler, input.uv).rgb;
-    let luma = luminance(color);
+    return vec4<f32>(bright_pass(input.uv, params.bloom_threshold), 1.0);
+}
 
-    // Extract bright pixels above threshold
-    let bloom_color = color * smoothstep(params.bloom_threshold, params.bloom_threshold + 0.2, luma);
-
-    return vec4<f32>(bloom_color, 1.0);
+@fragment
+fn fs_streak_threshold(input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(bright_pass(input.uv, params.streaks_threshold), 1.0);
 }
 
 // === Bloom blur shader ===

@@ -53,6 +53,8 @@ pub struct App {
     env_sampler: Option<wgpu::Sampler>,
     current_hdr: HdrEnvironment,
     sh_coefficients: Option<ShCoefficients>,
+    /// Surface foam map (advected 2D foam layer; MC water shader binds it)
+    foam_map: Option<crate::simulation::FoamMap>,
     /// Sun found in the loaded HDR map (None when the map is too diffuse)
     hdr_sun: Option<SunEstimate>,
     // Last (mode, solid color bits, hdr) the SH uniform buffers were pushed
@@ -162,6 +164,7 @@ impl App {
             env_sampler: None,
             current_hdr: HdrEnvironment::Farmland,
             sh_coefficients: None,
+            foam_map: None,
             hdr_sun: None,
             last_sh_key: None,
             env_bg_pipeline: None,
@@ -396,7 +399,7 @@ impl App {
         let render_params = self.state.rendering.to_gpu_params();
         let renderer = ParticleRenderer3D::new(
             &gpu.device,
-            gpu.config.format,
+            crate::render::HDR_FORMAT,
             &camera_params,
             &render_params,
             gpu.config.width,
@@ -457,16 +460,20 @@ impl App {
             self.state.environment.hdr_selection,
         ).expect("Failed to load environment map");
 
+        // Surface foam map (its textures are bound by the MC water shader)
+        let foam_map = crate::simulation::FoamMap::new(&gpu.device);
+
         // Create marching cubes renderer (shares environment map)
         let mc_renderer = MarchingCubesRenderer::new(
             &gpu.device,
-            gpu.config.format,
+            crate::render::HDR_FORMAT,
             &env_view,
             &env_sampler,
             gpu.config.width,
             gpu.config.height,
             self.state.quality.msaa.as_u32(),
             self.state.rendering.mc_grid_resolution.grid_size(),
+            &foam_map,
         );
 
         // Create wireframe renderer for container visualization
@@ -482,7 +489,7 @@ impl App {
         let rigid_body_renderer = RigidBodyRenderer::new(
             &gpu.device,
             &gpu.queue,
-            gpu.config.format,
+            crate::render::HDR_FORMAT,
             &camera_params,
             self.state.quality.msaa.as_u32(),
         );
@@ -511,7 +518,7 @@ impl App {
         let gpu_sh = GpuShCoefficients { coeffs: sh_coefficients.coeffs };
         let container_renderer = ContainerRenderer::new(
             &gpu.device,
-            gpu.config.format,
+            crate::render::HDR_FORMAT,
             &camera_params,
             &container_geom,
             &pool_style,
@@ -538,7 +545,7 @@ impl App {
         );
         let spray_renderer = SprayRenderer::new(
             &gpu.device,
-            gpu.config.format,
+            crate::render::HDR_FORMAT,
             &camera_params,
             spray_system.spray_buffer(),
             &self.build_spray_render_params(),
@@ -660,7 +667,7 @@ impl App {
                 module: &env_bg_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: gpu.config.format,
+                    format: crate::render::HDR_FORMAT,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -698,7 +705,7 @@ impl App {
         // Create screen-space fluid renderer
         let ss_renderer = ScreenSpaceFluidRenderer::new(
             &gpu.device,
-            gpu.config.format,
+            crate::render::HDR_FORMAT,
             &env_view,
             &env_sampler,
             &camera_params,
@@ -741,6 +748,7 @@ impl App {
         self.env_sampler = Some(env_sampler);
         self.sh_coefficients = Some(sh_coefficients);
         self.hdr_sun = hdr_sun;
+        self.foam_map = Some(foam_map);
         self.current_hdr = self.state.environment.hdr_selection;
         self.env_bg_pipeline = Some(env_bg_pipeline);
         self.env_bg_bind_group = Some(env_bg_bind_group);
@@ -801,7 +809,7 @@ impl App {
             let render_params = self.state.rendering.to_gpu_params();
             self.renderer = Some(ParticleRenderer3D::new(
                 &gpu.device,
-                gpu.config.format,
+                crate::render::HDR_FORMAT,
                 &camera_params,
                 &render_params,
                 gpu.config.width,
@@ -825,7 +833,7 @@ impl App {
                 let camera_params = self.camera.to_gpu_params();
                 let mut spray_renderer = SprayRenderer::new(
                     &gpu.device,
-                    gpu.config.format,
+                    crate::render::HDR_FORMAT,
                     &camera_params,
                     spray_system.spray_buffer(),
                     &self.build_spray_render_params(),
@@ -843,6 +851,11 @@ impl App {
                 }
                 self.spray_renderer = Some(spray_renderer);
                 self.spray_system = Some(spray_system);
+            }
+
+            // Fresh simulation: no foam on its surface yet
+            if let Some(foam_map) = self.foam_map.as_mut() {
+                foam_map.request_reset();
             }
 
             // Probes bind the new simulation's particle buffer
@@ -1624,6 +1637,40 @@ impl App {
             }
         }
 
+        // Surface foam map: settled foam particles deposit + retire, the
+        // layer advects with the smoothed surface flow (MC water renders it)
+        if let Some(foam_map) = self.foam_map.as_mut() {
+            let spray = &self.state.spray;
+            let active = spray.enabled
+                && spray.foam_map
+                && self.state.rendering.render_mode == FluidRenderMode::MarchingCubes
+                && self.spray_system.is_some();
+            let max_spray = self.spray_system.as_ref().map_or(0, |s| s.capacity());
+            foam_map.update(
+                &gpu.queue,
+                active,
+                stepped,
+                self.state.container.width,
+                self.state.container.depth,
+                self.state.sph.kernel_radius,
+                self.state.simulation.substep_dt() * self.state.simulation.substeps as f32,
+                spray.foam_persistence,
+                self.state.runtime.particle_count,
+                max_spray,
+            );
+            if active && stepped {
+                if let (Some(sph_sim), Some(spray_sys)) = (&self.sph_simulation, &self.spray_system) {
+                    foam_map.encode(
+                        &gpu.device,
+                        &mut encoder,
+                        sph_sim.particle_buffer(),
+                        spray_sys.spray_buffer(),
+                        sph_sim.container_geom_buffer(),
+                    );
+                }
+            }
+        }
+
         // Prepare a swapchain readback if a capture is due this frame
         let mut capture_due = false;
         while self
@@ -1684,17 +1731,14 @@ impl App {
             }
         }
 
-        // Determine render target (post-process intermediate or direct to screen)
+        // Scene renderers always draw into the HDR scene buffer (HDR_FORMAT);
+        // post-processing (or its passthrough when disabled) writes the screen
         let post_process_enabled = self.state.post_process.enabled;
-        let render_target = if post_process_enabled {
-            if let Some(pp) = &self.post_process_renderer {
-                pp.scene_view()
-            } else {
-                &view
-            }
-        } else {
-            &view
-        };
+        let render_target = self
+            .post_process_renderer
+            .as_ref()
+            .expect("post-process renderer owns the HDR scene buffer")
+            .scene_view();
 
         // Render fluid or particles based on render mode,
         // then render rigid body with depth testing against the fluid
@@ -2208,12 +2252,16 @@ impl App {
             }
         }
 
-        // Apply post-processing if enabled
-        if post_process_enabled {
-            if let Some(pp) = &self.post_process_renderer {
+        // Post-process the HDR scene onto the screen; disabled = plain
+        // passthrough (no exposure, tonemap or effects; clipped at 1)
+        if let Some(pp) = &self.post_process_renderer {
+            if post_process_enabled {
                 let pp_params = self.state.post_process.to_gpu_params();
                 pp.update_params(&gpu.queue, &pp_params);
                 pp.render(&mut encoder, &view, self.state.post_process.bloom_enabled, self.state.post_process.streaks_enabled, self.state.quality.fxaa_enabled);
+            } else {
+                pp.update_params(&gpu.queue, &crate::state::PostProcessConfig::passthrough_gpu_params());
+                pp.render(&mut encoder, &view, false, false, self.state.quality.fxaa_enabled);
             }
         }
 

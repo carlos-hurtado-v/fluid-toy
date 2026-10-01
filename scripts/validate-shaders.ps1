@@ -17,6 +17,7 @@ $rigidCommon = Join-Path $shaderDir "rigid_body_common.wgsl"
 
 $prefixed = @(
     "mc_density.wgsl",
+    "foam_map.wgsl",
     "mc_render.wgsl",
     "mc_back_depth.wgsl",
     "mc_caustics_gbuffer.wgsl",

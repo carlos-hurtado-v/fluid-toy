@@ -152,8 +152,9 @@ fn backdrop(uv: vec2<f32>) -> Backdrop {
         radiance = sample_environment(world_ray);
     }
 
-    // Simple tone mapping (match screen-space HDR handling)
-    out.color = clamp(radiance * env_params.env_intensity * occlusion, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Unclipped HDR radiance: post_process tonemaps (the bright sky and the
+    // sun disk keep their range for bloom and for refraction/SSR reads)
+    out.color = max(radiance * env_params.env_intensity * occlusion, vec3<f32>(0.0));
     return out;
 }
 

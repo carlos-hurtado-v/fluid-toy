@@ -474,6 +474,11 @@ impl SpraySystem {
         counts
     }
 
+    /// Particle slots in the spray buffer
+    pub fn capacity(&self) -> u32 {
+        self.max_spray_particles
+    }
+
     pub fn spray_buffer(&self) -> &wgpu::Buffer {
         &self.spray_buffer
     }

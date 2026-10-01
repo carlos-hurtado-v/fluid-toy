@@ -311,6 +311,12 @@ pub struct MarchingCubesRenderer {
     // by the water shader (foam reads as connected patches, not sprites)
     foam_density_texture: wgpu::Texture,
     foam_density_view: wgpu::TextureView,
+    // Surface foam map (simulation::FoamMap): foam layer, coarse surface grid
+    // (column tops) and its params, composited on the top surface
+    foam_map_view: wgpu::TextureView,
+    foam_surface_view: wgpu::TextureView,
+    foam_map_params: wgpu::Buffer,
+    foam_coords_view: wgpu::TextureView,
 
     // Buffers
     grid_params_buffer: wgpu::Buffer,
@@ -402,6 +408,7 @@ pub struct MarchingCubesRenderer {
 }
 
 impl MarchingCubesRenderer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
@@ -411,7 +418,12 @@ impl MarchingCubesRenderer {
         height: u32,
         sample_count: u32,
         grid_size: u32,
+        foam_map: &crate::simulation::FoamMap,
     ) -> Self {
+        let foam_map_view = foam_map.foam_view().clone();
+        let foam_surface_view = foam_map.surface_view().clone();
+        let foam_map_params = foam_map.params_buffer().clone();
+        let foam_coords_view = foam_map.coords_view().clone();
         // Clamp sample count to valid values (1, 2, 4, 8)
         // Note: Not all GPUs support 8x MSAA - wgpu will validate this
         let sample_count = match sample_count {
@@ -1353,6 +1365,48 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Surface foam map + coarse surface grid + params
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 17,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Foam flow-map coordinates (advected lace pattern)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 18,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1618,6 +1672,22 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 14,
                     resource: wgpu::BindingResource::TextureView(&background_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::TextureView(&foam_map_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: wgpu::BindingResource::TextureView(&foam_surface_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: foam_map_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: wgpu::BindingResource::TextureView(&foam_coords_view),
                 },
             ],
         });
@@ -2012,6 +2082,10 @@ impl MarchingCubesRenderer {
             background_view,
             foam_density_texture,
             foam_density_view,
+            foam_map_view,
+            foam_surface_view,
+            foam_map_params,
+            foam_coords_view,
             grid_params_buffer,
             _edge_table_buffer: edge_table_buffer,
             _tri_table_buffer: tri_table_buffer,
@@ -3141,6 +3215,22 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 14,
                     resource: wgpu::BindingResource::TextureView(&self.background_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::TextureView(&self.foam_map_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: wgpu::BindingResource::TextureView(&self.foam_surface_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: self.foam_map_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: wgpu::BindingResource::TextureView(&self.foam_coords_view),
                 },
             ],
         })
