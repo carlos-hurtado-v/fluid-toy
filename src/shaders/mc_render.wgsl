@@ -284,6 +284,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     let reflect_dir = reflect(-view_dir, normal);
     let roughness_sq = water.roughness * water.roughness;
     var reflection_color: vec3<f32>;
+    var below_horizon = 0.0;
     if (water.use_env_background == 0u) {
         reflection_color = vec3<f32>(water.background_r, water.background_g, water.background_b);
     } else {
@@ -297,9 +298,11 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         // Fade env reflection when reflect direction points below horizon.
         // The env map only contains sky — it can't represent nearby scene geometry
         // (walls, floor). Downward reflections would show incorrect sky colors.
-        // SSR handles these directions; without SSR, fade to the interior instead.
+        // SSR handles these directions; without SSR, the faded share is filled
+        // with the water's own body color once it's known (below).
         let horizon_fade = smoothstep(-0.15, 0.1, reflect_dir.y);
         reflection_color = env_reflection * horizon_fade;
+        below_horizon = 1.0 - horizon_fade;
     }
 
     // Screen-space reflections — blend with env map based on SSR confidence
@@ -388,8 +391,12 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
 
         sun_specular = light.sun_color * light.sun_intensity * specular_brdf * NdotL * rim_vis;
 
-        // Subsurface illumination — light enters water, scatters, exits toward viewer
-        let light_entering = NdotL * (1.0 - F_spec);
+        // Subsurface illumination — light enters water, scatters, exits toward viewer.
+        // Driven by the mean (flat) surface, not the facet: refraction squeezes all
+        // transmitted light into the ~49 deg Snell cone and it travels far past the
+        // wave scale before scattering back, so body radiance is volumetric. A facet
+        // NdotL here is a Lambert lobe — Lambert + sharp GGX is the CG plastic look.
+        let light_entering = max(sun_dir_ws.y, 0.0) * (1.0 - F_spec);
         let interior_glow = water.water_color * transmittance;
         sun_subsurface = interior_glow * light_entering * light.sun_color * light.sun_intensity * 0.18;
 
@@ -404,8 +411,9 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
 
     // IBL diffuse irradiance from spherical harmonics
     // Light enters the water (1-F), travels through the volume (transmittance),
-    // and scatters back (scatter_strength) — same physics as subsurface scattering
-    let ambient_irradiance = evaluate_sh_irradiance(normal) * water.env_intensity;
+    // and scatters back (scatter_strength) — same physics as subsurface scattering,
+    // so it also sees the mean surface (sky irradiance onto a flat water plane)
+    let ambient_irradiance = evaluate_sh_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * water.env_intensity;
     let ambient_subsurface = ambient_irradiance * water.water_color * transmittance * scatter_strength * 0.6;
 
     // Add sun subsurface (weighted by 1-fresnel for energy conservation) and ambient irradiance
@@ -420,13 +428,21 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     let whitewater_field = textureSampleLevel(foam_density_tex, env_sampler, screen_uv, 0.0).rg;
     let aeration = 1.0 - exp(-AERATION_K * water.aeration_strength * whitewater_field.g);
     if (aeration > 0.002) {
-        var aeration_light = evaluate_sh_irradiance(normal) * water.env_intensity;
+        // Bubble clouds sit in the volume: lit through the mean surface like
+        // the body light above, not by the facet they're seen through
+        var aeration_light = evaluate_sh_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * water.env_intensity;
         if (light.sun_enabled == 1u) {
             aeration_light += light.sun_color * light.sun_intensity
-                * max(dot(normal, sun_dir_ws), 0.0) * 0.6 * rim_vis;
+                * max(sun_dir_ws.y, 0.0) * 0.6 * rim_vis;
         }
         lit_interior = mix(lit_interior, AERATION_ALBEDO * aeration_light, aeration);
     }
+
+    // Below-horizon reflection rays mostly hit more water, so the faded env
+    // share takes the water's own color. (Black painted dark creases on every
+    // wave back at grazing Fresnel; a blurred-env fallback overshoots into white
+    // creases since the sky's lower hemisphere is bright haze.)
+    reflection_color += lit_interior * below_horizon * (1.0 - ssr_confidence);
 
     // Combine reflection and refraction based on Fresnel
     // At grazing angles (high fresnel): more reflection

@@ -286,6 +286,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     let reflect_dir = reflect(-view_dir, normal);
     let roughness_sq = ss_roughness * ss_roughness;
     var reflection_color: vec3<f32>;
+    var below_horizon = 0.0;
     if (water.use_env_background == 0u) {
         reflection_color = vec3<f32>(water.background_r, water.background_g, water.background_b);
     } else {
@@ -293,11 +294,13 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         let diffuse_env = evaluate_sh_irradiance(reflect_dir) * water.env_intensity;
         let env_reflection = mix(sharp_env, diffuse_env, roughness_sq);
 
-        // Below-horizon reflections fall back to dim diffuse ambient rather than
-        // black. Sphere-like SS features (droplets, choppy bumps) reflect in every
-        // direction, and a hard fade-to-black paints dark rims on all of them.
+        // Below-horizon reflections can't come from the sky map. Sphere-like SS
+        // features (droplets, choppy bumps) reflect in every direction, and a hard
+        // fade-to-black paints dark rims on all of them; the faded share is filled
+        // with the water's own body color once it's known (below).
         let horizon_fade = smoothstep(-0.15, 0.1, reflect_dir.y);
-        reflection_color = mix(diffuse_env * 0.5, env_reflection, horizon_fade);
+        reflection_color = env_reflection * horizon_fade;
+        below_horizon = 1.0 - horizon_fade;
     }
 
     // === SCREEN-SPACE REFRACTION ===
@@ -365,7 +368,8 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         // pinpoint glints that bloom into white sparkle noise.
         sun_specular = min(sun_specular, vec3<f32>(3.0));
 
-        let light_entering = NdotL * (1.0 - F_spec);
+        // Body light sees the mean (flat) surface, not the facet — see mc_render.wgsl
+        let light_entering = max(light_dir.y, 0.0) * (1.0 - F_spec);
         let interior_glow = water.water_color * transmittance;
         sun_subsurface = interior_glow * light_entering * light.sun_color * light.sun_intensity * 0.18;
 
@@ -375,7 +379,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     }
 
     // IBL diffuse irradiance
-    let ambient_irradiance = evaluate_sh_irradiance(normal) * water.env_intensity;
+    let ambient_irradiance = evaluate_sh_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * water.env_intensity;
     let ambient_subsurface = ambient_irradiance * water.water_color * transmittance * scatter_strength * 0.6;
 
     var lit_interior = interior_with_scatter
@@ -389,13 +393,17 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     let whitewater_field = textureSampleLevel(foam_density_tex, tex_sampler, input.uv, 0.0).rg;
     let aeration = 1.0 - exp(-AERATION_K * water.aeration_strength * whitewater_field.g);
     if (aeration > 0.002) {
-        var aeration_light = evaluate_sh_irradiance(normal) * water.env_intensity;
+        let sun_dir = normalize(light.sun_direction);
+        var aeration_light = evaluate_sh_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * water.env_intensity;
         if (light.sun_enabled == 1u) {
             aeration_light += light.sun_color * light.sun_intensity
-                * max(dot(normal, normalize(light.sun_direction)), 0.0) * 0.6;
+                * max(sun_dir.y, 0.0) * 0.6;
         }
         lit_interior = mix(lit_interior, AERATION_ALBEDO * aeration_light, aeration);
     }
+
+    // Below-horizon reflection rays mostly hit more water (see mc_render.wgsl)
+    reflection_color += lit_interior * below_horizon;
 
     var color = mix(lit_interior, reflection_color, fresnel);
     color += sun_specular;
