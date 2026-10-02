@@ -11,6 +11,7 @@ use std::sync::{
 
 use wgpu::util::DeviceExt;
 
+use crate::simulation::snapshot::{GpuSource, SimState};
 use crate::state::{GpuSprayParams, GpuSprayParticle};
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -117,7 +118,7 @@ impl SpraySystem {
         let spray_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Spray Particle Buffer"),
             size: (max_spray as usize * std::mem::size_of::<GpuSprayParticle>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -125,7 +126,7 @@ impl SpraySystem {
         let write_head_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Spray Write Head"),
             contents: bytemuck::bytes_of(&0u32),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         });
 
         // Spray params uniform
@@ -492,5 +493,33 @@ impl SpraySystem {
         // Recalibrate limits for the new scene (converges within ~1 s)
         self.auto_ta_max = AUTO_TA_INIT;
         self.auto_wc_max = AUTO_WC_INIT;
+    }
+
+    /// State-file sources: the whole ring buffer (slot order matters: it is
+    /// the billboard draw order) and the write head
+    pub fn snapshot_sources(&self) -> Vec<(&'static str, GpuSource<'_>)> {
+        let ring = self.max_spray_particles as u64 * std::mem::size_of::<GpuSprayParticle>() as u64;
+        vec![
+            ("spray.particles", GpuSource::Buffer { buffer: &self.spray_buffer, size: ring }),
+            ("spray.write_head", GpuSource::Buffer { buffer: &self.write_head_buffer, size: 4 }),
+        ]
+    }
+
+    /// Load the ring buffer, write head and auto-limits from a state file
+    pub fn restore_snapshot(&mut self, queue: &wgpu::Queue, state: &SimState) -> Result<(), String> {
+        let particles = state.blob("spray.particles")?;
+        let head = state.blob("spray.write_head")?;
+        let ring = self.max_spray_particles as usize * std::mem::size_of::<GpuSprayParticle>();
+        if particles.len() != ring || head.len() != 4 {
+            return Err(format!(
+                "state spray buffer is {} particles, this config has {} (set spray.max_particles to match)",
+                particles.len() / std::mem::size_of::<GpuSprayParticle>(),
+                self.max_spray_particles
+            ));
+        }
+        queue.write_buffer(&self.spray_buffer, 0, particles);
+        queue.write_buffer(&self.write_head_buffer, 0, head);
+        [self.auto_ta_max, self.auto_wc_max] = state.header.spray_auto_limits;
+        Ok(())
     }
 }

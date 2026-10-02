@@ -3,6 +3,7 @@
 pub mod foam_map;
 pub mod particle;
 pub mod probes;
+pub mod snapshot;
 pub mod spray;
 pub mod sph_3d_grid;
 

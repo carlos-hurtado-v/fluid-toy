@@ -11,3 +11,5 @@ CLAUDE.md
 /configs/export*
 /.claude
 /states
+# Simulation state snapshots (~48 MB each; F12 / --snapshot)
+*.state

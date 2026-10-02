@@ -2,6 +2,7 @@
 
 use crate::render::mesh_loader::SdfData;
 use crate::simulation::particle::SphParticle3D;
+use crate::simulation::snapshot::{GpuSource, SimState};
 use crate::state::{GpuContainerGeometry, GpuGravity, GpuMouseForce, GpuRigidBodiesHeader, GpuRigidBody, GpuRigidBodyAccum, GpuSphParams3D, MAX_RIGID_BODIES};
 use wgpu::util::DeviceExt;
 
@@ -204,14 +205,17 @@ impl SphSimulation3DGrid {
         let particle_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Particle Buffer"),
             size: (std::mem::size_of::<SphParticle3D>() * max_particles as usize) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let sorted_particle_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Sorted Particle Buffer"),
             size: (std::mem::size_of::<SphParticle3D>() * max_particles as usize) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -236,7 +240,7 @@ impl SphSimulation3DGrid {
         let cell_starts_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Cell Starts Buffer"),
             size: (4 * total_cells) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -1615,5 +1619,59 @@ impl SphSimulation3DGrid {
         queue.write_buffer(&self.grid_params_buffer, 0, bytemuck::bytes_of(&self.grid_params));
 
         spawn_count
+    }
+
+    /// Spatial grid identity: (cell size, total cells). A saved sorted set +
+    /// cell table only make sense on the same grid.
+    pub fn grid_layout(&self) -> (f32, u32) {
+        (self.grid_params.cell_size, self.grid_params.total_cells)
+    }
+
+    /// State-file sources: canonical particles, the grid-sorted copy and the
+    /// cell table (the MC/SS renderers read the sorted set between steps, so
+    /// a frozen reload needs it as it was, not rebuilt)
+    pub fn snapshot_sources(&self) -> Vec<(&'static str, GpuSource<'_>)> {
+        let particles = self.num_particles as u64 * std::mem::size_of::<SphParticle3D>() as u64;
+        let cells = 4 * self.grid_params.total_cells as u64;
+        vec![
+            ("sph.particles", GpuSource::Buffer { buffer: &self.particle_buffer, size: particles }),
+            ("sph.sorted", GpuSource::Buffer { buffer: &self._sorted_particle_buffer, size: particles }),
+            ("sph.cell_starts", GpuSource::Buffer { buffer: &self.cell_starts_buffer, size: cells }),
+            ("sph.cell_counts", GpuSource::Buffer { buffer: &self.cell_counts_buffer, size: cells }),
+        ]
+    }
+
+    /// Load particles + grid tables from a state file. The caller validates
+    /// the grid layout and pushes SPH params for the new particle count.
+    pub fn restore_snapshot(&mut self, queue: &wgpu::Queue, state: &SimState) -> Result<(), String> {
+        let count = state.header.particle_count;
+        if count > self.max_particles {
+            return Err(format!(
+                "state has {count} particles, max_particles is {} (raise simulation.max_particles)",
+                self.max_particles
+            ));
+        }
+        let particle_bytes = count as usize * std::mem::size_of::<SphParticle3D>();
+        let cell_bytes = 4 * self.grid_params.total_cells as usize;
+        let blobs = [
+            ("sph.particles", &self.particle_buffer, particle_bytes),
+            ("sph.sorted", &self._sorted_particle_buffer, particle_bytes),
+            ("sph.cell_starts", &self.cell_starts_buffer, cell_bytes),
+            ("sph.cell_counts", &self.cell_counts_buffer, cell_bytes),
+        ];
+        // Validate everything before touching the GPU
+        for (name, _, len) in &blobs {
+            let data = state.blob(name)?;
+            if data.len() != *len {
+                return Err(format!("state '{name}' holds {} bytes, expected {len}", data.len()));
+            }
+        }
+        for (name, buffer, _) in &blobs {
+            queue.write_buffer(buffer, 0, state.blob(name)?);
+        }
+        self.num_particles = count;
+        self.grid_params.num_particles = count;
+        queue.write_buffer(&self.grid_params_buffer, 0, bytemuck::bytes_of(&self.grid_params));
+        Ok(())
     }
 }

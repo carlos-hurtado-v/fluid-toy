@@ -33,8 +33,31 @@ Options:
   --exit-after <frame>     Exit after the given simulation frame
   --stay                   Keep running after captures/--exit-after milestones
   --size <WxH>             Window size in logical pixels (default: 1000x700)
+  --snapshot <f1,f2,...>   Write a snapshot (PNG + config JSON + .state) into
+                           --out after the given frames, like F12 does
+  --load-state <file>      Start from a saved simulation state (.state, from
+                           F12 or --snapshot); pair it with the snapshot's
+                           JSON via --config. Frame numbers for --capture,
+                           --snapshot and --exit-after then count from the
+                           loaded moment
+  --hold                   With --load-state: keep the simulation frozen on
+                           the loaded state (frame-exact render A/B); frames
+                           count rendered frames, so --capture 1 is the state
+                           as saved and later frames let temporal history
+                           (AO, caustics, SS) settle
   --help                   Show this help
 ";
+
+/// Comma-separated frame numbers (`--capture 60,180`)
+fn frame_list(text: &str, flag: &str) -> Result<Vec<u64>, String> {
+    text.split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<u64>()
+                .map_err(|_| format!("{flag}: '{part}' is not a frame number"))
+        })
+        .collect()
+}
 
 /// Parsed command-line options.
 pub struct LaunchOptions {
@@ -47,6 +70,9 @@ pub struct LaunchOptions {
     pub exit_after: Option<u64>,
     pub stay: bool,
     pub window_size: Option<(u32, u32)>,
+    pub snapshot_frames: Vec<u64>,
+    pub load_state: Option<PathBuf>,
+    pub hold: bool,
 }
 
 impl Default for LaunchOptions {
@@ -61,6 +87,9 @@ impl Default for LaunchOptions {
             exit_after: None,
             stay: false,
             window_size: None,
+            snapshot_frames: Vec::new(),
+            load_state: None,
+            hold: false,
         }
     }
 }
@@ -68,7 +97,10 @@ impl Default for LaunchOptions {
 impl LaunchOptions {
     /// Whether this run is automated (captures, stats, or a scripted exit).
     pub fn is_automated(&self) -> bool {
-        !self.capture_frames.is_empty() || self.stats_path.is_some() || self.exit_after.is_some()
+        !self.capture_frames.is_empty()
+            || !self.snapshot_frames.is_empty()
+            || self.stats_path.is_some()
+            || self.exit_after.is_some()
     }
 
     /// Parse from process args. Prints usage and exits on --help or error.
@@ -110,14 +142,15 @@ impl LaunchOptions {
                     opts.save_config = Some(PathBuf::from(value(&mut args, "--save-config")?))
                 }
                 "--capture" => {
-                    for part in value(&mut args, "--capture")?.split(',') {
-                        let frame = part
-                            .trim()
-                            .parse::<u64>()
-                            .map_err(|_| format!("--capture: '{part}' is not a frame number"))?;
-                        opts.capture_frames.push(frame);
-                    }
+                    opts.capture_frames.extend(frame_list(&value(&mut args, "--capture")?, "--capture")?)
                 }
+                "--snapshot" => {
+                    opts.snapshot_frames.extend(frame_list(&value(&mut args, "--snapshot")?, "--snapshot")?)
+                }
+                "--load-state" => {
+                    opts.load_state = Some(PathBuf::from(value(&mut args, "--load-state")?))
+                }
+                "--hold" => opts.hold = true,
                 "--out" => opts.out_dir = PathBuf::from(value(&mut args, "--out")?),
                 "--stats" => opts.stats_path = Some(PathBuf::from(value(&mut args, "--stats")?)),
                 "--exit-after" => {
@@ -143,6 +176,11 @@ impl LaunchOptions {
 
         opts.capture_frames.sort_unstable();
         opts.capture_frames.dedup();
+        opts.snapshot_frames.sort_unstable();
+        opts.snapshot_frames.dedup();
+        if opts.hold && opts.load_state.is_none() {
+            return Err("--hold needs --load-state (it freezes the loaded state)".into());
+        }
         Ok(opts)
     }
 

@@ -8,6 +8,8 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::simulation::snapshot::{write_texture, FoamMapScalars, GpuSource, SimState};
+
 /// Fine foam grid (texels per side). Square over the container's larger
 /// horizontal extent: ~4.3 mm texels for the default 2.22 m tank.
 const FINE_DIM: u32 = 512;
@@ -209,7 +211,11 @@ impl FoamMap {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                // COPY_*: state files save/restore the persistent layers
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             })
         };
@@ -333,6 +339,41 @@ impl FoamMap {
     /// Empty the map on the next active frame (simulation reset)
     pub fn request_reset(&mut self) {
         self.reset_pending = true;
+    }
+
+    /// State-file sources: the layers that persist across frames and that
+    /// the water shader reads (foam density, smoothed surface, flow coords);
+    /// the other textures and accumulators are rebuilt every stepped frame
+    pub fn snapshot_sources(&self) -> Vec<(&'static str, GpuSource<'_>)> {
+        vec![
+            ("foam.density", GpuSource::Texture { texture: &self._foam[0], bytes_per_texel: 4 }),
+            ("foam.surface", GpuSource::Texture { texture: &self._surface[0], bytes_per_texel: 16 }),
+            ("foam.coords", GpuSource::Texture { texture: &self.coords[0], bytes_per_texel: 16 }),
+        ]
+    }
+
+    pub fn snapshot_scalars(&self) -> FoamMapScalars {
+        FoamMapScalars {
+            flow_time: self.flow_time,
+            was_active: self.was_active,
+            reset_pending: self.reset_pending,
+        }
+    }
+
+    pub fn restore_snapshot(&mut self, queue: &wgpu::Queue, state: &SimState) -> Result<(), String> {
+        let layers = [
+            ("foam.density", &self._foam[0], 4),
+            ("foam.surface", &self._surface[0], 16),
+            ("foam.coords", &self.coords[0], 16),
+        ];
+        for (name, texture, bpt) in layers {
+            write_texture(queue, texture, bpt, state.blob(name)?, name)?;
+        }
+        let scalars = state.header.foam_map;
+        self.flow_time = scalars.flow_time;
+        self.was_active = scalars.was_active;
+        self.reset_pending = scalars.reset_pending;
+        Ok(())
     }
 
     /// Write this frame's params. `active` = the map owns top-surface foam

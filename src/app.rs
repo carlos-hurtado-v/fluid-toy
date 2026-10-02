@@ -95,7 +95,13 @@ pub struct App {
     /// Simulated seconds elapsed (sim_frame_index × frame_dt, dt-change aware)
     sim_time: f64,
     pending_captures: VecDeque<u64>,
+    /// --snapshot frames (PNG + config + .state into --out)
+    pending_snapshots: VecDeque<u64>,
     had_captures: bool,
+    /// Clock for --capture / --snapshot / --exit-after: simulated frames, or
+    /// rendered frames while --hold freezes a loaded state. Equals
+    /// sim_frame_index unless a state was loaded (then it counts from there).
+    milestone_frame: u64,
     /// F12: save the next frame (GUI-free) together with its exact config
     snapshot_requested: bool,
     stats_file: Option<std::io::BufWriter<std::fs::File>>,
@@ -104,7 +110,10 @@ pub struct App {
 
 impl App {
     pub fn new(mut state: AppState, launch: LaunchOptions) -> Self {
-        if launch.is_automated() && state.simulation.paused {
+        if launch.hold {
+            // Frozen on the loaded state: render-only frames
+            state.simulation.paused = true;
+        } else if launch.is_automated() && state.simulation.paused {
             println!("note: automation flags require a running simulation; ignoring paused=true");
             state.simulation.paused = false;
         }
@@ -129,7 +138,7 @@ impl App {
             writer
         });
 
-        if !launch.capture_frames.is_empty() {
+        if !launch.capture_frames.is_empty() || !launch.snapshot_frames.is_empty() {
             if let Err(e) = std::fs::create_dir_all(&launch.out_dir) {
                 eprintln!(
                     "error: cannot create capture dir {}: {e}",
@@ -140,7 +149,8 @@ impl App {
         }
 
         let pending_captures: VecDeque<u64> = launch.capture_frames.iter().copied().collect();
-        let had_captures = !pending_captures.is_empty();
+        let pending_snapshots: VecDeque<u64> = launch.snapshot_frames.iter().copied().collect();
+        let had_captures = !pending_captures.is_empty() || !pending_snapshots.is_empty();
         let scenario_fired = vec![false; state.scenario.events.len()];
 
         Self {
@@ -193,7 +203,9 @@ impl App {
             sim_frame_index: 0,
             sim_time: 0.0,
             pending_captures,
+            pending_snapshots,
             had_captures,
+            milestone_frame: 0,
             snapshot_requested: false,
             stats_file,
             should_exit: false,
@@ -762,6 +774,13 @@ impl App {
         self.sdf_data = sdf_data;
         self.egui_winit = Some(egui_winit);
         self.egui_renderer = Some(egui_renderer);
+
+        if let Some(path) = self.launch.load_state.clone() {
+            if let Err(e) = self.load_state(&path) {
+                eprintln!("error: --load-state {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
     }
 
     fn reset_simulation(&mut self) {
@@ -772,6 +791,7 @@ impl App {
         self.state.runtime.measurements = None;
         self.sim_frame_index = 0;
         self.sim_time = 0.0;
+        self.milestone_frame = 0;
 
         // Reset dynamic rigid body velocity and rotation (keep position);
         // Static/Kinematic bodies re-derive their pose from euler/spin anyway
@@ -1497,11 +1517,14 @@ impl App {
         // Visual time (ripples etc.): wall clock normally; fixed sim step in
         // automation runs so captures are reproducible across machines
         let frame_dt = self.state.simulation.substep_dt() * self.state.simulation.substeps as f32;
+        // --hold freezes everything that moves, ripples included (until the
+        // GUI unpauses)
+        let held = self.launch.hold && self.state.simulation.paused;
         if self.launch.is_automated() {
             if !self.state.simulation.paused {
                 self.state.runtime.time_elapsed += frame_dt;
             }
-        } else {
+        } else if !held {
             self.state.runtime.time_elapsed += delta;
         }
 
@@ -1560,7 +1583,9 @@ impl App {
             });
 
         // Smoothly interpolate container tilt toward target each frame (total frame time)
-        self.state.container.update_tilt(frame_dt);
+        if !held {
+            self.state.container.update_tilt(frame_dt);
+        }
 
         // Run SPH simulation if not paused (multiple sub-steps for stability)
         // Note: Grid simulation manages its own command encoding/submission
@@ -1638,6 +1663,9 @@ impl App {
             self.sim_frame_index += 1;
             self.sim_time += frame_dt as f64;
         }
+        if stepped || held {
+            self.milestone_frame += 1;
+        }
 
         // Measure fluid extents + probe heights on the post-integrate state
         if stepped {
@@ -1682,17 +1710,26 @@ impl App {
         }
 
         // Prepare a swapchain readback if a capture is due this frame
-        let mut capture_due = false;
+        let mut frame_capture = false;
         while self
             .pending_captures
             .front()
-            .is_some_and(|&f| self.sim_frame_index >= f)
+            .is_some_and(|&f| self.milestone_frame >= f)
         {
             self.pending_captures.pop_front();
-            capture_due = true;
+            frame_capture = true;
+        }
+        let mut scheduled_snapshot = false;
+        while self
+            .pending_snapshots
+            .front()
+            .is_some_and(|&f| self.milestone_frame >= f)
+        {
+            self.pending_snapshots.pop_front();
+            scheduled_snapshot = true;
         }
         let snapshot = std::mem::take(&mut self.snapshot_requested);
-        capture_due |= snapshot;
+        let capture_due = frame_capture || scheduled_snapshot || snapshot;
         let capture = if capture_due {
             let unpadded_bytes_per_row = gpu.config.width * 4;
             let padded_bytes_per_row = unpadded_bytes_per_row
@@ -2415,14 +2452,18 @@ impl App {
 
         // Finish any pending capture (map readback, write PNG)
         if let Some((buffer, padded_bytes_per_row)) = capture {
-            if snapshot {
-                self.save_snapshot(&buffer, padded_bytes_per_row);
-            } else {
+            if frame_capture {
                 let path = self
                     .launch
                     .out_dir
-                    .join(format!("frame_{:05}.png", self.sim_frame_index));
+                    .join(format!("frame_{:05}.png", self.milestone_frame));
                 self.save_capture(&buffer, padded_bytes_per_row, &path);
+            }
+            if snapshot {
+                self.save_snapshot(&buffer, padded_bytes_per_row, false);
+            }
+            if scheduled_snapshot {
+                self.save_snapshot(&buffer, padded_bytes_per_row, true);
             }
         }
 
@@ -2478,16 +2519,17 @@ impl App {
 
         // Automation exit: leave once every requested milestone is reached
         if self.launch.is_automated() && !self.launch.stay && !self.should_exit {
-            let captures_done = self.pending_captures.is_empty();
+            let captures_done =
+                self.pending_captures.is_empty() && self.pending_snapshots.is_empty();
             let exit_frame_reached = self
                 .launch
                 .exit_after
-                .is_none_or(|n| self.sim_frame_index >= n);
+                .is_none_or(|n| self.milestone_frame >= n);
             let has_milestone = self.had_captures || self.launch.exit_after.is_some();
             if has_milestone && captures_done && exit_frame_reached {
                 println!(
                     "Automation milestones reached at frame {} — exiting",
-                    self.sim_frame_index
+                    self.milestone_frame
                 );
                 self.should_exit = true;
             }
@@ -2562,29 +2604,38 @@ impl App {
         }
     }
 
-    /// F12 snapshot: this frame as captures/snapshots/snap_NNN_WxH.png plus the
-    /// exact state (live camera included) as snap_NNN_WxH.json, so a report
-    /// can be reproduced with `--config <json> --size WxH`.
-    fn save_snapshot(&mut self, buffer: &wgpu::Buffer, padded_bytes_per_row: u32) {
+    /// Snapshot: this frame as a GUI-free PNG, the exact config (live camera
+    /// included) as JSON and the simulation state as `.state`, all from the
+    /// same instant. F12 writes captures/snapshots/snap_NNN_WxH.*; scheduled
+    /// (`--snapshot`) ones go to --out as snap_fNNNNN_WxH.* (milestone frame).
+    /// Repro: `--config <json> --load-state <state> --size WxH [--hold]`.
+    fn save_snapshot(&mut self, buffer: &wgpu::Buffer, padded_bytes_per_row: u32, scheduled: bool) {
         let (width, height) = {
             let gpu = self.gpu.as_ref().unwrap();
             (gpu.config.width, gpu.config.height)
         };
-        let dir = std::path::PathBuf::from("captures").join("snapshots");
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("error: cannot create {}: {e}", dir.display());
-            return;
-        }
-        let mut n = 1u32;
-        let stem = loop {
-            let stem = format!("snap_{n:03}_{width}x{height}");
-            if !dir.join(format!("{stem}.png")).exists() {
-                break stem;
+        let (dir, stem) = if scheduled {
+            let stem = format!("snap_f{:05}_{width}x{height}", self.milestone_frame);
+            (self.launch.out_dir.clone(), stem)
+        } else {
+            let dir = std::path::PathBuf::from("captures").join("snapshots");
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("error: cannot create {}: {e}", dir.display());
+                return;
             }
-            n += 1;
+            let mut n = 1u32;
+            let stem = loop {
+                let stem = format!("snap_{n:03}_{width}x{height}");
+                if !dir.join(format!("{stem}.png")).exists() {
+                    break stem;
+                }
+                n += 1;
+            };
+            (dir, stem)
         };
         let png = dir.join(format!("{stem}.png"));
         let json = dir.join(format!("{stem}.json"));
+        let sim_state = dir.join(format!("{stem}.state"));
         if !self.save_capture(buffer, padded_bytes_per_row, &png) {
             return;
         }
@@ -2594,16 +2645,125 @@ impl App {
         state.camera.pitch = self.camera.pitch;
         state.camera.target = self.camera.target;
         state.camera.fov = self.camera.fov;
-        let message = match std::fs::write(&json, crate::launch::config_to_json(&state)) {
+        let message = match std::fs::write(&json, crate::launch::config_to_json(&state))
+            .map_err(|e| format!("snapshot config failed: {e}"))
+            .and_then(|()| self.save_state(&sim_state))
+        {
             Ok(()) => format!(
-                "snapshot {} (repro: --config {} --size {width}x{height})",
+                "snapshot {} (repro: --config {} --load-state {} --size {width}x{height}, \
+                 add --hold to freeze it)",
                 png.display(),
                 json.display(),
+                sim_state.display(),
             ),
-            Err(e) => format!("snapshot config failed: {e}"),
+            Err(e) => format!("snapshot failed: {e}"),
         };
         println!("{message}");
         self.state.runtime.last_export = Some(message);
+    }
+
+    /// Write the simulation state (GPU buffers + CPU clocks) to a `.state`
+    /// file; see simulation/snapshot.rs for what is in it and why.
+    fn save_state(&self, path: &std::path::Path) -> Result<(), String> {
+        use crate::simulation::snapshot::{read_gpu, SimState, StateHeader, STATE_VERSION};
+        let gpu = self.gpu.as_ref().ok_or("no GPU")?;
+        let sph_sim = self.sph_simulation.as_ref().ok_or("no simulation")?;
+        let spray = self.spray_system.as_ref().ok_or("no spray system")?;
+        let foam_map = self.foam_map.as_ref().ok_or("no foam map")?;
+
+        let mut sources = sph_sim.snapshot_sources();
+        sources.extend(spray.snapshot_sources());
+        sources.extend(foam_map.snapshot_sources());
+        let blobs = read_gpu(&gpu.device, &gpu.queue, sources);
+
+        let (grid_cell_size, grid_total_cells) = sph_sim.grid_layout();
+        let (ta, wc) = spray.auto_limits();
+        let header = StateHeader {
+            version: STATE_VERSION,
+            particle_count: sph_sim.num_particles(),
+            grid_cell_size,
+            grid_total_cells,
+            spray_capacity: spray.capacity(),
+            sim_frame_index: self.sim_frame_index,
+            sim_time: self.sim_time,
+            time_elapsed: self.state.runtime.time_elapsed,
+            spray_frame_count: self.state.runtime.frame_count,
+            spray_auto_limits: [ta, wc],
+            foam_map: foam_map.snapshot_scalars(),
+            scenario_fired: self.scenario_fired.clone(),
+            scenario_events_fired: self.state.runtime.scenario_events_fired,
+            spin_angles: self.state.rigid_bodies.iter().map(|b| b.spin_angle).collect(),
+            blobs: Vec::new(),
+        };
+        SimState::new(header, blobs).write(path)
+    }
+
+    /// Restore a `.state` file over the freshly initialized simulation. The
+    /// config (camera, tunables, rigid body poses) comes from the snapshot's
+    /// JSON via --config; this restores what the config cannot express.
+    fn load_state(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let state = crate::simulation::snapshot::SimState::read(path)?;
+        let h = &state.header;
+        let substep_dt = self.simulation_substep_dt();
+        let gpu = self.gpu.as_ref().ok_or("no GPU")?;
+        let sph_sim = self.sph_simulation.as_mut().ok_or("no simulation")?;
+        let spray = self.spray_system.as_mut().ok_or("no spray system")?;
+        let foam_map = self.foam_map.as_mut().ok_or("no foam map")?;
+
+        // Layout checks first: a mismatched grid or ring buffer would load as
+        // garbage, not fail
+        let (cell_size, total_cells) = sph_sim.grid_layout();
+        if h.grid_cell_size != cell_size || h.grid_total_cells != total_cells {
+            return Err(format!(
+                "saved on a kernel_radius {} grid ({} cells), this config builds {} ({} cells); \
+                 load it with the snapshot's --config",
+                h.grid_cell_size, h.grid_total_cells, cell_size, total_cells
+            ));
+        }
+        if h.spray_capacity != spray.capacity() {
+            return Err(format!(
+                "saved with spray.max_particles {}, this config has {}",
+                h.spray_capacity,
+                spray.capacity()
+            ));
+        }
+        sph_sim.restore_snapshot(&gpu.queue, &state)?;
+        spray.restore_snapshot(&gpu.queue, &state)?;
+        foam_map.restore_snapshot(&gpu.queue, &state)?;
+
+        self.state.runtime.particle_count = h.particle_count;
+        let sph_params = self.state.sph.to_gpu_params_3d(h.particle_count, substep_dt);
+        sph_sim.update_sph_params(&gpu.queue, &sph_params);
+
+        self.sim_frame_index = h.sim_frame_index;
+        self.sim_time = h.sim_time;
+        self.state.runtime.time_elapsed = h.time_elapsed;
+        self.state.runtime.frame_count = h.spray_frame_count;
+        // Event flags realign to the config's list in pump_scenario_events
+        self.scenario_fired = h.scenario_fired.clone();
+        self.state.runtime.scenario_events_fired = h.scenario_events_fired;
+        if h.spin_angles.len() != self.state.rigid_bodies.len() {
+            eprintln!(
+                "warning: state has {} rigid bodies, config has {}; spin angles matched by index",
+                h.spin_angles.len(),
+                self.state.rigid_bodies.len()
+            );
+        }
+        for (body, &angle) in self.state.rigid_bodies.iter_mut().zip(&h.spin_angles) {
+            body.spin_angle = angle;
+        }
+        // The loaded state is already whitewater-live: no re-enable reset
+        self.spray_prev_enabled = self.state.spray.enabled;
+
+        println!(
+            "loaded state {} (sim frame {}, t={:.3}s, {} particles){}",
+            path.display(),
+            h.sim_frame_index,
+            h.sim_time,
+            h.particle_count,
+            if self.launch.hold { ", held" } else { "" },
+        );
+        Ok(())
     }
 
     /// Write the current state (including the live camera pose) to
