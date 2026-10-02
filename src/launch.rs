@@ -53,6 +53,10 @@ Options:
   --probe-line <x0,y0,x1,y1>
                            Probe every pixel on this line (e.g. across a
                            stripe); at most 64 probed pixels in total
+  --dump-field             With --capture: also write the marching-cubes density
+                           field of each captured frame (frame_NNNNN_field.bin
+                           + .json; scripts/field_profile.py measures the
+                           surface in it)
   --help                   Show this help
 ";
 
@@ -118,6 +122,7 @@ pub struct LaunchOptions {
     pub load_state: Option<PathBuf>,
     pub hold: bool,
     pub probe_pixels: Vec<[u32; 2]>,
+    pub dump_field: bool,
 }
 
 impl Default for LaunchOptions {
@@ -136,6 +141,7 @@ impl Default for LaunchOptions {
             load_state: None,
             hold: false,
             probe_pixels: Vec::new(),
+            dump_field: false,
         }
     }
 }
@@ -197,6 +203,7 @@ impl LaunchOptions {
                     opts.load_state = Some(PathBuf::from(value(&mut args, "--load-state")?))
                 }
                 "--hold" => opts.hold = true,
+                "--dump-field" => opts.dump_field = true,
                 "--probe" => {
                     let v = value(&mut args, "--probe")?;
                     let n = number_list(&v, "--probe")?;

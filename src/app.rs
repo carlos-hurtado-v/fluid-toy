@@ -2085,7 +2085,9 @@ impl App {
                             [aabb_max[0] + mc_margin, aabb_max[1] + mc_margin, aabb_max[2] + mc_margin],
                         );
 
-                        // Update container geometry for MC clipping (with clip_margin from MC cell_size)
+                        // Update container geometry for the MC renderer (clip_margin from MC cell_size).
+                        // clip_enabled (pool only) gates fragment discards and the volume trace's wall
+                        // inset; the density field is bounded at the walls in both styles.
                         let mc_geom = {
                             let c = &self.state.container;
                             let is_pool = c.style == ContainerStyle::OpaquePool;
@@ -2116,6 +2118,11 @@ impl App {
                             &gpu.queue,
                             self.state.rendering.mc_calm_smoothing,
                             self.state.sph.kernel_radius,
+                        );
+                        mc_renderer.update_wall_bound(
+                            &gpu.queue,
+                            self.state.sph.kernel_radius,
+                            self.state.container.style == ContainerStyle::OpaquePool,
                         );
                         mc_renderer.update_aniso_params(
                             &gpu.queue,
@@ -2486,6 +2493,9 @@ impl App {
                     .out_dir
                     .join(format!("frame_{:05}_probe.json", self.milestone_frame));
                 self.save_probe(&probe_path);
+                if self.launch.dump_field {
+                    self.save_field(&self.launch.out_dir.join(format!("frame_{:05}_field", self.milestone_frame)));
+                }
             }
             if snapshot {
                 self.save_snapshot(&buffer, padded_bytes_per_row, false);
@@ -2688,6 +2698,31 @@ impl App {
         };
         println!("{message}");
         self.state.runtime.last_export = Some(message);
+    }
+
+    /// Field dump (--dump-field): `<stem>.bin` = the MC density field the mesh
+    /// was extracted from (grid_size^3 f32, x fastest), `<stem>.json` = grid +
+    /// container parameters; read by scripts/field_profile.py
+    fn save_field(&self, stem: &std::path::Path) {
+        let (Some(gpu), Some(mc)) = (self.gpu.as_ref(), self.mc_renderer.as_ref()) else {
+            return;
+        };
+        let (grid, bytes) = mc.read_field(&gpu.device, &gpu.queue);
+        let meta = serde_json::json!({
+            "frame": self.milestone_frame,
+            "grid_size": grid.grid_size,
+            "grid_min": grid.grid_min,
+            "cell_size": grid.cell_size,
+            "kernel_radius": grid.kernel_radius,
+            "iso_value": grid.iso_value,
+            "container": &self.state.container,
+        });
+        let result = std::fs::write(stem.with_extension("bin"), bytes)
+            .and_then(|()| std::fs::write(stem.with_extension("json"), meta.to_string()));
+        match result {
+            Ok(()) => println!("field: {}^3 -> {}.bin", grid.grid_size, stem.display()),
+            Err(e) => println!("field dump failed: {e}"),
+        }
     }
 
     /// Pixel probe: this frame's refraction records as JSON (no-op unless

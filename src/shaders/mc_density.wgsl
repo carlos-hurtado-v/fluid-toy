@@ -80,10 +80,11 @@ fn poly6_kernel(r_sq: f32, h: f32) -> f32 {
     return coeff * diff * diff * diff;
 }
 
-// Convert MC grid coordinates to world position (cell center)
+// World position of a field voxel: voxel i sits at grid_min + i * cell_size,
+// where mc_generate places its corner and mc_render samples it. (A cell-centre
+// convention here, + 0.5, drew the whole mesh half a cell off the particles.)
 fn grid_to_world(grid_pos: vec3<u32>) -> vec3<f32> {
-    let cell_size = params.cell_size;
-    return params.grid_min + (vec3<f32>(grid_pos) + 0.5) * cell_size;
+    return params.grid_min + vec3<f32>(grid_pos) * params.cell_size;
 }
 
 // --- SPH grid helper functions ---
@@ -212,10 +213,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
 
-    // Mark voxels outside the container with a sentinel (-1).
-    // The blur shader skips sentinels, preventing density bleed across walls.
+    // Mark voxels outside the container with a sentinel (-1). The smoothing
+    // passes skip sentinels: a wall is not a water/air edge, and filtering
+    // across it would round the free surface off toward the wall (a valley as
+    // wide as the filter). mc_wall_bound.wgsl turns the sentinel into the
+    // mesh's sides before mesh generation.
     let local = world_to_local(container, world_pos);
-    if (container.clip_enabled != 0u && !is_inside_box(container, local, 0.0)) {
+    if (!is_inside_box(container, local, 0.0)) {
         textureStore(density_field, vec3<i32>(global_id), vec4<f32>(-1.0, 0.0, 0.0, 0.0));
         return;
     }

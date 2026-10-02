@@ -9,6 +9,7 @@ use wgpu::util::DeviceExt;
 
 use super::calm_smoothing::CalmSmoothing;
 use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
+use super::wall_bound::WallBound;
 use super::ContainerRenderer;
 use super::RigidBodyRenderer;
 use super::SprayRenderer;
@@ -372,9 +373,9 @@ fn create_msaa_depth_texture(device: &wgpu::Device, width: u32, height: u32, sam
 
 pub struct MarchingCubesRenderer {
     // Density field (3D texture) - two textures for ping-pong blur
-    _density_texture: wgpu::Texture,
+    density_texture: wgpu::Texture,
     density_view: wgpu::TextureView,
-    _density_texture_b: wgpu::Texture,
+    density_texture_b: wgpu::Texture,
     _density_view_b: wgpu::TextureView,
 
     // MSAA render targets
@@ -470,6 +471,8 @@ pub struct MarchingCubesRenderer {
     blur_bind_groups: [[wgpu::BindGroup; 2]; 3],
     // Bulk-gated smoothing of calm water (half-res helper fields + combine)
     calm: CalmSmoothing,
+    // Ends the field on the container walls (last pass before generate)
+    wall_bound: WallBound,
 
     // Bind groups
     _density_bind_group: wgpu::BindGroup,
@@ -698,7 +701,9 @@ impl MarchingCubesRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let density_view = density_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -715,7 +720,9 @@ impl MarchingCubesRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let density_view_b = density_texture_b.create_view(&wgpu::TextureViewDescriptor::default());
@@ -872,7 +879,7 @@ impl MarchingCubesRenderer {
         let grid_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MC Grid Params"),
             contents: bytemuck::bytes_of(&grid_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         });
 
         // Edge table buffer
@@ -954,6 +961,14 @@ impl MarchingCubesRenderer {
             contents: bytemuck::bytes_of(&container_geom),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let wall_bound = WallBound::new(
+            device,
+            grid_size,
+            &density_view,
+            &density_view_b,
+            &grid_params_buffer,
+            &container_geom_buffer,
+        );
 
         // Light params buffer
         let light_params = GpuLightParams {
@@ -1024,7 +1039,9 @@ impl MarchingCubesRenderer {
 
         let aniso_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Anisotropy Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_anisotropy.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/mc_anisotropy.wgsl")).into(),
+            ),
         });
 
         let generate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1242,6 +1259,17 @@ impl MarchingCubesRenderer {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Container geometry (walls mirror the neighbourhood)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -2477,9 +2505,9 @@ impl MarchingCubesRenderer {
         });
 
         Self {
-            _density_texture: density_texture,
+            density_texture,
             density_view,
-            _density_texture_b: density_texture_b,
+            density_texture_b,
             _density_view_b: density_view_b,
             msaa_texture,
             msaa_view,
@@ -2544,6 +2572,7 @@ impl MarchingCubesRenderer {
             blur_pipeline,
             blur_params_buffers,
             blur_bind_groups,
+            wall_bound,
             calm,
             _density_bind_group: density_bind_group,
             generate_bind_group,
@@ -2690,6 +2719,11 @@ impl MarchingCubesRenderer {
         }
     }
 
+    /// Where the field ends at the container walls. `kernel_radius` is the sim h.
+    pub fn update_wall_bound(&self, queue: &wgpu::Queue, kernel_radius: f32, is_pool: bool) {
+        self.wall_bound.update(queue, kernel_radius, self.cell_size(), is_pool);
+    }
+
     /// Calm-surface smoothing strength (0 = off). `kernel_radius` is the sim h.
     pub fn update_calm_smoothing(&self, queue: &wgpu::Queue, strength: f32, kernel_radius: f32) {
         self.calm.update(queue, strength, kernel_radius, self.cell_size());
@@ -2761,7 +2795,9 @@ impl MarchingCubesRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let density_view = density_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2777,7 +2813,9 @@ impl MarchingCubesRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let density_view_b = density_texture_b.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2837,15 +2875,23 @@ impl MarchingCubesRenderer {
         });
 
         self.calm = CalmSmoothing::new(device, new_grid_size, &density_view, &density_view_b);
+        self.wall_bound = WallBound::new(
+            device,
+            new_grid_size,
+            &density_view,
+            &density_view_b,
+            &self.grid_params_buffer,
+            &self.container_geom_buffer,
+        );
         self.volume_bind_groups = create_volume_bind_groups(
             device, &self.volume_bind_group_layout, &density_view, &density_view_b,
             &self.volume_sampler, &self.grid_params_buffer, &self._tri_table_buffer,
         );
 
         // Store new textures and views (old ones are dropped automatically)
-        self._density_texture = density_texture;
+        self.density_texture = density_texture;
         self.density_view = density_view;
-        self._density_texture_b = density_texture_b;
+        self.density_texture_b = density_texture_b;
         self._density_view_b = density_view_b;
 
         // Cached density bind group references the old density view
@@ -3022,6 +3068,59 @@ impl MarchingCubesRenderer {
         }
     }
 
+    /// Field dump (--dump-field): the density field the mesh was extracted
+    /// from, as last generated — grid parameters + grid_size^3 f32 (x fastest).
+    /// Voxel i sits at grid_min + i * cell_size (mc_generate's convention).
+    pub fn read_field(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (GpuGridParams, Vec<u8>) {
+        let n = self.grid_size;
+        let texture = if self.result_in_b { &self.density_texture_b } else { &self.density_texture };
+        let row = n * 4;
+        let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MC Field Readback"),
+            size: padded as u64 * n as u64 * n as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let params_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MC Grid Params Readback"),
+            size: std::mem::size_of::<GpuGridParams>() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("MC Field Readback"),
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(n),
+                },
+            },
+            wgpu::Extent3d { width: n, height: n, depth_or_array_layers: n },
+        );
+        encoder.copy_buffer_to_buffer(&self.grid_params_buffer, 0, &params_staging, 0, params_staging.size());
+        queue.submit(Some(encoder.finish()));
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        params_staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        let params: GpuGridParams = *bytemuck::from_bytes(&params_staging.slice(..).get_mapped_range());
+        let mut bytes = Vec::with_capacity(row as usize * n as usize * n as usize);
+        {
+            let data = staging.slice(..).get_mapped_range();
+            for r in 0..(n * n) as usize {
+                let start = r * padded as usize;
+                bytes.extend_from_slice(&data[start..start + row as usize]);
+            }
+        }
+        (params, bytes)
+    }
+
     /// Set whether SSR is enabled and update GPU params
     pub fn set_ssr_enabled(&self, queue: &wgpu::Queue, enabled: bool) {
         let params = GpuSsrParams {
@@ -3125,6 +3224,10 @@ impl MarchingCubesRenderer {
                         wgpu::BindGroupEntry {
                             binding: 5,
                             resource: self.aniso_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: self.container_geom_buffer.as_entire_binding(),
                         },
                     ],
                 });
@@ -3242,6 +3345,9 @@ impl MarchingCubesRenderer {
         } else {
             result_in_b
         };
+
+        // Pass 1.7: end the field on the container walls
+        let result_in_b = self.wall_bound.encode(encoder, result_in_b);
 
         self.result_in_b = result_in_b;
 

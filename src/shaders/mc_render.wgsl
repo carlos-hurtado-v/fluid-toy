@@ -857,11 +857,12 @@ fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0
 
 // === Container walls as optical interfaces ===
 // In a wireframe (glass-less) tank the water's sides and bottom ARE the
-// container walls, like water against glass: flat planes. The MC surface
-// there is a soft particle bulge — deeper water presses further into the wall
-// (~1.7 cm bulge near the top, ~2.8 cm near the floor), so its normals lean
-// and a flat slab turns into a weak prism; seen at eye level that is enough to
-// bend the horizon down onto the ground. Fragments on a wall use the plane.
+// container walls, like water against glass: flat planes. The mesh's sides lie
+// on those planes (mc_wall_bound.wgsl cuts the field with them), but its
+// vertex normals there come from field differences and lean near the edges;
+// a slab with leaning normals is a weak prism, and seen at eye level that is
+// enough to bend the horizon down onto the ground. Fragments on a wall use
+// the plane.
 // Distance beyond the clip margin that still counts as "on the wall" (m)
 const WALL_SNAP_TOLERANCE: f32 = 0.02;
 const WALL_SNAP_MIN_COS: f32 = 0.7;
@@ -993,11 +994,11 @@ fn trace_event(q: vec3<f32>) -> vec2<f32> {
 // a point is in the water iff the field there is at least the iso value, and
 // the surface normal is the field's gradient. No view dependence.
 
-// Field voxels outside the container hold a sentinel, which interpolation
-// would smear into the water next to a wall. Points are read at least this
-// many cells inside the walls and floor: the last stretch to a wall sees the
-// field as it is that far in (the walls themselves are exact planes,
-// box_interior_exit).
+// Within two cells of a wall the field is not the water's own: mc_wall_bound
+// cuts it with a ramp that puts the mesh's sides on the wall plane. Points
+// are read at least this many cells inside the walls and floor: the last
+// stretch to a wall sees the field as it is that far in (the walls themselves
+// are exact planes, box_interior_exit).
 const VOLUME_WALL_INSET: f32 = 3.0;
 // water_normal's spline reaches 2 voxels either way: its own inset
 const NORMAL_WALL_INSET: f32 = 4.0;

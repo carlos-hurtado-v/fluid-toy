@@ -5,7 +5,7 @@
 # Requires: cargo install naga-cli --version "^27"  (major must match wgpu in Cargo.lock)
 #
 # Keep PREFIXED in sync with the format!("{}\n{}", container_common_wgsl, ...) call
-# sites: marching_cubes.rs, sph_3d_grid.rs, spray.rs, wireframe.rs, container_renderer.rs,
+# sites: marching_cubes.rs, wall_bound.rs, sph_3d_grid.rs, spray.rs, wireframe.rs, container_renderer.rs,
 # caustics.rs, rigid_body_renderer.rs. RIGIDPREFIXED shaders get
 # container_common + rigid_body_common (sph_3d_grid.rs integrate/predict/solve).
 # mc_render.wgsl links a pixel-probe snippet after container_common
@@ -20,6 +20,8 @@ $rigidCommon = Join-Path $shaderDir "rigid_body_common.wgsl"
 
 $prefixed = @(
     "mc_density.wgsl",
+    "mc_anisotropy.wgsl",
+    "mc_wall_bound.wgsl",
     "foam_map.wgsl",
     "mc_back_depth.wgsl",
     "mc_caustics_gbuffer.wgsl",

@@ -4,6 +4,15 @@
 // (cyclic Jacobi), and emits a world->kernel-space transform G plus a
 // Laplacian-smoothed splat center. mc_density.wgsl consumes the output to splat
 // ellipsoids instead of spheres. Render-only: the simulation never reads this.
+//
+// Container walls and floor within the support radius act as mirrors: each
+// neighbour also counts through its image behind the wall. Without that a
+// particle at a wall has a one-sided neighbourhood, which reads as "surface":
+// its splat is flattened against the wall and its centre pulled inward, and
+// the field next to the glass comes up short (the water surface dipped over
+// the last centimetre before a wall).
+//
+// container_common.wgsl is prepended (ContainerGeometry, world_to_local).
 
 struct SphParticle3D {
     position: vec3<f32>,
@@ -53,6 +62,7 @@ struct ParticleAniso {
 @group(0) @binding(3) var<uniform> sph_grid: SphGridParams;
 @group(0) @binding(4) var<uniform> params: AnisoParams;
 @group(0) @binding(5) var<storage, read_write> aniso_out: array<ParticleAniso>;
+@group(0) @binding(6) var<uniform> container: ContainerGeometry;
 
 // Neighbor counts (within support_radius) where anisotropy fades in.
 // Below N_LO features stay spherical (isolated droplets); a one-layer sheet
@@ -76,6 +86,23 @@ fn is_valid_sph_cell(cell: vec3<i32>) -> bool {
     return cell.x >= 0 && cell.x < i32(sph_grid.grid_size_x) &&
            cell.y >= 0 && cell.y < i32(sph_grid.grid_size_y) &&
            cell.z >= 0 && cell.z < i32(sph_grid.grid_size_z);
+}
+
+// Weighted neighbourhood moments, of offsets from the particle
+struct Moments {
+    w_sum: f32,
+    m1: vec3<f32>,
+    diag: vec3<f32>, // xx, yy, zz
+    off: vec3<f32>,  // xy, xz, yz
+}
+
+fn add_sample(m: ptr<function, Moments>, d: vec3<f32>, r: f32, r_support: f32) {
+    let u = r / r_support;
+    let w = 1.0 - u * u * u;
+    (*m).w_sum += w;
+    (*m).m1 += w * d;
+    (*m).diag += w * d * d;
+    (*m).off += w * vec3<f32>(d.x * d.y, d.x * d.z, d.y * d.z);
 }
 
 // One Jacobi rotation in the (p, q) plane, zeroing A[p][q]; k is the remaining
@@ -123,17 +150,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Poly6 peak at r=0 for the MC kernel; the field calibration anchor.
     let peak = 315.0 / (64.0 * PI * h * h * h);
 
+    // Walls and floor within reach of the neighbourhood: inward normal in
+    // world space, and how far inside the particle is. Never the open top.
+    var wall_n: array<vec3<f32>, 3>;
+    var wall_s: array<f32, 3>;
+    var wall_count = 0;
+    let local_i = world_to_local(container, xi);
+    let to_x = container.half_width - abs(local_i.x);
+    if (to_x < r_support) {
+        wall_n[wall_count] = local_dir_to_world(container, vec3<f32>(select(-1.0, 1.0, local_i.x < 0.0), 0.0, 0.0));
+        wall_s[wall_count] = max(to_x, 0.0);
+        wall_count++;
+    }
+    let to_z = container.half_depth - abs(local_i.z);
+    if (to_z < r_support) {
+        wall_n[wall_count] = local_dir_to_world(container, vec3<f32>(0.0, 0.0, select(-1.0, 1.0, local_i.z < 0.0)));
+        wall_s[wall_count] = max(to_z, 0.0);
+        wall_count++;
+    }
+    let to_floor = local_i.y + container.half_height;
+    if (to_floor < r_support) {
+        wall_n[wall_count] = local_dir_to_world(container, vec3<f32>(0.0, 1.0, 0.0));
+        wall_s[wall_count] = max(to_floor, 0.0);
+        wall_count++;
+    }
+
     // Gather weighted neighborhood moments. Positions are taken relative to xi
     // so the one-pass covariance has no catastrophic cancellation.
-    var w_sum = 0.0;
+    var mom = Moments(0.0, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
     var n_count = 0.0;
-    var m1 = vec3<f32>(0.0);
-    var cxx = 0.0;
-    var cyy = 0.0;
-    var czz = 0.0;
-    var cxy = 0.0;
-    var cxz = 0.0;
-    var cyz = 0.0;
 
     let center_cell = position_to_sph_cell(xi);
     let cell_radius = i32(ceil(r_support * sph_grid.inv_cell_size));
@@ -157,22 +202,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let d = sorted_particles[start + n].position - xi;
                     let r = length(d);
                     if (r < r_support) {
-                        let u = r / r_support;
-                        let w = 1.0 - u * u * u;
-                        w_sum += w;
+                        add_sample(&mom, d, r, r_support);
                         n_count += 1.0;
-                        m1 += w * d;
-                        cxx += w * d.x * d.x;
-                        cyy += w * d.y * d.y;
-                        czz += w * d.z * d.z;
-                        cxy += w * d.x * d.y;
-                        cxz += w * d.x * d.z;
-                        cyz += w * d.y * d.z;
+                        // Its image behind each nearby wall (always further
+                        // away than the neighbour itself). Images shape the
+                        // kernel but are not neighbours: the sparse-feature
+                        // fade below counts real particles only.
+                        for (var k = 0; k < wall_count; k++) {
+                            let s_j = max(wall_s[k] + dot(d, wall_n[k]), 0.0);
+                            let d_img = d - 2.0 * s_j * wall_n[k];
+                            let r_img = length(d_img);
+                            if (r_img < r_support) {
+                                add_sample(&mom, d_img, r_img, r_support);
+                            }
+                        }
                     }
                 }
             }
         }
     }
+    let w_sum = mom.w_sum;
+    let m1 = mom.m1;
+    let cxx = mom.diag.x;
+    let cyy = mom.diag.y;
+    let czz = mom.diag.z;
+    let cxy = mom.off.x;
+    let cxz = mom.off.y;
+    let cyz = mom.off.z;
 
     // Fade anisotropy (and center smoothing) out for sparse neighborhoods.
     let t_n = smoothstep(N_LO, N_HI, n_count);

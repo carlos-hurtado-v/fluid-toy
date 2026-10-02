@@ -19,6 +19,7 @@ pub mod mesh_loader;
 pub mod rigid_body_renderer;
 pub mod screen_space_fluid;
 pub mod spray_renderer;
+pub mod wall_bound;
 pub mod wireframe;
 
 pub use camera::{Camera, GpuCameraParams};
