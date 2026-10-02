@@ -2118,6 +2118,12 @@ impl App {
                             &gpu.queue,
                             self.state.rendering.mc_calm_smoothing,
                             self.state.sph.kernel_radius,
+                            iso_value,
+                        );
+                        mc_renderer.update_voxel_normals(
+                            &gpu.queue,
+                            self.state.rendering.mc_normal_denoise,
+                            self.state.rendering.mc_calm_smoothing,
                         );
                         mc_renderer.update_wall_bound(
                             &gpu.queue,

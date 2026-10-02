@@ -52,6 +52,8 @@ const EDGE_VERTICES: array<vec2<u32>, 12> = array<vec2<u32>, 12>(
 @group(0) @binding(3) var<storage, read> tri_table: array<i32>;
 @group(0) @binding(4) var<storage, read_write> counter: Counter;
 @group(0) @binding(5) var<storage, read_write> vertices: array<Vertex>;
+// Normal at every voxel (mc_voxel_normals.wgsl)
+@group(0) @binding(6) var normal_field: texture_3d<u32>;
 
 // Sample density at a grid point
 fn sample_density(pos: vec3<i32>) -> f32 {
@@ -81,19 +83,23 @@ fn grid_to_world(grid_pos: vec3<f32>) -> vec3<f32> {
     return params.grid_min + grid_pos * params.cell_size;
 }
 
-// Compute normal from local density gradient
+// Octahedral unit vector, 16 + 16 bits (encoder: mc_voxel_normals.wgsl - keep
+// in sync)
+fn oct_decode(v: u32) -> vec3<f32> {
+    let o = (vec2<f32>(f32(v & 0xffffu), f32(v >> 16u)) - 32767.0) / 32767.0;
+    var n = vec3<f32>(o.x, o.y, 1.0 - abs(o.x) - abs(o.y));
+    let t = max(-n.z, 0.0);
+    n.x += select(t, -t, n.x >= 0.0);
+    n.y += select(t, -t, n.y >= 0.0);
+    return normalize(n);
+}
+
+// The normal at a grid point: the field's gradient, denoised on calm water.
+// mc_voxel_normals.wgsl writes it for this pass and for mc_render's
+// water_normal, which rebuilds these triangles and must get the same normals.
 fn compute_normal(pos: vec3<i32>) -> vec3<f32> {
-    // A 1-cell central difference preserves local wave detail and avoids
-    // over-smoothed "waxy" shading on dynamic surfaces.
-    let dx = sample_density(pos + vec3<i32>(1, 0, 0)) - sample_density(pos - vec3<i32>(1, 0, 0));
-    let dy = sample_density(pos + vec3<i32>(0, 1, 0)) - sample_density(pos - vec3<i32>(0, 1, 0));
-    let dz = sample_density(pos + vec3<i32>(0, 0, 1)) - sample_density(pos - vec3<i32>(0, 0, 1));
-    let grad = vec3<f32>(dx, dy, dz);
-    let len = length(grad);
-    if (len > 0.0001) {
-        return -normalize(grad);  // Point outward from surface
-    }
-    return vec3<f32>(0.0, 1.0, 0.0);
+    let clamped = clamp(pos, vec3<i32>(0), vec3<i32>(i32(params.grid_size) - 1));
+    return oct_decode(textureLoad(normal_field, clamped, 0).r);
 }
 
 @compute @workgroup_size(4, 4, 4)

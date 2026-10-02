@@ -4,7 +4,9 @@
 //! helper fields — a wide blur S (the smoothing target) and a wider blur G
 //! (the gate) — feed a combine pass `final = mix(base, S, strength * gate(G))`.
 //! Flattens the particle-scale lumps on still water while splash sheets and
-//! droplets keep the base field. The half-res blurs reuse `mc_blur.wgsl`.
+//! droplets keep the base field. The gate is read on the smoothed surface
+//! (S = iso), so it cannot fade across a crossing. The half-res blurs reuse
+//! `mc_blur.wgsl`.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -18,11 +20,14 @@ const SMOOTH_HALF_WIDTH_H: f32 = 2.75;
 /// (~7 cm sigma overall): well above splash-sheet thickness, so sheets read
 /// low (radius 5 at High).
 const GATE_HALF_WIDTH_H: f32 = 4.1;
-/// Gate thresholds on G as fractions of the interior density. The bulk
-/// surface's iso sits near 0.44 (half-space edge, minus the iso offset); a
-/// 4 cm sheet peaks near 0.23 and droplets near 0.
-const GATE_LO: f32 = 0.22;
-const GATE_HI: f32 = 0.40;
+/// Gate thresholds on G where S crosses the iso value, as fractions of what G
+/// reads there on a flat bulk surface (`bulk_surface_gate`: ~0.40 of the
+/// interior density at High with the default threshold, where a 4 cm sheet
+/// peaks near 0.23 and droplets near 0). The upper one leaves room for convex
+/// bulk (crests read ~10% low): at 1.0 the calm surface itself was only just
+/// gated.
+const GATE_LO: f32 = 0.55;
+const GATE_HI: f32 = 0.88;
 /// SPH rest spacing as a fraction of the kernel radius (the spawn lattice;
 /// PCISPH holds rest density there). With normalized splat kernels the
 /// interior field value is the number density 1 / spacing^3.
@@ -38,7 +43,28 @@ struct GpuCalmParams {
     gate_lo: f32,
     gate_hi: f32,
     strength: f32,
-    _pad: [f32; 3],
+    iso: f32,
+    _pad: [f32; 2],
+}
+
+/// Variance of `mc_blur.wgsl`'s triangle filter of radius r, in cells^2
+fn triangle_variance(radius: i32) -> f32 {
+    let w = (radius + 1) as f32;
+    (w * w - 1.0) / 6.0
+}
+
+/// G where S crosses `iso`, on a flat bulk surface, as a fraction of the
+/// interior density. Across a half-space S and G are the same edge at two
+/// widths, so in logit space one is the other scaled by the width ratio
+/// (logistic stand-in for the filters' profiles; within 0.01 of the measured
+/// value at every grid preset for iso fractions 0.15-0.4).
+fn bulk_surface_gate(iso_fraction: f32, smooth_radius: i32, gate_radius: i32) -> f32 {
+    // What the raw field brings in (splat kernel, 2x2x2 downsample), half-res cells^2
+    const PRE_FILTER_VARIANCE: f32 = 0.1;
+    let smooth = PRE_FILTER_VARIANCE + triangle_variance(smooth_radius);
+    let width_ratio = (smooth / (smooth + triangle_variance(gate_radius))).sqrt();
+    let iso = iso_fraction.clamp(0.02, 0.98);
+    1.0 / (1.0 + ((1.0 - iso) / iso).powf(width_ratio))
 }
 
 /// Same layout as `BlurParams` in mc_blur.wgsl
@@ -55,6 +81,8 @@ pub struct CalmSmoothing {
     full_size: u32,
     half_size: u32,
     _half_textures: [wgpu::Texture; 3],
+    /// G, once `encode_helpers` has run
+    gate_view: wgpu::TextureView,
     params_buffer: wgpu::Buffer,
     /// S chain (X, Y, Z) then G chain (X, Y, Z); radii rewritten each update
     blur_params_buffers: [wgpu::Buffer; 6],
@@ -128,7 +156,8 @@ impl CalmSmoothing {
                 gate_lo: 0.0,
                 gate_hi: 1.0,
                 strength: 0.0,
-                _pad: [0.0; 3],
+                iso: 0.0,
+                _pad: [0.0; 2],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -190,10 +219,12 @@ impl CalmSmoothing {
             })
         });
 
+        let [gate_view, ..] = half_views;
         Self {
             full_size,
             half_size,
             _half_textures: half_textures,
+            gate_view,
             params_buffer,
             blur_params_buffers,
             downsample_pipeline,
@@ -207,8 +238,9 @@ impl CalmSmoothing {
 
     /// `strength` 0..1 (0 = off); `kernel_radius` is the sim h, which sets the
     /// rest spacing (so the interior field value the gate is scaled to) and
-    /// the filter widths; `cell_size` is the full-res MC voxel size.
-    pub fn update(&self, queue: &wgpu::Queue, strength: f32, kernel_radius: f32, cell_size: f32) {
+    /// the filter widths; `cell_size` is the full-res MC voxel size and
+    /// `iso_value` the field value the mesh is extracted at.
+    pub fn update(&self, queue: &wgpu::Queue, strength: f32, kernel_radius: f32, cell_size: f32, iso_value: f32) {
         // Triangle filter of radius r spans r + 1 cells each side
         let half_cell = 2.0 * cell_size;
         let radius_for = |half_width_h: f32| {
@@ -227,15 +259,23 @@ impl CalmSmoothing {
 
         let spacing = REST_SPACING_FACTOR * kernel_radius;
         let interior = 1.0 / (spacing * spacing * spacing);
+        let bulk_gate = bulk_surface_gate(iso_value / interior, radii[0], radii[1]) * interior;
         let params = GpuCalmParams {
             full_size: self.full_size,
             half_size: self.half_size,
-            gate_lo: GATE_LO * interior,
-            gate_hi: GATE_HI * interior,
+            gate_lo: GATE_LO * bulk_gate,
+            gate_hi: GATE_HI * bulk_gate,
             strength: strength.clamp(0.0, 1.0),
-            _pad: [0.0; 3],
+            iso: iso_value,
+            _pad: [0.0; 2],
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
+    }
+
+    /// The gate field G (half resolution; outside-container voxels hold -1).
+    /// Only current on frames `encode_helpers` ran.
+    pub fn gate_view(&self) -> &wgpu::TextureView {
+        &self.gate_view
     }
 
     /// Build S and G from the raw density field. Must run while A still holds

@@ -9,6 +9,7 @@ use wgpu::util::DeviceExt;
 
 use super::calm_smoothing::CalmSmoothing;
 use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
+use super::voxel_normals::VoxelNormals;
 use super::wall_bound::WallBound;
 use super::ContainerRenderer;
 use super::RigidBodyRenderer;
@@ -248,6 +249,7 @@ fn create_volume_bind_groups(
     sampler: &wgpu::Sampler,
     grid_params_buffer: &wgpu::Buffer,
     tri_table_buffer: &wgpu::Buffer,
+    voxel_normals: &wgpu::TextureView,
 ) -> [wgpu::BindGroup; 2] {
     [density_view, density_view_b].map(|view| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -258,6 +260,7 @@ fn create_volume_bind_groups(
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: grid_params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: tri_table_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(voxel_normals) },
             ],
         })
     })
@@ -471,8 +474,10 @@ pub struct MarchingCubesRenderer {
     blur_bind_groups: [[wgpu::BindGroup; 2]; 3],
     // Bulk-gated smoothing of calm water (half-res helper fields + combine)
     calm: CalmSmoothing,
-    // Ends the field on the container walls (last pass before generate)
+    // Ends the field on the container walls (last field pass)
     wall_bound: WallBound,
+    // Normal at every voxel of the final field, for generate and the water shader
+    voxel_normals: VoxelNormals,
 
     // Bind groups
     _density_bind_group: wgpu::BindGroup,
@@ -969,6 +974,14 @@ impl MarchingCubesRenderer {
             &grid_params_buffer,
             &container_geom_buffer,
         );
+        let voxel_normals = VoxelNormals::new(
+            device,
+            grid_size,
+            &density_view,
+            &density_view_b,
+            &grid_params_buffer,
+            calm.gate_view(),
+        );
 
         // Light params buffer
         let light_params = GpuLightParams {
@@ -1378,6 +1391,17 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Voxel normals (octahedral, R32Uint)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1425,6 +1449,10 @@ impl MarchingCubesRenderer {
                     binding: 5,
                     resource: vertex_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(voxel_normals.view()),
+                },
             ],
         });
 
@@ -1456,6 +1484,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: vertex_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(voxel_normals.view()),
                 },
             ],
         });
@@ -1858,6 +1890,18 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Voxel normals (octahedral, R32Uint): the normals the mesh
+                // was built from
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let volume_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1871,7 +1915,7 @@ impl MarchingCubesRenderer {
         });
         let volume_bind_groups = create_volume_bind_groups(
             device, &volume_bind_group_layout, &density_view, &density_view_b, &volume_sampler, &grid_params_buffer,
-            &tri_table_buffer,
+            &tri_table_buffer, voxel_normals.view(),
         );
 
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2573,6 +2617,7 @@ impl MarchingCubesRenderer {
             blur_params_buffers,
             blur_bind_groups,
             wall_bound,
+            voxel_normals,
             calm,
             _density_bind_group: density_bind_group,
             generate_bind_group,
@@ -2724,9 +2769,17 @@ impl MarchingCubesRenderer {
         self.wall_bound.update(queue, kernel_radius, self.cell_size(), is_pool);
     }
 
-    /// Calm-surface smoothing strength (0 = off). `kernel_radius` is the sim h.
-    pub fn update_calm_smoothing(&self, queue: &wgpu::Queue, strength: f32, kernel_radius: f32) {
-        self.calm.update(queue, strength, kernel_radius, self.cell_size());
+    /// Calm-surface smoothing strength (0 = off). `kernel_radius` is the sim h,
+    /// `iso_value` the same one `update_params` gets.
+    pub fn update_calm_smoothing(&self, queue: &wgpu::Queue, strength: f32, kernel_radius: f32, iso_value: f32) {
+        self.calm.update(queue, strength, kernel_radius, self.cell_size(), iso_value);
+    }
+
+    /// Normal denoising on calm water (degrees, 0 = off; see
+    /// `mc_voxel_normals.wgsl`). It leans on the calm gate field, so it
+    /// follows the calm-smoothing strength down to off.
+    pub fn update_voxel_normals(&self, queue: &wgpu::Queue, denoise_deg: f32, calm_smoothing: f32) {
+        self.voxel_normals.update(queue, denoise_deg * calm_smoothing.clamp(0.0, 1.0));
     }
 
     /// Update anisotropic kernel parameters (Yu & Turk).
@@ -2820,6 +2873,30 @@ impl MarchingCubesRenderer {
         });
         let density_view_b = density_texture_b.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Field passes that own per-resolution textures and bind groups
+        self.calm = CalmSmoothing::new(device, new_grid_size, &density_view, &density_view_b);
+        self.wall_bound = WallBound::new(
+            device,
+            new_grid_size,
+            &density_view,
+            &density_view_b,
+            &self.grid_params_buffer,
+            &self.container_geom_buffer,
+        );
+        self.voxel_normals = VoxelNormals::new(
+            device,
+            new_grid_size,
+            &density_view,
+            &density_view_b,
+            &self.grid_params_buffer,
+            self.calm.gate_view(),
+        );
+        self.volume_bind_groups = create_volume_bind_groups(
+            device, &self.volume_bind_group_layout, &density_view, &density_view_b,
+            &self.volume_sampler, &self.grid_params_buffer, &self._tri_table_buffer,
+            self.voxel_normals.view(),
+        );
+
         // Rebuild generate bind groups (reference density texture views)
         let gen_layout = self.generate_pipeline.get_bind_group_layout(0);
         self.generate_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2832,6 +2909,7 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry { binding: 3, resource: self._tri_table_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: self.counter_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: self.vertex_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(self.voxel_normals.view()) },
             ],
         });
         self.generate_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2844,6 +2922,7 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry { binding: 3, resource: self._tri_table_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: self.counter_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: self.vertex_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(self.voxel_normals.view()) },
             ],
         });
 
@@ -2874,19 +2953,6 @@ impl MarchingCubesRenderer {
             ]
         });
 
-        self.calm = CalmSmoothing::new(device, new_grid_size, &density_view, &density_view_b);
-        self.wall_bound = WallBound::new(
-            device,
-            new_grid_size,
-            &density_view,
-            &density_view_b,
-            &self.grid_params_buffer,
-            &self.container_geom_buffer,
-        );
-        self.volume_bind_groups = create_volume_bind_groups(
-            device, &self.volume_bind_group_layout, &density_view, &density_view_b,
-            &self.volume_sampler, &self.grid_params_buffer, &self._tri_table_buffer,
-        );
 
         // Store new textures and views (old ones are dropped automatically)
         self.density_texture = density_texture;
@@ -3350,6 +3416,9 @@ impl MarchingCubesRenderer {
         let result_in_b = self.wall_bound.encode(encoder, result_in_b);
 
         self.result_in_b = result_in_b;
+
+        // Pass 1.8: the final field's normals, for generate and the water shader
+        self.voxel_normals.encode(encoder, result_in_b);
 
         // Pass 2: Generate triangles (read from whichever texture has the result)
         {

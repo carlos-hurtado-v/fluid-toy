@@ -468,6 +468,15 @@ pub struct RenderConfig {
     /// still water where it is thick, leaving splash sheets and droplets to
     /// `mc_blur_radius` alone.
     pub mc_calm_smoothing: f32,
+    /// Normal denoising on calm water, degrees (0 = off = the mesh's own
+    /// normals). The calm-smoothed surface still carries the particles as a
+    /// ~0.4 deg ripple of slope (sub-millimetre in height) that grazing
+    /// mirrors show as marbling. Normals within about this angle of the
+    /// gradient of a much wider blur (the calm gate field) take its direction;
+    /// normals that differ by more are real shape and stay. No normal moves by
+    /// more than half this angle; the geometry is untouched. Needs calm
+    /// smoothing on (scales with its strength).
+    pub mc_normal_denoise: f32,
     /// Water surface roughness for PBR specular (0.01 = mirror, 0.5 = rough)
     pub water_roughness: f32,
     /// Micro-ripple normal perturbation strength (0 = glass-smooth, 1 = choppy)
@@ -523,6 +532,7 @@ impl Default for RenderConfig {
             deep_water_color: [0.005, 0.03, 0.08],
             mc_blur_radius: 1,
             mc_calm_smoothing: 1.0,
+            mc_normal_denoise: 1.5,
             water_roughness: 0.1,
             ripple_strength: 0.011,
             water_clarity: 0.65,

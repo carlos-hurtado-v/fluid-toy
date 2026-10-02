@@ -250,7 +250,7 @@ const BLOOM_MAX_LUMINANCE: f32 = 32.0;
 // pixel above the threshold, so bloom grows smoothly with brightness instead
 // of switching on whole surfaces
 fn bright_pass(uv: vec2<f32>, threshold: f32) -> vec3<f32> {
-    var color = textureSample(scene_texture, texture_sampler, uv).rgb;
+    var color = textureSampleLevel(scene_texture, texture_sampler, uv, 0.0).rgb;
     let luma = luminance(color);
     if (luma > BLOOM_MAX_LUMINANCE) {
         color *= BLOOM_MAX_LUMINANCE / luma;
@@ -262,18 +262,33 @@ fn bright_pass(uv: vec2<f32>, threshold: f32) -> vec3<f32> {
     return color * (contribution / max(l, 1e-4));
 }
 
+// Half-res target: the tap at the pixel centre averages its 2x2 scene pixels
 @fragment
 fn fs_bloom_threshold(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(bright_pass(input.uv, params.bloom_threshold), 1.0);
 }
 
+// Streak target is 1/16 x 1/4 of the scene. Every scene pixel under a texel
+// has to be read (a single tap sees 2x2 of them: glints elsewhere went
+// missing and streaks popped in and out as they moved): 8 bilinear taps
+// across, and 4 rows with tent weights reaching half a texel into the
+// neighbours above and below, so a streak slides between rows instead of
+// jumping. Thresholded per tap, like the bloom source.
 @fragment
 fn fs_streak_threshold(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(bright_pass(input.uv, params.streaks_threshold), 1.0);
+    let texel = 1.0 / vec2<f32>(textureDimensions(scene_texture));
+    var sum = vec3<f32>(0.0);
+    for (var j = 0; j < 4; j++) {
+        let row_weight = select(0.125, 0.375, j == 1 || j == 2);
+        for (var i = 0; i < 8; i++) {
+            let offset = vec2<f32>(f32(2 * i - 7), f32(2 * j - 3)) * texel;
+            sum += bright_pass(input.uv + offset, params.streaks_threshold) * row_weight;
+        }
+    }
+    return vec4<f32>(sum / 8.0, 1.0);
 }
 
-// === Bloom blur shader ===
-// Gaussian blur for bloom (called twice: horizontal then vertical)
+// === Blur shaders ===
 
 struct BlurParams {
     direction: vec2<f32>,  // (1,0) for horizontal, (0,1) for vertical
@@ -282,49 +297,51 @@ struct BlurParams {
 
 @group(0) @binding(5) var<uniform> blur_params: BlurParams;
 
-@fragment
-fn fs_bloom_blur(input: VertexOutput) -> @location(0) vec4<f32> {
-    let tex_size = vec2<f32>(textureDimensions(scene_texture));
-    let texel = 1.0 / tex_size;
-
-    // 9-tap Gaussian blur
-    let offsets = array<f32, 5>(0.0, 1.0, 2.0, 3.0, 4.0);
-    let weights = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
-
-    var result = textureSample(scene_texture, texture_sampler, input.uv).rgb * weights[0];
-
-    for (var i = 1; i < 5; i++) {
-        let offset = blur_params.direction * texel * offsets[i] * 2.0;
-        result += textureSample(scene_texture, texture_sampler, input.uv + offset).rgb * weights[i];
-        result += textureSample(scene_texture, texture_sampler, input.uv - offset).rgb * weights[i];
+// One-dimensional Gaussian over every texel within 2 * pairs of the centre.
+// Neighbouring texels are read two at a time through one bilinear tap placed
+// between them, weighted so the pair gets its two Gaussian weights. Taps must
+// not skip texels: spaced further apart they make a comb, and a one-pixel HDR
+// glint then shows the tap pattern itself (a square grid of dots in the
+// bloom, a dashed line in the streaks) instead of a glow.
+fn gaussian_blur(uv: vec2<f32>, texel_step: vec2<f32>, sigma: f32, pairs: i32) -> vec3<f32> {
+    let k = -0.5 / (sigma * sigma);
+    var sum = textureSampleLevel(scene_texture, texture_sampler, uv, 0.0).rgb;
+    var weight_sum = 1.0;
+    for (var i = 0; i < pairs; i++) {
+        let near = f32(2 * i + 1);
+        let w_near = exp(k * near * near);
+        let w_far = exp(k * (near + 1.0) * (near + 1.0));
+        let w = w_near + w_far;
+        let offset = texel_step * (near + w_far / w);
+        sum += w * (textureSampleLevel(scene_texture, texture_sampler, uv + offset, 0.0).rgb
+            + textureSampleLevel(scene_texture, texture_sampler, uv - offset, 0.0).rgb);
+        weight_sum += 2.0 * w;
     }
-
-    return vec4<f32>(result, 1.0);
+    return sum / weight_sum;
 }
 
-// === Anamorphic streak blur shader ===
-// Very wide horizontal blur for cinematic lens streaks
+// Bloom: sigma 3.4 texels of the half-res target (~7 scene pixels), called
+// twice (horizontal, then vertical)
+const BLOOM_SIGMA: f32 = 3.4;
+const BLOOM_PAIRS: i32 = 5;
+
+@fragment
+fn fs_bloom_blur(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = 1.0 / vec2<f32>(textureDimensions(scene_texture));
+    return vec4<f32>(gaussian_blur(input.uv, blur_params.direction * texel, BLOOM_SIGMA, BLOOM_PAIRS), 1.0);
+}
+
+// Anamorphic streak: horizontal only, called twice. Sigma 6.85 texels of the
+// 1/16-width target per pass = ~155 scene pixels after both. The gain keeps
+// the streak energy of the 13-tap kernel this replaced (its weights summed to
+// 1.14), so intensity settings carry over.
+const STREAK_SIGMA: f32 = 6.85;
+const STREAK_PAIRS: i32 = 9;
+const STREAK_PASS_GAIN: f32 = 1.14;
 
 @fragment
 fn fs_streak_blur(input: VertexOutput) -> @location(0) vec4<f32> {
-    let tex_size = vec2<f32>(textureDimensions(scene_texture));
-    let texel = 1.0 / tex_size;
-
-    // Wide 13-tap blur with extended reach for streak effect
-    // Offsets go much further than bloom for that stretched look
-    let offsets = array<f32, 7>(0.0, 1.5, 3.5, 6.0, 9.0, 13.0, 18.0);
-    let weights = array<f32, 7>(0.14, 0.13, 0.12, 0.10, 0.08, 0.05, 0.02);
-
-    // Horizontal direction only for anamorphic effect
-    let dir = blur_params.direction;
-
-    var result = textureSample(scene_texture, texture_sampler, input.uv).rgb * weights[0];
-
-    for (var i = 1; i < 7; i++) {
-        let offset = dir * texel * offsets[i] * 4.0; // 4x multiplier for extra width
-        result += textureSample(scene_texture, texture_sampler, input.uv + offset).rgb * weights[i];
-        result += textureSample(scene_texture, texture_sampler, input.uv - offset).rgb * weights[i];
-    }
-
-    return vec4<f32>(result, 1.0);
+    let texel = 1.0 / vec2<f32>(textureDimensions(scene_texture));
+    let step = vec2<f32>(blur_params.direction.x * texel.x, 0.0);
+    return vec4<f32>(gaussian_blur(input.uv, step, STREAK_SIGMA, STREAK_PAIRS) * STREAK_PASS_GAIN, 1.0);
 }

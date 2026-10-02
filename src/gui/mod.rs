@@ -491,6 +491,18 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                          while splash sheets and droplets keep Surface Smoothing alone.\n\
                          0 = off.",
                     );
+                    ui.add_enabled(
+                        state.rendering.mc_calm_smoothing > 0.0,
+                        egui::Slider::new(&mut state.rendering.mc_normal_denoise, 0.0..=4.0)
+                            .text("Calm Normal Denoise (deg)")
+                    ).on_hover_text(
+                        "Removes the faint particle-scale ripple left in calm water's\n\
+                         normals (marbled grazing reflections): normals within about\n\
+                         this angle of a wider average take its direction, larger\n\
+                         differences are real shape and stay. Never moves a normal by\n\
+                         more than half this angle; geometry untouched. Needs Calm\n\
+                         Surface Smoothing. 0 = off.",
+                    );
                     ui.add(
                         egui::Slider::new(&mut state.rendering.mc_density_radius_scale, 1.0..=3.0)
                             .text("Density Radius Scale")

@@ -165,6 +165,9 @@ struct McGridParams {
 @group(1) @binding(2) var<uniform> mc_grid: McGridParams;
 // Marching-cubes triangle table (256 cases x 16 edge indices, -1 terminated)
 @group(1) @binding(3) var<storage, read> mc_tri_table: array<i32>;
+// Normal at every voxel, octahedral (mc_voxel_normals.wgsl): what mc_generate
+// built the mesh's vertex normals from
+@group(1) @binding(4) var normal_tex: texture_3d<u32>;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -1081,22 +1084,22 @@ fn water_density(p: vec3<f32>) -> f32 {
     return field_at(volume_point(p, VOLUME_WALL_INSET));
 }
 
-// mc_generate's normal at a voxel: central differences of the field, normalized
+// Octahedral unit vector, 16 + 16 bits (encoder: mc_voxel_normals.wgsl - keep
+// in sync)
+fn oct_decode(v: u32) -> vec3<f32> {
+    let o = (vec2<f32>(f32(v & 0xffffu), f32(v >> 16u)) - 32767.0) / 32767.0;
+    var n = vec3<f32>(o.x, o.y, 1.0 - abs(o.x) - abs(o.y));
+    let t = max(-n.z, 0.0);
+    n.x += select(t, -t, n.x >= 0.0);
+    n.y += select(t, -t, n.y >= 0.0);
+    return normalize(n);
+}
+
+// mc_generate's normal at a voxel: both read the texture mc_voxel_normals.wgsl
+// writes (the field's central-difference gradient, denoised on calm water)
 fn voxel_normal(i: vec3<i32>) -> vec3<f32> {
     let top = vec3<i32>(i32(mc_grid.grid_size) - 1);
-    let grad = vec3<f32>(
-        textureLoad(density_tex, clamp(i + vec3<i32>(1, 0, 0), vec3<i32>(0), top), 0).r
-            - textureLoad(density_tex, clamp(i - vec3<i32>(1, 0, 0), vec3<i32>(0), top), 0).r,
-        textureLoad(density_tex, clamp(i + vec3<i32>(0, 1, 0), vec3<i32>(0), top), 0).r
-            - textureLoad(density_tex, clamp(i - vec3<i32>(0, 1, 0), vec3<i32>(0), top), 0).r,
-        textureLoad(density_tex, clamp(i + vec3<i32>(0, 0, 1), vec3<i32>(0), top), 0).r
-            - textureLoad(density_tex, clamp(i - vec3<i32>(0, 0, 1), vec3<i32>(0), top), 0).r,
-    );
-    let len = length(grad);
-    if (len > 0.0001) {
-        return -grad / len;
-    }
-    return vec3<f32>(0.0, 1.0, 0.0);
+    return oct_decode(textureLoad(normal_tex, clamp(i, vec3<i32>(0), top), 0).r);
 }
 
 // Marching-cubes cell layout, as in mc_generate.wgsl (keep in sync): corner
@@ -1157,10 +1160,10 @@ fn closest_on_triangle(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -
 
 // Outward surface normal at world point p (w = 1): the MESH's normal there.
 // The cell p lies in is triangulated exactly as mc_generate did it (same
-// corner values, same table, same vertex normals: unit central-difference
-// normals of the two voxels of each cut edge, blended along it), and the
-// normal is interpolated across the triangle nearest p, as the rasteriser
-// would. 56 texel loads. Anything "smoother" or cheaper was tried and shows
+// corner values, same table, same vertex normals: the voxel normals of the
+// two voxels of each cut edge, blended along it), and the normal is
+// interpolated across the triangle nearest p, as the rasteriser would. 16
+// texel loads. Anything "smoother" or cheaper was tried and shows
 // in refractions: differences of interpolated samples, a blend of the cell's
 // eight voxel normals and a cubic B-spline gradient all draw contour bands
 // two cells apart (they let in voxels a cell or more off the surface); an

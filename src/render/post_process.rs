@@ -7,6 +7,10 @@ use wgpu::util::DeviceExt;
 
 use crate::state::post_process::GpuPostProcessParams;
 
+/// Scene width / streak target width. The streak threshold pass in
+/// post_process.wgsl reads 8 bilinear taps across each texel: keep in sync.
+const STREAK_DOWNSCALE_X: u32 = 16;
+
 /// GPU blur direction parameters
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -93,9 +97,9 @@ impl PostProcessRenderer {
         // Bloom textures use HDR format for better quality
         let (bloom_texture_a, bloom_view_a) = Self::create_texture(device, width / 2, height / 2, "Bloom A", wgpu::TextureFormat::Rgba16Float);
         let (bloom_texture_b, bloom_view_b) = Self::create_texture(device, width / 2, height / 2, "Bloom B", wgpu::TextureFormat::Rgba16Float);
-        // Streak textures (can be lower res for performance, wider blur hides it)
-        let (streak_texture_a, streak_view_a) = Self::create_texture(device, width / 4, height / 4, "Streak A", wgpu::TextureFormat::Rgba16Float);
-        let (streak_texture_b, streak_view_b) = Self::create_texture(device, width / 4, height / 4, "Streak B", wgpu::TextureFormat::Rgba16Float);
+        // Streak textures: 1/16 width (the horizontal blur is ~155 px wide), 1/4 height
+        let (streak_texture_a, streak_view_a) = Self::create_texture(device, width / STREAK_DOWNSCALE_X, height / 4, "Streak A", wgpu::TextureFormat::Rgba16Float);
+        let (streak_texture_b, streak_view_b) = Self::create_texture(device, width / STREAK_DOWNSCALE_X, height / 4, "Streak B", wgpu::TextureFormat::Rgba16Float);
         // FXAA intermediate texture (composite renders here when FXAA enabled)
         let (fxaa_texture, fxaa_view) = Self::create_texture(device, width, height, "FXAA", surface_format);
 
@@ -948,8 +952,8 @@ impl PostProcessRenderer {
         let (scene_texture, scene_view) = Self::create_texture(device, width, height, "Scene", super::HDR_FORMAT);
         let (bloom_texture_a, bloom_view_a) = Self::create_texture(device, width / 2, height / 2, "Bloom A", wgpu::TextureFormat::Rgba16Float);
         let (bloom_texture_b, bloom_view_b) = Self::create_texture(device, width / 2, height / 2, "Bloom B", wgpu::TextureFormat::Rgba16Float);
-        let (streak_texture_a, streak_view_a) = Self::create_texture(device, width / 4, height / 4, "Streak A", wgpu::TextureFormat::Rgba16Float);
-        let (streak_texture_b, streak_view_b) = Self::create_texture(device, width / 4, height / 4, "Streak B", wgpu::TextureFormat::Rgba16Float);
+        let (streak_texture_a, streak_view_a) = Self::create_texture(device, width / STREAK_DOWNSCALE_X, height / 4, "Streak A", wgpu::TextureFormat::Rgba16Float);
+        let (streak_texture_b, streak_view_b) = Self::create_texture(device, width / STREAK_DOWNSCALE_X, height / 4, "Streak B", wgpu::TextureFormat::Rgba16Float);
         let (fxaa_texture, fxaa_view) = Self::create_texture(device, width, height, "FXAA", self.output_format);
 
         self.scene_texture = scene_texture;

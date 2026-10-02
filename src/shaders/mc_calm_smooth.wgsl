@@ -13,17 +13,21 @@
 // reads ~half the interior density however wide the filter, while a sheet
 // thinner than the filter reads ~thickness/width and a droplet ~0. So the
 // gate smoothstep(lo, hi, G) is ~1 on bulk surfaces and ~0 on splash detail.
+//
+// The gate is read ON the smoothed surface (S = iso), not per voxel: see
+// surface_gate.
 
 struct CalmParams {
     full_size: u32,
     half_size: u32,
-    // Gate thresholds on G, absolute field units (fractions of the interior
-    // density, scaled on the CPU)
+    // Gate thresholds on G, absolute field units (fractions of what G reads
+    // on a bulk surface, scaled on the CPU)
     gate_lo: f32,
     gate_hi: f32,
     // 0 = off (base field untouched), 1 = full replacement where gated
     strength: f32,
-    _pad0: f32,
+    // The marching-cubes iso value: S = iso is the smoothed surface
+    iso: f32,
     _pad1: f32,
     _pad2: f32,
 }
@@ -61,30 +65,92 @@ fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(dst_field, vec3<i32>(id), vec4<f32>(out, 0.0, 0.0, 0.0));
 }
 
-// Trilinear read of a half-res field at a full-res voxel, skipping
-// outside-container taps. Returns -1 if every tap is outside.
-fn sample_half(field: texture_3d<f32>, p: vec3<i32>) -> f32 {
+// Voxels closer than NEAR cells to the smoothed surface read the gate on it,
+// fading to their own G by FAR (distances along the gradient of S, linear
+// estimate). Marching cubes reads the voxels on either side of a crossing and
+// their neighbours for the normals: two cells each way.
+const PROJECT_NEAR: f32 = 3.0;
+const PROJECT_FAR: f32 = 5.0;
+
+struct HalfSample {
+    value: f32,
+    // Per full-res cell
+    grad: vec3<f32>,
+}
+
+// Trilinear read of a half-res field at a full-res grid position, skipping
+// outside-container taps (value -1 if every tap is outside), with the
+// gradient of the interpolant. Outside taps take the value for the gradient,
+// which then has no component across a wall.
+fn sample_half(field: texture_3d<f32>, p: vec3<f32>) -> HalfSample {
     // Full voxel center p + 0.5 sits at half-res coordinate (p + 0.5) / 2 - 0.5
-    let q = (vec3<f32>(p) + 0.5) * 0.5 - 0.5;
+    let q = (p + 0.5) * 0.5 - 0.5;
     let q0 = vec3<i32>(floor(q));
     let f = q - floor(q);
     let half_max = vec3<i32>(i32(params.half_size) - 1);
+    var v: array<f32, 8>;
     var sum = 0.0;
     var w_sum = 0.0;
     for (var k = 0; k < 8; k++) {
         let o = corner(k);
-        let v = textureLoad(field, clamp(q0 + o, vec3<i32>(0), half_max), 0).r;
+        v[k] = textureLoad(field, clamp(q0 + o, vec3<i32>(0), half_max), 0).r;
         let w3 = select(1.0 - f, f, o == vec3<i32>(1));
         let w = w3.x * w3.y * w3.z;
-        if (v >= 0.0) {
-            sum += v * w;
+        if (v[k] >= 0.0) {
+            sum += v[k] * w;
             w_sum += w;
         }
     }
-    return select(-1.0, sum / max(w_sum, 1e-6), w_sum > 1e-6);
+    if (w_sum <= 1e-6) {
+        return HalfSample(-1.0, vec3<f32>(0.0));
+    }
+    let value = sum / w_sum;
+    for (var k = 0; k < 8; k++) {
+        if (v[k] < 0.0) {
+            v[k] = value;
+        }
+    }
+    let dx = mix(mix(v[1] - v[0], v[3] - v[2], f.y), mix(v[5] - v[4], v[7] - v[6], f.y), f.z);
+    let dy = mix(mix(v[2] - v[0], v[3] - v[1], f.x), mix(v[6] - v[4], v[7] - v[5], f.x), f.z);
+    let dz = mix(mix(v[4] - v[0], v[5] - v[1], f.x), mix(v[6] - v[2], v[7] - v[3], f.x), f.y);
+    return HalfSample(value, 0.5 * vec3<f32>(dx, dy, dz));
 }
 
-// final = mix(base, S, strength * smoothstep(lo, hi, G))
+// The gate value for the voxel at p: G at the nearest point of the smoothed
+// surface when p is close to it, its own G otherwise.
+//
+// The gate has to be a property of the surface, not of the voxel. G falls
+// off across a bulk surface, so gating each voxel on its own G lets some of
+// the base field back in on the air side of every crossing - where the base
+// field, a much narrower blur, is far below S - and how much depends on how
+// far above the surface that voxel happens to sit. The surface dips by a
+// sawtooth, one tooth per voxel layer it climbs through (contour-line stripes
+// on any tilted calm surface, period = cell / slope): well under a millimetre
+// of height, but slope enough for a grazing mirror to draw as streaks
+// (snap_004: lookups of neighbouring pixel rows 20 px apart, 4 px without
+// it). Read on the surface, the gate is the same for every voxel along the
+// normal and the crossing is that of one fixed blend.
+fn surface_gate(p: vec3<f32>, s: HalfSample, g: f32) -> f32 {
+    let slope = max(length(s.grad), 1e-6 * params.iso);
+    let reach = 1.0 - smoothstep(PROJECT_NEAR, PROJECT_FAR, abs(params.iso - s.value) / slope);
+    if (reach <= 0.0) {
+        return g;
+    }
+    // Two Newton steps onto S = iso: the profile flattens away from the
+    // surface, so the first one overshoots
+    var q = p + s.grad * ((params.iso - s.value) / (slope * slope));
+    let s1 = sample_half(smooth_field, q);
+    if (s1.value >= 0.0) {
+        let slope1 = max(length(s1.grad), 1e-6 * params.iso);
+        let step = clamp((params.iso - s1.value) / slope1, -PROJECT_FAR, PROJECT_FAR);
+        q += s1.grad * (step / slope1);
+    }
+    // max: never less gated than the voxel's own G (an outside-container
+    // read is -1)
+    return mix(g, max(g, sample_half(gate_field, q).value), reach);
+}
+
+// final = mix(base, S, strength * smoothstep(lo, hi, G on the surface))
 @compute @workgroup_size(4, 4, 4)
 fn combine(@builtin(global_invocation_id) id: vec3<u32>) {
     if (any(id >= vec3<u32>(params.full_size))) {
@@ -94,11 +160,11 @@ fn combine(@builtin(global_invocation_id) id: vec3<u32>) {
     let base = textureLoad(src_field, p, 0).r;
     var out = base;
     if (base >= 0.0) {
-        let s = sample_half(smooth_field, p);
-        let g = sample_half(gate_field, p);
-        if (s >= 0.0 && g >= 0.0) {
-            let bulk = smoothstep(params.gate_lo, params.gate_hi, g) * params.strength;
-            out = mix(base, s, bulk);
+        let s = sample_half(smooth_field, vec3<f32>(id));
+        let g = sample_half(gate_field, vec3<f32>(id)).value;
+        if (s.value >= 0.0 && g >= 0.0) {
+            let bulk = smoothstep(params.gate_lo, params.gate_hi, surface_gate(vec3<f32>(id), s, g)) * params.strength;
+            out = mix(base, s.value, bulk);
         }
     }
     textureStore(dst_field, p, vec4<f32>(out, 0.0, 0.0, 0.0));
