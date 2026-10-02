@@ -40,7 +40,13 @@ struct WaterParams {
     body_count: u32,
     // rendering.mc_debug_view (McDebugView::as_u32, 0 = off)
     debug_view: u32,
-    _pad_m2: f32,
+    // rendering.mc_silhouette_exit (SILHOUETTE_* below)
+    silhouette_exit: u32,
+    // rendering.mc_front_face_exit (1 = the in-water trace tests front faces)
+    front_exit: u32,
+    _pad_f0: u32,
+    _pad_f1: u32,
+    _pad_f2: u32,
 }
 
 struct LightParams {
@@ -124,6 +130,11 @@ struct RigidBodyParams {
     _pad1: f32,
 }
 @group(0) @binding(19) var<storage, read> rigid_bodies: array<RigidBodyParams>;
+// Nearest surface at each pixel (water of either winding, bodies, pool walls)
+// and the water front faces' world normals (raw MC winding, w = 1 on water),
+// both from the front-face pass ahead of this one
+@group(0) @binding(21) var front_depth_tex: texture_depth_2d;
+@group(0) @binding(22) var front_normal_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -439,6 +450,34 @@ fn back_normal_smooth(uv: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(normalize(n), 1.0);
 }
 
+// Front-face normal at a screen point, bilinear between texel centres over the
+// texels that hold one (w = 1 if any did). The front G-buffer keeps the raw MC
+// winding, so each texel is first turned outward: a surface seen from the
+// camera's side faces against the camera ray.
+fn front_normal_smooth(uv: vec2<f32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(front_normal_tex));
+    let p = uv * vec2<f32>(dims) - 0.5;
+    let f = fract(p);
+    let i0 = clamp(vec2<i32>(floor(p)), vec2<i32>(0), dims - 1);
+    let i1 = clamp(vec2<i32>(floor(p)) + 1, vec2<i32>(0), dims - 1);
+    let ray = screen_to_world(uv, 0.5) - camera.camera_pos;
+    var texels = array<vec2<i32>, 4>(i0, vec2<i32>(i1.x, i0.y), vec2<i32>(i0.x, i1.y), i1);
+    var weights = array<f32, 4>((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
+    var n = vec3<f32>(0.0);
+    var w_sum = 0.0;
+    for (var i = 0; i < 4; i++) {
+        let t = textureLoad(front_normal_tex, texels[i], 0);
+        if (t.w > 0.5) {
+            n += select(t.xyz, -t.xyz, dot(t.xyz, ray) > 0.0) * weights[i];
+            w_sum += weights[i];
+        }
+    }
+    if (w_sum <= 0.0 || dot(n, n) < 1e-8) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(normalize(n), 1.0);
+}
+
 // How close to the depth-buffer surface at its pixel a point must be to count
 // as touching it, relative to its distance from the camera ((1 - raw depth)
 // is ~ 1 / view distance)
@@ -516,12 +555,13 @@ const PRB_REFRACT_IN: u32 = 3u;    // a = t1, b = (background raw depth, back ra
 const PRB_SECOND: u32 = 4u;        // a = t2 (0 = TIR), b = exit normal, c = water path to the exit (m)
 const PRB_EXIT_BEGIN: u32 = 10u;   // water_exit: a = origin, b = dir, c = box exit distance
 const PRB_EXIT_BOX: u32 = 11u;     // a = box exit normal, b = (t_body, trace max distance, -), c = -
-const PRB_TRACE: u32 = 12u;        // in-water sample: a = (uv, raw depth), b = (background depth, back depth, kind), c = distance
+const PRB_TRACE: u32 = 12u;        // in-water sample: a = (uv, raw depth), b = (background depth, back depth, kind), c = distance, d.x = front depth
 const PRB_TRACE_REFINE: u32 = 13u; // bisection sample, same fields
 const PRB_TRACE_END: u32 = 14u;    // a = (kind, dist_in, dist), b = (uv, -), c = max distance
-const PRB_EXIT_CROSS: u32 = 15u;   // a = back normal (smooth), b = after rim flattening, c = back.w + 2 * accepted
+const PRB_EXIT_CROSS: u32 = 15u;   // a = layer normal (smooth), b = after rim flattening, c = n.w + 2 * accepted + 4 * front layer
 const PRB_EXIT_END: u32 = 16u;     // a = exit point, b = exit normal, c = on_wall + 2 blocked + 4 body
 const PRB_EXIT_INSIDE: u32 = 17u;  // a = last in-water point, b = (blocked uv, floor contact), c = -
+const PRB_SILHOUETTE: u32 = 18u;   // out-of-water bracket whose back depth jumps: a = (back in, back out, mode), b = (lo, hi, action 0 exit 1 continue), c = -
 const PRB_BOUNCE: u32 = 20u;       // a = refracted dir (0 = reflects again), b = incoming dir, c = bounce index
 const PRB_MARCH_BEGIN: u32 = 30u;  // march_to_background: a = origin, b = dir, c = reach
 const PRB_MARCH: u32 = 31u;        // a = (uv, raw depth), b = (background depth, behind, -), c = distance
@@ -532,9 +572,9 @@ const PRB_BACKDROP: u32 = 41u;     // a = (vanishing-point uv or -1, on screen b
 const PRB_LOOKUP: u32 = 42u;       // background_at: a = (uv, background depth), b = (front raw depth, accepted, -), c = -
 const PRB_RESULT: u32 = 50u;       // a = (dbg path, end, bounces), b = (dbg uv, exit kind), c = mirror kind
 const PRB_COLOR: u32 = 51u;        // a = refracted scene, b = shaded color, c = fresnel
-// Depths behind the last trace_event / behind_background verdict (probe only)
+// Background / front depth at the last trace_event / behind_background verdict (probe only)
 var<private> prb_bg: f32 = -1.0;
-var<private> prb_back: f32 = -1.0;
+var<private> prb_front: f32 = -1.0;
 
 fn dbg_exit_interface(p: vec3<f32>, on_wall: bool) -> u32 {
     if (on_wall) {
@@ -758,10 +798,19 @@ fn box_interior_exit(o: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
 // refracted in through the tank's walls or free surface, and of its bounces
 // off walls, floor and surface (each keeps the component that leads away).
 // Rays bent by drops and crests can break it.
-fn trace_event(q: vec3<f32>) -> f32 {
+// rendering.mc_front_face_exit: how far in front of the nearest surface at its
+// pixel a sample must lie to count as out of the water, relative to
+// (1 - depth) (~ relative distance). Rays start ON the front surface, and the
+// bilinear depth of a curved surface is not exact between texel centres.
+const FRONT_EXIT_REL: f32 = 0.002;
+
+// Returns (kind, back depth read at q or -1). Kinds: 0 in the water, 1 out
+// (behind the nearest back face, or no water behind the pixel at all), 2 an
+// opaque surface, 3 out through a surface facing the camera (front exits on).
+fn trace_event(q: vec3<f32>) -> vec2<f32> {
     let bg = depth_smooth(background_depth_tex, q.xy);
     prb_bg = bg;
-    prb_back = -1.0;
+    prb_front = -1.0;
     if (q.z >= bg) {
         // Hidden behind a sphere or box: ray_body_hit owns hits on it, and the
         // back face at this pixel is the water in front of the body (where the
@@ -769,16 +818,28 @@ fn trace_event(q: vec3<f32>) -> f32 {
         // Read as "out of the water", rays passing behind a floating body
         // exited there with that surface's normal and scattered.
         if (water.body_count > 0u && on_analytic_body(screen_to_world(q.xy, bg))) {
-            return 0.0;
+            return vec2<f32>(0.0, -1.0);
         }
-        return 2.0;
+        return vec2<f32>(2.0, -1.0);
+    }
+    // In front of the nearest surface at its pixel: between the camera and
+    // everything there, so not in the water whatever that surface is (water
+    // of either winding, a body, a pool wall). The back-face test alone sees
+    // a ray rising through a free surface viewed from above only where the
+    // sample leaves the water's outline on screen, and takes the normal of
+    // whatever back face is there (the far rim).
+    if (water.front_exit != 0u) {
+        let front = depth_smooth(front_depth_tex, q.xy);
+        prb_front = front;
+        if (front - q.z > FRONT_EXIT_REL * max(1.0 - front, 1e-6)) {
+            return vec2<f32>(3.0, -1.0);
+        }
     }
     let back = depth_smooth(back_depth_tex, q.xy);
-    prb_back = back;
     if (back >= 1.0 || q.z > back) {
-        return 1.0;
+        return vec2<f32>(1.0, back);
     }
-    return 0.0;
+    return vec2<f32>(0.0, back);
 }
 
 struct TraceEvent {
@@ -791,48 +852,110 @@ struct TraceEvent {
     uv: vec2<f32>,
 }
 
+// rendering.mc_silhouette_exit: what an out-of-water verdict that comes from a
+// back-face silhouette means. The in-water test sees only the nearest back
+// face at a sample's pixel, so a ray that slips BEHIND a nearer layer of water
+// surface (as the camera sees it: a crater wall, a crest) reads as out of the
+// water without crossing anything. Bisecting a real crossing closes onto a
+// continuous back face; across a silhouette the back depth jumps and stays
+// jumped. As an exit (old behaviour) its normal is blended across the two
+// unrelated layers and neighbouring pixels flip between outcomes: stripes,
+// strongest in mirrors (snap_001). Continuing behind the layer is physically
+// right there (the ray is measured to be in water behind a crater), but its
+// switch still follows the near layer's texel-precision outline, which a
+// mirror magnifies into stair steps (snap_003): opt-in until both outcomes can
+// be blended across that outline.
+const SILHOUETTE_EXIT: u32 = 0u;       // treat it as an exit (old, default)
+const SILHOUETTE_CONTINUE: u32 = 1u;   // behind the nearer layer counts as in the water
+
+// How far behind the nearer layer (relative to (1 - depth), ~ relative
+// distance) the out-of-water sample must lie for the step to count as a slip
+// behind it. A back face seen nearly edge-on also jumps between texels
+// (depth_smooth falls back to the nearest texel on it), but a ray crossing it
+// stays within a few % of it: snap_003 ~2% (a real exit), snap_001's crater
+// wall 16%+ (behind it by 0.56 m and more).
+const SILHOUETTE_BEHIND_REL: f32 = 0.05;
+
+// Is the step from an in-water sample (back depth back_in) to an out-of-water
+// one (back_out, sample depth z_out) a slip behind a nearer back-face layer?
+fn is_silhouette(back_in: f32, back_out: f32, z_out: f32) -> bool {
+    return back_in > 0.0 && back_out >= 0.0
+        && back_out < back_in - DEPTH_EDGE_REL * max(1.0 - back_in, 1e-6)
+        && z_out - back_out > SILHOUETTE_BEHIND_REL * max(1.0 - back_out, 1e-6);
+}
+
 // First event along a ray inside the water, within max_dist. Samples are
 // spaced quadratically: ~1 cm apart at the start, where thin drops and crests
 // need them, coarse toward the far walls.
 fn trace_in_water(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> TraceEvent {
     var lo = 0.0;
-    var hi = -1.0;
-    var kind = 0.0;
-    for (var k = 1; k <= TRACE_STEPS; k++) {
+    // Back depth at the last in-water sample (-1: none yet)
+    var back_lo = -1.0;
+    // SILHOUETTE_CONTINUE: back depths nearer than this belong to a layer the
+    // ray has slipped behind; samples hidden by it count as in the water
+    var hidden_below = 0.0;
+    var k = 1;
+    loop {
+        if (k > TRACE_STEPS) {
+            break;
+        }
         let f = f32(k) / f32(TRACE_STEPS);
         let s = max_dist * f * f;
+        k += 1;
         let q = screen_point(origin + dir * s);
         if (any(q.xy < vec2<f32>(0.0)) || any(q.xy > vec2<f32>(1.0))) {
             probe_event(PRB_TRACE, q, vec3<f32>(-1.0, -1.0, -1.0), s);
             break;
         }
-        kind = trace_event(q);
-        probe_event(PRB_TRACE, q, vec3<f32>(prb_bg, prb_back, kind), s);
-        if (kind > 0.5) {
-            hi = s;
-            break;
+        var ev = trace_event(q);
+        if (ev.x > 0.5 && ev.x < 1.5 && ev.y >= 0.0 && ev.y < hidden_below) {
+            ev.x = 0.0;
         }
-        lo = s;
-    }
-    if (hi < 0.0) {
-        probe_event(PRB_TRACE_END, vec3<f32>(0.0, max_dist, max_dist), vec3<f32>(0.0), max_dist);
-        return TraceEvent(0.0, max_dist, max_dist, vec2<f32>(0.0));
-    }
-    for (var k = 0; k < TRACE_REFINE; k++) {
-        let mid = 0.5 * (lo + hi);
-        let q = screen_point(origin + dir * mid);
-        let e = trace_event(q);
-        probe_event(PRB_TRACE_REFINE, q, vec3<f32>(prb_bg, prb_back, e), mid);
-        if (e > 0.5) {
-            hi = mid;
-            kind = e;
-        } else {
-            lo = mid;
+        probe_event4(PRB_TRACE, q, vec3<f32>(prb_bg, ev.y, ev.x), s, vec4<f32>(prb_front, 0.0, 0.0, 0.0));
+        if (ev.x < 0.5) {
+            lo = s;
+            back_lo = ev.y;
+            continue;
         }
+        var hi = s;
+        var kind = ev.x;
+        var back_hi = ev.y;
+        var z_hi = q.z;
+        for (var r = 0; r < TRACE_REFINE; r++) {
+            let mid = 0.5 * (lo + hi);
+            let qm = screen_point(origin + dir * mid);
+            var e = trace_event(qm);
+            if (e.x > 0.5 && e.x < 1.5 && e.y >= 0.0 && e.y < hidden_below) {
+                e.x = 0.0;
+            }
+            probe_event4(PRB_TRACE_REFINE, qm, vec3<f32>(prb_bg, e.y, e.x), mid, vec4<f32>(prb_front, 0.0, 0.0, 0.0));
+            if (e.x > 0.5) {
+                hi = mid;
+                kind = e.x;
+                back_hi = e.y;
+                z_hi = qm.z;
+            } else {
+                lo = mid;
+                back_lo = e.y;
+            }
+        }
+        let silhouette = kind < 1.5 && is_silhouette(back_lo, back_hi, z_hi);
+        if (silhouette) {
+            let action = select(0.0, 1.0, water.silhouette_exit == SILHOUETTE_CONTINUE);
+            probe_event(PRB_SILHOUETTE, vec3<f32>(back_lo, back_hi, f32(water.silhouette_exit)), vec3<f32>(lo, hi, action), 0.0);
+            if (water.silhouette_exit == SILHOUETTE_CONTINUE) {
+                // Not a way out: carry on behind the nearer layer
+                hidden_below = back_lo - DEPTH_EDGE_REL * max(1.0 - back_lo, 1e-6);
+                lo = s;
+                continue;
+            }
+        }
+        let event_uv = screen_point(origin + dir * hi).xy;
+        probe_event(PRB_TRACE_END, vec3<f32>(kind, lo, hi), vec3<f32>(event_uv, 0.0), max_dist);
+        return TraceEvent(kind, lo, hi, event_uv);
     }
-    let event_uv = screen_point(origin + dir * hi).xy;
-    probe_event(PRB_TRACE_END, vec3<f32>(kind, lo, hi), vec3<f32>(event_uv, 0.0), max_dist);
-    return TraceEvent(kind, lo, hi, event_uv);
+    probe_event(PRB_TRACE_END, vec3<f32>(0.0, max_dist, max_dist), vec3<f32>(0.0), max_dist);
+    return TraceEvent(0.0, max_dist, max_dist, vec2<f32>(0.0));
 }
 
 // The MC surface does not meet a wireframe tank wall at a corner: it rounds
@@ -906,7 +1029,8 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
     var out: WaterExit;
     // Reached the body with nothing in between, or left the water through the
     // film just in front of it
-    if (t_body > 0.0 && (ev.kind < 0.5 || (ev.kind < 1.5 && t_body - ev.dist < BODY_WET_GAP))) {
+    let opaque = ev.kind > 1.5 && ev.kind < 2.5;
+    if (t_body > 0.0 && (ev.kind < 0.5 || (!opaque && t_body - ev.dist < BODY_WET_GAP))) {
         dbg_body = true;
         out.blocked = true;
         out.blocked_uv = screen_point(origin + dir * t_body).xy;
@@ -914,12 +1038,17 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
         probe_event(PRB_EXIT_INSIDE, origin, vec3<f32>(out.blocked_uv, 0.0), 0.0);
         return out;
     }
-    out.blocked = ev.kind > 1.5;
+    out.blocked = opaque;
     out.blocked_uv = ev.uv;
     var floor_contact = 0.0;
     var crossing = ev.kind > 0.5 && ev.dist < wall.w - (container.clip_margin + WALL_SNAP_TOLERANCE);
     if (crossing) {
-        let back_n = back_normal_smooth(ev.uv);
+        // The interface crossed: a back face, or (kind 3) a front face
+        let front_layer = ev.kind > 2.5;
+        var back_n = back_normal_smooth(ev.uv);
+        if (front_layer) {
+            back_n = front_normal_smooth(ev.uv);
+        }
         if (back_n.w > 0.5) {
             out.normal = flatten_wall_rim(origin + dir * ev.dist, back_n.xyz);
         } else {
@@ -933,7 +1062,7 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
         // camera and a point just under the surface reads as dry): ignore it
         // and let the box bound the ray
         crossing = dot(out.normal, dir) > 0.0;
-        probe_event(PRB_EXIT_CROSS, back_n.xyz, out.normal, back_n.w + 2.0 * f32(crossing));
+        probe_event(PRB_EXIT_CROSS, back_n.xyz, out.normal, back_n.w + 2.0 * f32(crossing) + 4.0 * f32(front_layer));
     }
     if (crossing) {
         out.point = origin + dir * ev.dist;

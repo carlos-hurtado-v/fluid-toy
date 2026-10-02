@@ -71,6 +71,46 @@ impl McDebugView {
     }
 }
 
+/// What the in-water trace (wireframe tank refraction) does when it finds the
+/// ray "out of the water" only because it passed behind a nearer layer of water
+/// surface in screen space: the back depth jumps between the last in-water and
+/// the first out-of-water sample instead of being crossed. The back-depth
+/// buffer holds one layer, so what lies behind the nearer one is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum McSilhouetteExit {
+    /// Treat it as an exit through the surface there (old behaviour): its
+    /// normal is blended across two unrelated surfaces, and neighbouring
+    /// pixels flip between outcomes (stripes in mirrors). Configs from the
+    /// short-lived "Straight" mode (exit unbent; wrong by construction) load
+    /// as this.
+    #[default]
+    #[serde(alias = "Straight")]
+    Exit,
+    /// Behind the nearer layer counts as still in the water: keep tracing.
+    /// Physically right where measured (snap_001), but the switch follows the
+    /// layer's texel-precision outline and mirrors magnify it into stair steps
+    /// (snap_003), so it is opt-in
+    Continue,
+}
+
+impl McSilhouetteExit {
+    pub const ALL: [McSilhouetteExit; 2] = [McSilhouetteExit::Exit, McSilhouetteExit::Continue];
+
+    pub fn as_u32(self) -> u32 {
+        match self {
+            McSilhouetteExit::Exit => 0,
+            McSilhouetteExit::Continue => 1,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            McSilhouetteExit::Exit => "Exit (old)",
+            McSilhouetteExit::Continue => "Continue in water",
+        }
+    }
+}
+
 /// Marching cubes grid resolution presets
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum McGridResolution {
@@ -396,6 +436,13 @@ pub struct RenderConfig {
     pub physical_water_medium: bool,
     /// MC refraction debug view (see McDebugView); bypasses post-processing
     pub mc_debug_view: McDebugView,
+    /// In-water trace at back-face silhouettes (see McSilhouetteExit)
+    pub mc_silhouette_exit: McSilhouetteExit,
+    /// In-water trace also tests the nearest front face: a sample in front of
+    /// it has left the water through a surface the camera sees from its side
+    /// (the free surface seen from above), which the back-face test alone
+    /// only notices at the water's on-screen outline
+    pub mc_front_face_exit: bool,
     /// Deep water color - what you see looking into deep water (legacy medium)
     pub deep_water_color: [f32; 3],
     /// Surface smoothing - blur radius for MC density field in voxels (0 = off).
@@ -458,6 +505,8 @@ impl Default for RenderConfig {
             mc_physical_refraction: true,
             physical_water_medium: true,
             mc_debug_view: McDebugView::Off,
+            mc_silhouette_exit: McSilhouetteExit::Exit,
+            mc_front_face_exit: true,
             deep_water_color: [0.005, 0.03, 0.08],
             mc_blur_radius: 1,
             mc_calm_smoothing: 1.0,

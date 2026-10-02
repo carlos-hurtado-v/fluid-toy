@@ -110,7 +110,11 @@ pub struct GpuWaterParams {
     pub body_count: u32,
     /// McDebugView::as_u32 (0 = off)
     pub debug_view: u32,
-    pub _pad_m: f32,
+    /// rendering.mc_silhouette_exit (McSilhouetteExit::as_u32)
+    pub silhouette_exit: u32,
+    /// rendering.mc_front_face_exit
+    pub front_exit: u32,
+    pub _pad_f: [u32; 3],
 }
 
 impl Default for GpuWaterParams {
@@ -137,7 +141,9 @@ impl Default for GpuWaterParams {
             physical_medium: 1.0,
             body_count: 0,
             debug_view: 0,
-            _pad_m: 0.0,
+            silhouette_exit: 0,
+            front_exit: 0,
+            _pad_f: [0; 3],
         }
     }
 }
@@ -427,16 +433,18 @@ pub struct MarchingCubesRenderer {
 
 /// Pixel probe (--probe) record layout: mirrors ProbeBuffer in
 /// mc_probe_on.wgsl (header, PROBE_MAX_PIXELS pixel slots, then fragment
-/// slots of 2 + 2 * PROBE_EVENTS_PER_SLOT vec4s)
+/// slots of 2 + PROBE_EVENT_VEC4S * PROBE_EVENTS_PER_SLOT vec4s)
 pub const PROBE_MAX_PIXELS: usize = 64;
 const PROBE_EVENTS_PER_SLOT: u32 = 256;
+/// vec4s per event: (a.xyz, tag), (b.xyz, c), d
+const PROBE_EVENT_VEC4S: u64 = 3;
 /// Fragment slots: every fragment shading a probed pixel takes one (occluded
 /// ones and MSAA edge triangles included)
 const PROBE_MAX_SLOTS: u64 = 4 * PROBE_MAX_PIXELS as u64;
 const PROBE_HEADER_BYTES: u64 = 16 + 16 * PROBE_MAX_PIXELS as u64;
 
 fn create_probe_buffer(device: &wgpu::Device, slots: u64) -> wgpu::Buffer {
-    let slot_bytes = 16 * (2 + 2 * PROBE_EVENTS_PER_SLOT as u64);
+    let slot_bytes = 16 * (2 + PROBE_EVENT_VEC4S * PROBE_EVENTS_PER_SLOT as u64);
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("MC Probe Records"),
         size: PROBE_HEADER_BYTES + slots * slot_bytes,
@@ -446,7 +454,8 @@ fn create_probe_buffer(device: &wgpu::Device, slots: u64) -> wgpu::Buffer {
 }
 
 /// One fragment that shaded a probed pixel: its recorded refraction events,
-/// each [tag, a.x, a.y, a.z, b.x, b.y, b.z, c] (scripts/probe_decode.py names
+/// each [tag, a.x, a.y, a.z, b.x, b.y, b.z, c, d.x, d.y, d.z, d.w]
+/// (scripts/probe_decode.py names
 /// them; tags are the PRB_* constants in mc_render.wgsl)
 #[derive(serde::Serialize)]
 pub struct ProbeFragment {
@@ -454,7 +463,7 @@ pub struct ProbeFragment {
     pub frag_xy: [f32; 2],
     pub depth: f32,
     pub overflow: bool,
-    pub events: Vec<[f32; 8]>,
+    pub events: Vec<[f32; 12]>,
 }
 
 #[derive(serde::Serialize)]
@@ -1555,6 +1564,28 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Front faces: nearest-surface depth + normals (pass 0a), for
+                // rays leaving the water through a camera-facing surface
+                wgpu::BindGroupLayoutEntry {
+                    binding: 21,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 22,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
                 // Pixel probe records (only the --probe shader variant uses it)
                 wgpu::BindGroupLayoutEntry {
                     binding: 20,
@@ -1819,6 +1850,14 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 20,
                     resource: probe_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 21,
+                    resource: wgpu::BindingResource::TextureView(&front_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 22,
+                    resource: wgpu::BindingResource::TextureView(&normal_view),
                 },
             ],
         });
@@ -2588,6 +2627,8 @@ impl MarchingCubesRenderer {
         aeration_strength: f32,
         body_count: u32,
         debug_view: u32,
+        silhouette_exit: u32,
+        front_exit: bool,
     ) {
         let params = GpuWaterParams {
             water_color: *water_color,
@@ -2611,7 +2652,9 @@ impl MarchingCubesRenderer {
             physical_medium: if physical_medium { 1.0 } else { 0.0 },
             body_count,
             debug_view,
-            _pad_m: 0.0,
+            silhouette_exit,
+            front_exit: front_exit as u32,
+            _pad_f: [0; 3],
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
     }
@@ -2678,7 +2721,7 @@ impl MarchingCubesRenderer {
         let floats: &[f32] = bytemuck::cast_slice(&bytes);
         let slots_used = words[1] as usize;
         let events_per_slot = words[2] as usize;
-        let stride = 4 * (2 + 2 * events_per_slot);
+        let stride = 4 * (2 + PROBE_EVENT_VEC4S as usize * events_per_slot);
         let data = &floats[PROBE_HEADER_BYTES as usize / 4..];
         let capacity = data.len() / stride;
         let mut fragments = Vec::new();
@@ -2687,9 +2730,9 @@ impl MarchingCubesRenderer {
             let count = (d[4] as usize).min(events_per_slot);
             let events = (0..count)
                 .map(|e| {
-                    let v = &d[8 + 8 * e..16 + 8 * e];
-                    // [tag, a.xyz, b.xyz, c]
-                    [v[3], v[0], v[1], v[2], v[4], v[5], v[6], v[7]]
+                    let v = &d[8 + 12 * e..20 + 12 * e];
+                    // [tag, a.xyz, b.xyz, c, d]
+                    [v[3], v[0], v[1], v[2], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]]
                 })
                 .collect();
             fragments.push(ProbeFragment {
@@ -3472,6 +3515,14 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 20,
                     resource: self.probe_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 21,
+                    resource: wgpu::BindingResource::TextureView(&self.front_depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 22,
+                    resource: wgpu::BindingResource::TextureView(&self.normal_view),
                 },
             ],
         })

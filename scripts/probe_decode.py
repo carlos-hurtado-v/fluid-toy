@@ -17,13 +17,18 @@ then
 Default output, one row per probed pixel (in probe order):
   route + final lookup (the Paths view ids), then one token per water_exit
   call (the initial exit and each mirror bounce):
-      k05o>S*   first in-water sample that found an event = 5 of 16;
-                o = left the water (back face crossed), X = opaque surface,
+      k05o>S*   first in-water sample that found an event = 5 of 16
+                (a ^ before it per back-face silhouette the trace carried
+                on past, rendering.mc_silhouette_exit=Continue);
+                o = left the water (back face crossed / no water behind),
+                u = left through a front face (rendering.mc_front_face_exit),
+                X = opaque surface,
                 - = nothing up to the box; then the exit: S = through the
                 back face (free surface / drop), W = container wall/floor
                 plane, R = back-face crossing rejected (its normal faced the
                 ray) so the box bounded it, B = blocked, F = floor contact
-                (counts as blocked), Y = body; * = reflected again (TIR)
+                (counts as blocked), Y = body, U = through a front face;
+                * = reflected again (TIR)
 followed by the FIRST DIVERGENCE between each pair of neighbouring pixels
 whose route differs: which water_exit call, which sample, which test, and the
 depth margins either side. --diff prints both traces around that point.
@@ -48,13 +53,14 @@ from debug_decode import ENDS, EXITS, PATHS  # noqa: E402  (shared id tables)
 EVENTS = {
     1: "FRAG", 2: "NORMAL", 3: "REFRACT_IN", 4: "SECOND",
     10: "EXIT_BEGIN", 11: "EXIT_BOX", 12: "TRACE", 13: "TRACE_REFINE", 14: "TRACE_END",
-    15: "EXIT_CROSS", 16: "EXIT_END", 17: "EXIT_INSIDE",
+    15: "EXIT_CROSS", 16: "EXIT_END", 17: "EXIT_INSIDE", 18: "SILHOUETTE",
     20: "BOUNCE",
     30: "MARCH_BEGIN", 31: "MARCH", 32: "MARCH_REFINE", 33: "MARCH_END",
     40: "SCENE", 41: "BACKDROP", 42: "LOOKUP",
     50: "RESULT", 51: "COLOR",
 }
-KIND = {-1: "offscreen", 0: "in water", 1: "out of water", 2: "opaque"}
+KIND = {-1: "offscreen", 0: "in water", 1: "out of water", 2: "opaque",
+        3: "out through a front face"}
 
 
 def v3(x):
@@ -83,15 +89,24 @@ def fmt_event(e):
             return f"{name:12s} s={c:.4f} uv=({a[0]:.5f}, {a[1]:.5f}) OFFSCREEN"
         kind = KIND.get(int(round(b[2])), "?")
         back = f"back={b[1]:.7f} z-back={a[2] - b[1]:+.2e}" if b[1] >= 0 else "back=  (not read)"
+        front = ""
+        if len(e) > 8 and e[8] > 0:
+            # front margin in units of (1 - front): FRONT_EXIT_REL in mc_render.wgsl
+            front = f" front={e[8]:.7f} (front-z)/(1-front)={(e[8] - a[2]) / max(1 - e[8], 1e-6):+.4f}"
         return (f"{name:12s} s={c:.4f} uv=({a[0]:.5f}, {a[1]:.5f}) z={a[2]:.7f} "
-                f"bg={b[0]:.7f} z-bg={a[2] - b[0]:+.2e} {back} -> {kind}")
+                f"bg={b[0]:.7f} z-bg={a[2] - b[0]:+.2e} {back}{front} -> {kind}")
     if tag == 14:
         return (f"{name:12s} kind={KIND.get(int(round(a[0])), '?')} dist_in={a[1]:.4f} "
                 f"dist={a[2]:.4f} uv=({b[0]:.5f}, {b[1]:.5f}) max={c:.4f}")
+    if tag == 18:
+        action = {0: "taken as an exit (old)", 1: "CONTINUE behind the nearer layer"}.get(int(round(b[2])), "?")
+        return (f"{name:12s} back in={a[0]:.7f} back out={a[1]:.7f} (jump {a[0] - a[1]:.2e}) "
+                f"bracket=[{b[0]:.4f}, {b[1]:.4f}] -> {action}")
     if tag == 15:
         has_n = int(round(c)) % 2
-        accepted = int(round(c)) >= 2
-        return (f"{name:12s} back_n={v3(a)} (written={has_n}) flattened={v3(b)} "
+        accepted = int(round(c)) % 4 >= 2
+        layer = "front" if int(round(c)) >= 4 else "back"
+        return (f"{name:12s} {layer}_n={v3(a)} (written={has_n}) flattened={v3(b)} "
                 f"{'ACCEPTED' if accepted else 'REJECTED (faces the ray)'}")
     if tag == 16:
         f = int(round(c))
@@ -134,7 +149,9 @@ def decision(e):
     if tag in (12, 13):
         return int(round(e[6]))            # trace kind (-1 offscreen)
     if tag == 15:
-        return int(round(e[7])) >= 2         # crossing accepted
+        return int(round(e[7])) % 4 >= 2     # crossing accepted
+    if tag == 18:
+        return int(round(e[6]))              # silhouette action
     if tag == 16:
         return int(round(e[7]))              # exit flags
     if tag == 17:
@@ -164,16 +181,22 @@ def summarize(events):
     for e in events:
         tag = int(round(e[0]))
         if tag == 10:
-            cur = {"k": None, "kind": "-", "exit": "?", "tir": False}
+            cur = {"k": None, "kind": "-", "exit": "?", "tir": False, "skips": 0}
             s["exits"].append(cur)
             k = 0
         elif tag == 12 and cur is not None:
             k += 1
             if cur["k"] is None and e[6] > 0.5:
                 cur["k"] = k
-                cur["kind"] = "o" if e[6] < 1.5 else "X"
+                cur["kind"] = {1: "o", 2: "X", 3: "u"}.get(int(round(e[6])), "?")
+        elif tag == 18 and cur is not None:
+            action = int(round(e[6]))
+            if action == 1:
+                cur["skips"] += 1
+                cur["k"], cur["kind"] = None, "-"   # the next event counts
         elif tag == 15 and cur is not None:
-            cur["crossed"] = int(round(e[7])) >= 2
+            cur["crossed"] = int(round(e[7])) % 4 >= 2
+            cur["front"] = int(round(e[7])) >= 4
         elif tag == 16 and cur is not None:
             f = int(round(e[7]))
             if f & 4:
@@ -183,7 +206,7 @@ def summarize(events):
             elif f & 1:
                 cur["exit"] = "R" if cur.get("crossed") is False else "W"
             else:
-                cur["exit"] = "S"
+                cur["exit"] = "U" if cur.get("front") else "S"
         elif tag == 17 and cur is not None and e[6] > 0.5:
             cur["exit"] = "F"
         elif tag in (20, 4) and cur is not None:
@@ -195,7 +218,7 @@ def summarize(events):
 
 def exit_token(x):
     k = f"k{x['k']:02d}" if x["k"] is not None else "k--"
-    return f"{k}{x['kind']}>{x['exit']}{'*' if x['tir'] else ' '}"
+    return f"{'^' * x['skips']}{k}{x['kind']}>{x['exit']}{'*' if x['tir'] else ' '}"
 
 
 def locate(events, j, exact=True):

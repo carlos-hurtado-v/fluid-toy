@@ -16,9 +16,9 @@ struct ProbeBuffer {
     _pad: u32,
     // Probed pixels (.xy, PNG pixel coordinates: x right, y down)
     pixels: array<vec4<u32>, PROBE_MAX_PIXELS>,
-    // Slots of 2 + 2 * events_per_slot entries: [pixel index, frag x, frag y,
+    // Slots of 2 + 3 * events_per_slot entries: [pixel index, frag x, frag y,
     // raw depth], [events recorded, overflowed, -, -], then per event
-    // (a.xyz, tag) and (b.xyz, c)
+    // (a.xyz, tag), (b.xyz, c) and d
     data: array<vec4<f32>>,
 }
 @group(0) @binding(20) var<storage, read_write> probe: ProbeBuffer;
@@ -31,7 +31,7 @@ fn probe_begin(frag_xy: vec2<f32>, depth: f32) {
     let n = min(probe.pixel_count, PROBE_MAX_PIXELS);
     for (var i = 0u; i < n; i++) {
         if (all(probe.pixels[i].xy == px)) {
-            let stride = 2u + 2u * probe.events_per_slot;
+            let stride = 2u + 3u * probe.events_per_slot;
             let slot = atomicAdd(&probe.slots_used, 1u);
             if ((slot + 1u) * stride > arrayLength(&probe.data)) {
                 return;
@@ -45,7 +45,7 @@ fn probe_begin(frag_xy: vec2<f32>, depth: f32) {
     }
 }
 
-fn probe_event(tag: u32, a: vec3<f32>, b: vec3<f32>, c: f32) {
+fn probe_event4(tag: u32, a: vec3<f32>, b: vec3<f32>, c: f32, d: vec4<f32>) {
     if (probe_base < 0) {
         return;
     }
@@ -54,9 +54,14 @@ fn probe_event(tag: u32, a: vec3<f32>, b: vec3<f32>, c: f32) {
         probe.data[base + 1u].y = 1.0;
         return;
     }
-    let at = base + 2u + 2u * probe_n;
+    let at = base + 2u + 3u * probe_n;
     probe.data[at] = vec4<f32>(a, f32(tag));
     probe.data[at + 1u] = vec4<f32>(b, c);
+    probe.data[at + 2u] = d;
     probe_n += 1u;
     probe.data[base + 1u].x = f32(probe_n);
+}
+
+fn probe_event(tag: u32, a: vec3<f32>, b: vec3<f32>, c: f32) {
+    probe_event4(tag, a, b, c, vec4<f32>(0.0));
 }

@@ -550,6 +550,29 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                              interface, bounces. \
                              Decode captures with scripts/debug_decode.py",
                         );
+                    egui::ComboBox::from_label("Behind-Surface Rays")
+                        .selected_text(state.rendering.mc_silhouette_exit.label())
+                        .show_ui(ui, |ui| {
+                            for mode in crate::state::McSilhouetteExit::ALL {
+                                ui.selectable_value(&mut state.rendering.mc_silhouette_exit, mode, mode.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Glass tank: a ray inside the water that passes behind a nearer \
+                             layer of water surface (as the camera sees it) looks like it left \
+                             the water. Exit: old behaviour (stripes in mirrors). Continue: \
+                             assume it is still in the water (removes those stripes, but can \
+                             draw stair steps along the outline in mirrors)",
+                        );
+                    ui.checkbox(&mut state.rendering.mc_front_face_exit, "Front-Face Exits")
+                        .on_hover_text(
+                            "Glass tank: rays inside the water also detect leaving through \
+                             a surface the camera sees from its side (the free surface seen \
+                             from above). Off: they are noticed only at the water's outline \
+                             on screen, with the outline's normal (stripes in mirrors when \
+                             looking across the surface)",
+                        );
                     deep_water_color_control(ui, state);
                 }
 
