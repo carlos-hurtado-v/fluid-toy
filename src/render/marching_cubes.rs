@@ -246,6 +246,7 @@ fn create_volume_bind_groups(
     density_view_b: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
     grid_params_buffer: &wgpu::Buffer,
+    tri_table_buffer: &wgpu::Buffer,
 ) -> [wgpu::BindGroup; 2] {
     [density_view, density_view_b].map(|view| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -255,6 +256,7 @@ fn create_volume_bind_groups(
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: grid_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: tri_table_buffer.as_entire_binding() },
             ],
         })
     })
@@ -1816,6 +1818,18 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Marching-cubes triangle table: the shader rebuilds the
+                // mesh's triangles in a cell to read its normal there
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let volume_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1829,6 +1843,7 @@ impl MarchingCubesRenderer {
         });
         let volume_bind_groups = create_volume_bind_groups(
             device, &volume_bind_group_layout, &density_view, &density_view_b, &volume_sampler, &grid_params_buffer,
+            &tri_table_buffer,
         );
 
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2824,7 +2839,7 @@ impl MarchingCubesRenderer {
         self.calm = CalmSmoothing::new(device, new_grid_size, &density_view, &density_view_b);
         self.volume_bind_groups = create_volume_bind_groups(
             device, &self.volume_bind_group_layout, &density_view, &density_view_b,
-            &self.volume_sampler, &self.grid_params_buffer,
+            &self.volume_sampler, &self.grid_params_buffer, &self._tri_table_buffer,
         );
 
         // Store new textures and views (old ones are dropped automatically)

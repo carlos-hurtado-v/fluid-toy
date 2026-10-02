@@ -163,6 +163,8 @@ struct McGridParams {
 @group(1) @binding(0) var density_tex: texture_3d<f32>;
 @group(1) @binding(1) var density_sampler: sampler;
 @group(1) @binding(2) var<uniform> mc_grid: McGridParams;
+// Marching-cubes triangle table (256 cases x 16 edge indices, -1 terminated)
+@group(1) @binding(3) var<storage, read> mc_tri_table: array<i32>;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -791,6 +793,13 @@ fn screen_point(p: vec3<f32>) -> vec3<f32> {
 // Distance along the ray at which the last march_to_background found its
 // surface (-1: none)
 var<private> march_dist: f32 = -1.0;
+// In-water path of the refracted ray where it is known better than from the
+// depth buffers at the pixel (-1: not set). The medium otherwise measures to
+// the nearer of back face and opaque surface along the VIEW ray, which is
+// wrong where the refracted ray misses the body the view ray sees: that
+// stretch kept the body's short path and stood out as a tinted ghost of it.
+var<private> refracted_path: f32 = -1.0;
+var<private> missed_inside: bool = false;
 
 fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0: f32) -> vec3<f32> {
     march_dist = -1.0;
@@ -1089,15 +1098,74 @@ fn voxel_normal(i: vec3<i32>) -> vec3<f32> {
     return vec3<f32>(0.0, 1.0, 0.0);
 }
 
-// Outward surface normal at world point p (w = 1): the mesh's own normals.
-// mc_generate gives each mesh vertex, where the surface cuts a cell edge, the
-// blend of the two voxel normals at the edge's ends; here those same vertex
-// normals of the cell p lies in are blended by closeness to p (56 texel
-// loads, full float precision). Blending all eight voxel normals of the cell
-// instead (or differencing interpolated samples, or a spline through the
-// voxels) lets in voxels that no cut edge touches, a cell or more off the
-// surface, whose gradients point a little differently: half-degree dips two
-// cells apart, contour bands in whatever a curved surface refracts.
+// Marching-cubes cell layout, as in mc_generate.wgsl (keep in sync): corner
+// offsets, and the two corners each of the 12 edges joins
+const MC_CORNER: array<vec3<i32>, 8> = array<vec3<i32>, 8>(
+    vec3<i32>(0, 0, 0), vec3<i32>(0, 1, 0), vec3<i32>(0, 1, 1), vec3<i32>(0, 0, 1),
+    vec3<i32>(1, 0, 0), vec3<i32>(1, 1, 0), vec3<i32>(1, 1, 1), vec3<i32>(1, 0, 1),
+);
+const MC_EDGE: array<vec2<u32>, 12> = array<vec2<u32>, 12>(
+    vec2<u32>(0u, 1u), vec2<u32>(1u, 2u), vec2<u32>(2u, 3u), vec2<u32>(3u, 0u),
+    vec2<u32>(4u, 5u), vec2<u32>(5u, 6u), vec2<u32>(6u, 7u), vec2<u32>(7u, 4u),
+    vec2<u32>(0u, 4u), vec2<u32>(1u, 5u), vec2<u32>(2u, 6u), vec2<u32>(3u, 7u),
+);
+
+// Barycentric coordinates of the point of triangle abc closest to p
+// (Ericson, Real-Time Collision Detection 5.1.5)
+fn closest_on_triangle(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> vec3<f32> {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) {
+        return vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let bp = p - b;
+    let d3 = dot(ab, bp);
+    let d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) {
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+        let v = d1 / max(d1 - d3, 1e-12);
+        return vec3<f32>(1.0 - v, v, 0.0);
+    }
+    let cp = p - c;
+    let d5 = dot(ab, cp);
+    let d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) {
+        return vec3<f32>(0.0, 0.0, 1.0);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+        let w = d2 / max(d2 - d6, 1e-12);
+        return vec3<f32>(1.0 - w, 0.0, w);
+    }
+    let va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
+        let w = (d4 - d3) / max((d4 - d3) + (d5 - d6), 1e-12);
+        return vec3<f32>(0.0, 1.0 - w, w);
+    }
+    let denom = 1.0 / max(va + vb + vc, 1e-12);
+    let v = vb * denom;
+    let w = vc * denom;
+    return vec3<f32>(1.0 - v - w, v, w);
+}
+
+// Outward surface normal at world point p (w = 1): the MESH's normal there.
+// The cell p lies in is triangulated exactly as mc_generate did it (same
+// corner values, same table, same vertex normals: unit central-difference
+// normals of the two voxels of each cut edge, blended along it), and the
+// normal is interpolated across the triangle nearest p, as the rasteriser
+// would. 56 texel loads. Anything "smoother" or cheaper was tried and shows
+// in refractions: differences of interpolated samples, a blend of the cell's
+// eight voxel normals and a cubic B-spline gradient all draw contour bands
+// two cells apart (they let in voxels a cell or more off the surface); an
+// inverse-distance blend of the cell's edge vertices is right on average but
+// jumps at every cell face (cell-sized blocks and beaded rings, seen from
+// close by). Only the mesh's own interpolation is both right and continuous.
 fn water_normal(p: vec3<f32>) -> vec4<f32> {
     let q = volume_point(p, NORMAL_WALL_INSET);
     let g = (q - mc_grid.grid_min) / mc_grid.cell_size;
@@ -1107,34 +1175,53 @@ fn water_normal(p: vec3<f32>) -> vec4<f32> {
     var value: array<f32, 8>;
     var normal: array<vec3<f32>, 8>;
     var all = vec3<f32>(0.0);
-    for (var k = 0; k < 8; k++) {
-        let o = vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1);
-        value[k] = textureLoad(density_tex, clamp(i0 + o, vec3<i32>(0), top), 0).r / mc_grid.iso_value;
+    var case_index = 0u;
+    for (var k = 0u; k < 8u; k++) {
+        let o = MC_CORNER[k];
+        value[k] = textureLoad(density_tex, clamp(i0 + o, vec3<i32>(0), top), 0).r;
         normal[k] = voxel_normal(i0 + o);
+        if (value[k] >= mc_grid.iso_value) {
+            case_index |= 1u << k;
+        }
         let w3 = select(vec3<f32>(1.0) - f, f, o == vec3<i32>(1));
         all += normal[k] * (w3.x * w3.y * w3.z);
     }
     var n = vec3<f32>(0.0);
-    for (var k = 0; k < 8; k++) {
-        for (var axis = 0; axis < 3; axis++) {
-            let bit = 1 << u32(axis);
-            if ((k & bit) != 0) {
-                continue;
+    if (case_index != 0u && case_index != 255u) {
+        // The mesh's vertices on this cell's edges (cell coordinates) and
+        // their normals
+        var edge_pos: array<vec3<f32>, 12>;
+        var edge_normal: array<vec3<f32>, 12>;
+        for (var e = 0u; e < 12u; e++) {
+            let c0 = MC_EDGE[e].x;
+            let c1 = MC_EDGE[e].y;
+            var t = 0.5;
+            if (abs(value[c1] - value[c0]) > 0.00001) {
+                t = (mc_grid.iso_value - value[c0]) / (value[c1] - value[c0]);
             }
-            let k1 = k | bit;
-            if ((value[k] >= 1.0) == (value[k1] >= 1.0)) {
-                continue;
+            edge_pos[e] = mix(vec3<f32>(MC_CORNER[c0]), vec3<f32>(MC_CORNER[c1]), t);
+            edge_normal[e] = normalize(mix(normal[c0], normal[c1], t));
+        }
+        var best = 1e9;
+        let table = case_index * 16u;
+        for (var i = 0u; i < 15u; i += 3u) {
+            let e0 = mc_tri_table[table + i];
+            if (e0 < 0) {
+                break;
             }
-            // The mesh vertex on this edge, in cell coordinates
-            let t = clamp((1.0 - value[k]) / (value[k1] - value[k]), 0.0, 1.0);
-            var at = vec3<f32>(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1));
-            at[axis] = t;
-            let d = f - at;
-            n += normalize(mix(normal[k], normal[k1], t)) / (dot(d, d) + 1e-3);
+            let e1 = mc_tri_table[table + i + 1u];
+            let e2 = mc_tri_table[table + i + 2u];
+            let bary = closest_on_triangle(f, edge_pos[e0], edge_pos[e1], edge_pos[e2]);
+            let d = f - (edge_pos[e0] * bary.x + edge_pos[e1] * bary.y + edge_pos[e2] * bary.z);
+            let dist = dot(d, d);
+            if (dist < best) {
+                best = dist;
+                n = edge_normal[e0] * bary.x + edge_normal[e1] * bary.y + edge_normal[e2] * bary.z;
+            }
         }
     }
     if (dot(n, n) < 1e-8) {
-        // No cut edge in this cell (p a little off the surface): all eight
+        // No surface in this cell (p a little off it): the cell's eight
         n = all;
     }
     if (dot(n, n) < 1e-8) {
@@ -1725,12 +1812,14 @@ fn refract_scene(
         // any other ray: carry on to the exit search below. Painting the
         // surface first seen there instead drew bodies a little too large.
         if (m.z > 0.5) {
+            refracted_path = march_dist;
             if (march_hit_before_ground(true, ground_distance(p, t1))) {
                 return background_at(m.xy, front_depth_raw, straight);
             }
             // It is the ground the ray ends on, through the tank's floor
             return backdrop_along(p, t1);
         }
+        missed_inside = true;
     }
     // No back face behind this pixel (mesh clipped open): treat the body as
     // deep and let the refracted ray run out to the backdrop
@@ -1771,6 +1860,9 @@ fn refract_scene(
         n_exit = normalize(back_n.xyz);
     }
     dbg_water_path = distance(p, p_exit);
+    if (missed_inside) {
+        refracted_path = dbg_water_path;
+    }
     let t2 = refract(t1, -n_exit, water.ior);
     probe_event(PRB_SECOND, t2, n_exit, dbg_water_path);
     if (dot(t2, t2) < 0.5) {
@@ -2297,6 +2389,9 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     }
     if (water.filtered_lookup != 0u) {
         refracted_background = resolve_lookup(refracted_background);
+    }
+    if (refracted_path >= 0.0) {
+        path_length = min(refracted_path, 10.0);
     }
 
     let refracted_scene = refracted_background;
