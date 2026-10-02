@@ -30,17 +30,22 @@ pub enum McDebugView {
     /// in all channels. Banding, staircases and aliasing show up as speckle
     Jump,
     /// R = cos of the final exit angle (0 = grazing / near critical), G = water
-    /// path to the first exit / 4 m, B = (mirror bounces + 1) / 8
+    /// path to the first exit / 4 m, B = exit interface id / 8 (wall plane,
+    /// back face, back face near a wall)
     Exit,
+    /// R = interface of the last mirror reflection / 8, G = exit interface / 8
+    /// (same ids as Exit), B = (mirror bounces + 1) / 8
+    Mirror,
 }
 
 impl McDebugView {
-    pub const ALL: [McDebugView; 5] = [
+    pub const ALL: [McDebugView; 6] = [
         McDebugView::Off,
         McDebugView::Paths,
         McDebugView::Lookup,
         McDebugView::Jump,
         McDebugView::Exit,
+        McDebugView::Mirror,
     ];
 
     pub fn as_u32(self) -> u32 {
@@ -50,6 +55,7 @@ impl McDebugView {
             McDebugView::Lookup => 2,
             McDebugView::Jump => 3,
             McDebugView::Exit => 4,
+            McDebugView::Mirror => 5,
         }
     }
 
@@ -60,6 +66,7 @@ impl McDebugView {
             McDebugView::Lookup => "Lookup",
             McDebugView::Jump => "Jump",
             McDebugView::Exit => "Exit",
+            McDebugView::Mirror => "Mirror",
         }
     }
 }

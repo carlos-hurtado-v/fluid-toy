@@ -21,7 +21,9 @@ tables below must match its DBG_PATH_* / DBG_END_* constants):
   lookup: R, G = screen uv of the final background lookup, B = lookup id / 8
   jump  : log2(1 + lookup jump between neighbouring pixels, texels) / 8
   exit  : R = cos(exit angle), G = water path to first exit / 4 m,
-          B = (mirror bounces + 1) / 8
+          B = exit interface id / 8 (see EXITS)
+  mirror: R = interface of the last mirror reflection / 8, G = exit
+          interface / 8 (both EXITS ids), B = (mirror bounces + 1) / 8
 The swapchain stores sRGB: values are linearised before decoding. Paths mode
 only counts pixels whose three channels all carry the exact 8-bit code of a
 valid id; everything else (non-water pixels, edges blended by MSAA) is
@@ -56,6 +58,12 @@ ENDS = {
     4: "environment map",
     5: "solid background color",
     6: "exact body hit",
+}
+EXITS = {
+    0: "no refracted exit (blocked / straight / legacy)",
+    1: "container wall or floor (exact plane)",
+    2: "back face away from the walls (free surface, drop)",
+    3: "back face within 6 cm of a wall (MC contact line / bulge)",
 }
 # Distinct, readable colors per id (sRGB)
 PALETTE = [
@@ -151,9 +159,10 @@ def write_map(base_rgb, colored, mask, region, out, legend):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("capture")
-    ap.add_argument("--mode", required=True, choices=["paths", "lookup", "jump", "exit"])
+    ap.add_argument("--mode", required=True, choices=["paths", "lookup", "jump", "exit", "mirror"])
     ap.add_argument("--region", help="x0,y0,x1,y1 in pixels (default: whole image)")
-    ap.add_argument("--by", choices=["path", "end"], default="path", help="paths mode: color the map by")
+    ap.add_argument("--by", choices=["path", "end", "exit"], default="path",
+                    help="paths mode: color the map by; exit mode: 'exit' colors by interface")
     ap.add_argument("--map", help="false-color map output path")
     args = ap.parse_args()
 
@@ -175,6 +184,33 @@ def main():
                 colored[sel] = PALETTE[(k - 1) % len(PALETTE)]
                 legend.append((PALETTE[(k - 1) % len(PALETTE)], f"{k} {name}"))
         write_map(rgb, colored, water, region, out, legend)
+        return
+
+    if args.mode == "mirror":
+        codes = rgb.astype(int)
+        mirror = match_ids(codes[..., 0], 8, EXITS.keys())
+        exit_id = match_ids(codes[..., 1], 8, EXITS.keys())
+        b = match_ids(codes[..., 2], 8, range(1, 5))
+        data = (mirror >= 0) & (exit_id >= 0) & (b > 0)
+        sub = data[y0:y1, x0:x1]
+        n = int(sub.sum())
+        print(f"region {x0},{y0} - {x1},{y1}: {sub.size} px, {n} decoded")
+        combos = {}
+        for m, e in zip(mirror[y0:y1, x0:x1][sub].tolist(), exit_id[y0:y1, x0:x1][sub].tolist()):
+            combos[(m, e)] = combos.get((m, e), 0) + 1
+        print("\nlast mirror reflection -> exit                                              px      %")
+        for (m, e), c in sorted(combos.items(), key=lambda kv: -kv[1]):
+            label = f"{m} {EXITS[m][:34]} -> {e} {EXITS[e][:34]}"
+            print(f"{label:<74} {c:7d} {100.0 * c / max(n, 1):6.1f}")
+        ids = mirror if args.by != "exit" else exit_id
+        colored = np.zeros_like(rgb)
+        legend = []
+        for k, name in EXITS.items():
+            sel = data & (ids == k)
+            if sel.any():
+                colored[sel] = PALETTE[k % len(PALETTE)]
+                legend.append((PALETTE[k % len(PALETTE)], f"{k} {name}"))
+        write_map(rgb, colored, data, region, out, legend)
         return
 
     sub = lin[y0:y1, x0:x1]
@@ -213,15 +249,29 @@ def main():
     # exit
     cos_exit = sub[..., 0]
     path_m = sub[..., 1] * 4
-    bounces = np.rint(sub[..., 2] * 8).astype(int) - 1
+    exit_id = match_ids(rgb[y0:y1, x0:x1, 2].astype(int), 8, EXITS.keys())
     print(f"region {x0},{y0} - {x1},{y1}: exit cos median {np.median(cos_exit):.2f} "
           f"(< 0.2 = grazing / near critical: {100 * (cos_exit < 0.2).mean():.1f}%), "
           f"water path median {np.median(path_m):.2f} m")
-    print("mirror bounces: " + ", ".join(
-        f"{k}: {int((bounces == k).sum())}" for k in range(4) if (bounces == k).any()))
-    colored = heat(1 - lin[..., 0])
+    for k, name in EXITS.items():
+        sel = exit_id == k
+        if sel.any():
+            print(f"  exit {k} {name:<58} {int(sel.sum()):7d} px, grazing (<0.2) "
+                  f"{100 * (cos_exit[sel] < 0.2).mean():5.1f}%")
     mask = np.zeros((h, w), bool)
     mask[y0:y1, x0:x1] = True
+    if args.by == "exit":
+        ids = match_ids(rgb[..., 2].astype(int), 8, EXITS.keys())
+        colored = np.zeros_like(rgb)
+        legend = []
+        for k, name in EXITS.items():
+            sel = ids == k
+            if sel.any():
+                colored[sel] = PALETTE[k % len(PALETTE)]
+                legend.append((PALETTE[k % len(PALETTE)], f"{k} {name}"))
+        write_map(rgb, colored, mask, region, out, legend)
+        return
+    colored = heat(1 - lin[..., 0])
     write_map(rgb, colored, mask, region, out, [(tuple(heat(np.array(0.0))), "straight out"),
                                                 (tuple(heat(np.array(1.0))), "grazing exit")])
 

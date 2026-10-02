@@ -545,7 +545,9 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                              (post-processing off while active). Paths: route taken (R), \
                              final lookup (G), mirror bounces (B). Lookup: lookup uv. \
                              Jump: lookup jump between pixels (bright = banding/aliasing). \
-                             Exit: exit angle cosine, water path, bounces. \
+                             Exit: exit angle cosine, water path, exit interface. \
+                             Mirror: interface of the last mirror reflection, exit \
+                             interface, bounces. \
                              Decode captures with scripts/debug_decode.py",
                         );
                     deep_water_color_control(ui, state);

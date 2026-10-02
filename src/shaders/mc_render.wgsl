@@ -496,6 +496,26 @@ var<private> dbg_bounces: u32 = 0u;
 var<private> dbg_uv: vec2<f32> = vec2<f32>(-1.0);
 var<private> dbg_exit_cos: f32 = 0.0;
 var<private> dbg_water_path: f32 = 0.0;
+var<private> dbg_exit_kind: u32 = 0u;
+// Interface of the last mirror (total internal) reflection, same ids
+var<private> dbg_mirror_kind: u32 = 0u;
+// Interface a ray finally refracted out through (dbg_exit_kind)
+const DBG_EXIT_WALL: u32 = 1u;          // container wall or floor (exact plane)
+const DBG_EXIT_SURFACE: u32 = 2u;       // back face (free surface, drop) away from the walls
+const DBG_EXIT_SURFACE_WALL: u32 = 3u;  // back face near a wall: the MC contact line / bulge
+const DBG_NEAR_WALL: f32 = 0.06;
+
+fn dbg_exit_interface(p: vec3<f32>, on_wall: bool) -> u32 {
+    if (on_wall) {
+        return DBG_EXIT_WALL;
+    }
+    let l = world_to_local(container, p);
+    let to_wall = min(
+        min(container.half_width - abs(l.x), container.half_depth - abs(l.z)),
+        l.y + container.half_height,
+    );
+    return select(DBG_EXIT_SURFACE, DBG_EXIT_SURFACE_WALL, to_wall < DBG_NEAR_WALL);
+}
 
 fn background_at(uv: vec2<f32>, front_depth_raw: f32, straight: vec3<f32>) -> vec3<f32> {
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))
@@ -755,6 +775,48 @@ fn trace_in_water(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> TraceEven
     return TraceEvent(kind, lo, hi, screen_point(origin + dir * hi).xy);
 }
 
+// The MC surface does not meet a wireframe tank wall at a corner: it rounds
+// over into the particle bulge past the wall, unevenly along the wall. Real
+// water meets glass with a meniscus of millimetres, flat right up to the
+// wall. Mirrored in that rim at grazing angles, the uneven lean strung dark
+// beads along wall/surface seams (the Mirror debug view shows rays whose last
+// reflection was there). Within this distance of a side wall (m), the free
+// surface's normal loses its lean into the wall (full at half the band,
+// fading out by the band's edge). The rim's uneven HEIGHT remains: rays near
+// the seam still flip between leaving through the surface and the wall.
+const RIM_BAND: f32 = 0.05;
+
+fn flatten_wall_rim(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    if (container.is_pool != 0u) {
+        return n;
+    }
+    let l = world_to_local(container, p);
+    let n_local = world_dir_to_local(container, n);
+    // Only the free surface: the bulge's side faces (normals along a wall)
+    // would be left pointing along the wall
+    if (n_local.y < 0.5) {
+        return n;
+    }
+    var out = n_local;
+    // Each side wall in turn (a corner is near two)
+    let to_x = container.half_width - abs(l.x);
+    if (to_x < RIM_BAND) {
+        let wn = vec3<f32>(sign(l.x), 0.0, 0.0);
+        let w = 1.0 - smoothstep(0.5 * RIM_BAND, RIM_BAND, to_x);
+        out = out - wn * max(dot(out, wn), 0.0) * w;
+    }
+    let to_z = container.half_depth - abs(l.z);
+    if (to_z < RIM_BAND) {
+        let wn = vec3<f32>(0.0, 0.0, sign(l.z));
+        let w = 1.0 - smoothstep(0.5 * RIM_BAND, RIM_BAND, to_z);
+        out = out - wn * max(dot(out, wn), 0.0) * w;
+    }
+    if (dot(out, out) < 0.25) {
+        return n;
+    }
+    return local_dir_to_world(container, normalize(out));
+}
+
 struct WaterExit {
     // Where the ray leaves the water, and the interface's outward normal
     point: vec3<f32>,
@@ -793,7 +855,7 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
     if (crossing) {
         let back_n = back_normal_smooth(ev.uv);
         if (back_n.w > 0.5) {
-            out.normal = back_n.xyz;
+            out.normal = flatten_wall_rim(origin + dir * ev.dist, back_n.xyz);
         } else {
             // Crossing on a silhouette edge with no normal written: the free
             // surface is the likely interface
@@ -885,9 +947,11 @@ fn follow_internal_reflection(
         if (dot(out_dir, out_dir) > 0.5) {
             dbg_path = DBG_PATH_TIR_EXIT;
             dbg_exit_cos = dot(out_dir, ex.normal);
+            dbg_exit_kind = dbg_exit_interface(ex.point, ex.on_wall);
             return scene_from(ex.point, out_dir, front_depth_raw, straight);
         }
         // Reflects again: continue inside the water
+        dbg_mirror_kind = dbg_exit_interface(ex.point, ex.on_wall);
         o = ex.inside;
         d = reflect(d, ex.normal);
     }
@@ -939,6 +1003,7 @@ fn refract_scene(
     var p_exit: vec3<f32>;
     var p_inside: vec3<f32>;
     var n_exit: vec3<f32>;
+    var exit_on_wall = false;
     if (container.is_pool == 0u) {
         // Wireframe tank: find the exit along the refracted ray itself. The
         // back face behind this pixel is where the VIEW ray leaves, and the
@@ -953,6 +1018,7 @@ fn refract_scene(
         p_exit = ex.point;
         p_inside = ex.inside;
         n_exit = ex.normal;
+        exit_on_wall = ex.on_wall;
     } else {
         // Cross the body to the back face, refract out through its normal there
         p_exit = p + t1 * distance(p, screen_to_world(screen_uv, back_depth_raw));
@@ -975,10 +1041,12 @@ fn refract_scene(
             dbg_end = DBG_END_STRAIGHT;
             return straight;
         }
+        dbg_mirror_kind = dbg_exit_interface(p_exit, exit_on_wall);
         return follow_internal_reflection(p_inside, reflect(t1, n_exit), front_depth_raw, straight);
     }
     dbg_path = DBG_PATH_EXIT;
     dbg_exit_cos = dot(t2, n_exit);
+    dbg_exit_kind = dbg_exit_interface(p_exit, exit_on_wall);
     return scene_from(p_exit, t2, front_depth_raw, straight);
 }
 
@@ -1243,8 +1311,11 @@ fn debug_view_output() -> vec3<f32> {
             let jump = max(length(dpdx(dbg_uv) * dims), length(dpdy(dbg_uv) * dims));
             return vec3<f32>(clamp(log2(1.0 + jump) / 8.0, 0.0, 1.0));
         }
+        case 4u: {
+            return vec3<f32>(clamp(dbg_exit_cos, 0.0, 1.0), clamp(dbg_water_path / 4.0, 0.0, 1.0), f32(dbg_exit_kind) / 8.0);
+        }
         default: {
-            return vec3<f32>(clamp(dbg_exit_cos, 0.0, 1.0), clamp(dbg_water_path / 4.0, 0.0, 1.0), bounces);
+            return vec3<f32>(f32(dbg_mirror_kind) / 8.0, f32(dbg_exit_kind) / 8.0, bounces);
         }
     }
 }
