@@ -238,24 +238,27 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(color, 1.0);
 }
 
-// === Bloom extraction shader ===
-// Separate entry point for bloom threshold pass
+// === Bloom / streak source ===
 
 // Scene luminance is unclipped HDR: a sun glint or the sun disk can sit
 // thousands of times above white. Capping what feeds the blur keeps a single
 // glint from flooding the frame (and f16 from overflowing in the blur).
 const BLOOM_MAX_LUMINANCE: f32 = 32.0;
+// The streak spreads a glint along hundreds of pixels, so it takes far more
+// of it to show: capped like the bloom, a one-pixel glint has no visible
+// streak at all.
+const STREAK_MAX_LUMINANCE: f32 = 512.0;
 
 // Bright-pass with a soft knee (half the threshold wide): the part of each
 // pixel above the threshold, so bloom grows smoothly with brightness instead
 // of switching on whole surfaces
-fn bright_pass(uv: vec2<f32>, threshold: f32) -> vec3<f32> {
+fn bright_pass(uv: vec2<f32>, threshold: f32, max_luminance: f32) -> vec3<f32> {
     var color = textureSampleLevel(scene_texture, texture_sampler, uv, 0.0).rgb;
     let luma = luminance(color);
-    if (luma > BLOOM_MAX_LUMINANCE) {
-        color *= BLOOM_MAX_LUMINANCE / luma;
+    if (luma > max_luminance) {
+        color *= max_luminance / luma;
     }
-    let l = min(luma, BLOOM_MAX_LUMINANCE);
+    let l = min(luma, max_luminance);
     let knee = 0.5 * threshold;
     let soft = clamp(l - threshold + knee, 0.0, 2.0 * knee);
     let contribution = max(soft * soft / (4.0 * knee + 1e-4), l - threshold);
@@ -265,30 +268,30 @@ fn bright_pass(uv: vec2<f32>, threshold: f32) -> vec3<f32> {
 // Half-res target: the tap at the pixel centre averages its 2x2 scene pixels
 @fragment
 fn fs_bloom_threshold(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(bright_pass(input.uv, params.bloom_threshold), 1.0);
+    return vec4<f32>(bright_pass(input.uv, params.bloom_threshold, BLOOM_MAX_LUMINANCE), 1.0);
 }
 
-// Streak target is 1/16 x 1/4 of the scene. Every scene pixel under a texel
-// has to be read (a single tap sees 2x2 of them: glints elsewhere went
-// missing and streaks popped in and out as they moved): 8 bilinear taps
-// across, and 4 rows with tent weights reaching half a texel into the
-// neighbours above and below, so a streak slides between rows instead of
-// jumping. Thresholded per tap, like the bloom source.
+// Level 0 of the streak pyramid: 1/8 of the scene's width, 1/4 of its height.
+// Every scene pixel under a texel has to be read - one tap sees 2x2 of them,
+// and glints elsewhere went missing, so streaks popped in and out as they
+// moved: 4 bilinear taps across, and 4 rows with tent weights reaching half a
+// texel into the neighbours above and below, so a streak slides between rows
+// instead of jumping. Thresholded per tap, like the bloom source.
 @fragment
 fn fs_streak_threshold(input: VertexOutput) -> @location(0) vec4<f32> {
     let texel = 1.0 / vec2<f32>(textureDimensions(scene_texture));
     var sum = vec3<f32>(0.0);
     for (var j = 0; j < 4; j++) {
         let row_weight = select(0.125, 0.375, j == 1 || j == 2);
-        for (var i = 0; i < 8; i++) {
-            let offset = vec2<f32>(f32(2 * i - 7), f32(2 * j - 3)) * texel;
-            sum += bright_pass(input.uv + offset, params.streaks_threshold) * row_weight;
+        for (var i = 0; i < 4; i++) {
+            let offset = vec2<f32>(f32(2 * i - 3), f32(2 * j - 3)) * texel;
+            sum += bright_pass(input.uv + offset, params.streaks_threshold, STREAK_MAX_LUMINANCE) * row_weight;
         }
     }
-    return vec4<f32>(sum / 8.0, 1.0);
+    return vec4<f32>(0.25 * sum, 1.0);
 }
 
-// === Blur shaders ===
+// === Bloom blur ===
 
 struct BlurParams {
     direction: vec2<f32>,  // (1,0) for horizontal, (0,1) for vertical
@@ -301,8 +304,8 @@ struct BlurParams {
 // Neighbouring texels are read two at a time through one bilinear tap placed
 // between them, weighted so the pair gets its two Gaussian weights. Taps must
 // not skip texels: spaced further apart they make a comb, and a one-pixel HDR
-// glint then shows the tap pattern itself (a square grid of dots in the
-// bloom, a dashed line in the streaks) instead of a glow.
+// glint then shows the tap pattern itself (a square grid of dots) instead of
+// a glow.
 fn gaussian_blur(uv: vec2<f32>, texel_step: vec2<f32>, sigma: f32, pairs: i32) -> vec3<f32> {
     let k = -0.5 / (sigma * sigma);
     var sum = textureSampleLevel(scene_texture, texture_sampler, uv, 0.0).rgb;
@@ -320,8 +323,8 @@ fn gaussian_blur(uv: vec2<f32>, texel_step: vec2<f32>, sigma: f32, pairs: i32) -
     return sum / weight_sum;
 }
 
-// Bloom: sigma 3.4 texels of the half-res target (~7 scene pixels), called
-// twice (horizontal, then vertical)
+// Sigma 3.4 texels of the half-res target (~7 scene pixels), called twice
+// (horizontal, then vertical)
 const BLOOM_SIGMA: f32 = 3.4;
 const BLOOM_PAIRS: i32 = 5;
 
@@ -331,17 +334,36 @@ fn fs_bloom_blur(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(gaussian_blur(input.uv, blur_params.direction * texel, BLOOM_SIGMA, BLOOM_PAIRS), 1.0);
 }
 
-// Anamorphic streak: horizontal only, called twice. Sigma 6.85 texels of the
-// 1/16-width target per pass = ~155 scene pixels after both. The gain keeps
-// the streak energy of the 13-tap kernel this replaced (its weights summed to
-// 1.14), so intensity settings carry over.
-const STREAK_SIGMA: f32 = 6.85;
-const STREAK_PAIRS: i32 = 9;
-const STREAK_PASS_GAIN: f32 = 1.14;
+// === Anamorphic streak ===
+// A horizontal mip pyramid (PostProcessRenderer::streak_down / streak_up):
+// the bright pixels at 1/8 of the scene's width, halved level by level,
+// then recombined from the narrowest level up, each level mixed with the
+// stretched one below it. That adds up streaks of every length from a few
+// pixels to most of the screen - brightest at the glint, fading along a long
+// tail - with the energy of the source kept. (One wide blur cannot do it: a
+// kernel hundreds of pixels wide either skips texels, which showed as a row
+// of dots, or spreads a glint too thin to see.)
 
+// Share of each level taken from the wider levels below it. Higher = longer
+// streaks, dimmer at the glint.
+const STREAK_STRETCH: f32 = 0.7;
+
+// Half the width: weights 1 3 3 1 over the four texels around the new one
+// (two bilinear taps), so a glint moves smoothly between the texels of every
+// level
 @fragment
-fn fs_streak_blur(input: VertexOutput) -> @location(0) vec4<f32> {
-    let texel = 1.0 / vec2<f32>(textureDimensions(scene_texture));
-    let step = vec2<f32>(blur_params.direction.x * texel.x, 0.0);
-    return vec4<f32>(gaussian_blur(input.uv, step, STREAK_SIGMA, STREAK_PAIRS) * STREAK_PASS_GAIN, 1.0);
+fn fs_streak_down(input: VertexOutput) -> @location(0) vec4<f32> {
+    let offset = vec2<f32>(0.75 / f32(textureDimensions(scene_texture).x), 0.0);
+    let color = 0.5 * (textureSampleLevel(scene_texture, texture_sampler, input.uv - offset, 0.0).rgb
+        + textureSampleLevel(scene_texture, texture_sampler, input.uv + offset, 0.0).rgb);
+    return vec4<f32>(color, 1.0);
+}
+
+// scene_texture = this level's bright pixels, streak_texture = the streak of
+// the levels below, stretched to this width by the bilinear tap
+@fragment
+fn fs_streak_up(input: VertexOutput) -> @location(0) vec4<f32> {
+    let level = textureSampleLevel(scene_texture, texture_sampler, input.uv, 0.0).rgb;
+    let below = textureSampleLevel(streak_texture, texture_sampler, input.uv, 0.0).rgb;
+    return vec4<f32>(mix(level, below, STREAK_STRETCH), 1.0);
 }

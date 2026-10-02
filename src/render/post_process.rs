@@ -7,9 +7,12 @@ use wgpu::util::DeviceExt;
 
 use crate::state::post_process::GpuPostProcessParams;
 
-/// Scene width / streak target width. The streak threshold pass in
-/// post_process.wgsl reads 8 bilinear taps across each texel: keep in sync.
-const STREAK_DOWNSCALE_X: u32 = 16;
+/// Streak pyramid: level 0 is 1/8 of the scene's width and 1/4 of its height
+/// (fs_streak_threshold in post_process.wgsl reads 4 x 4 bilinear taps per
+/// texel: keep in sync), each further level half as wide again, so the last
+/// is 1/256 of the width and its texels spread a glint over most of the screen
+const STREAK_BASE_DOWNSCALE_X: u32 = 8;
+const STREAK_LEVELS: u32 = 6;
 
 /// GPU blur direction parameters
 #[repr(C)]
@@ -17,6 +20,16 @@ const STREAK_DOWNSCALE_X: u32 = 16;
 pub struct GpuBlurParams {
     pub direction: [f32; 2],
     pub _padding: [f32; 2],
+}
+
+struct PostProcessBindGroups {
+    composite: wgpu::BindGroup,
+    bloom_threshold: wgpu::BindGroup,
+    bloom_blur_h: wgpu::BindGroup,
+    bloom_blur_v: wgpu::BindGroup,
+    streak_threshold: wgpu::BindGroup,
+    streak_down: Vec<wgpu::BindGroup>,
+    streak_up: Vec<wgpu::BindGroup>,
 }
 
 pub struct PostProcessRenderer {
@@ -27,11 +40,11 @@ pub struct PostProcessRenderer {
     bloom_view_a: wgpu::TextureView,
     bloom_texture_b: wgpu::Texture,
     bloom_view_b: wgpu::TextureView,
-    // Streak textures (for anamorphic effect)
-    streak_texture_a: wgpu::Texture,
-    streak_view_a: wgpu::TextureView,
-    streak_texture_b: wgpu::Texture,
-    streak_view_b: wgpu::TextureView,
+    // Streak pyramid (anamorphic effect): `down[k]` is the bright-pass at
+    // level k, `up[k]` the streak recombined from level k down to the
+    // narrowest (up[0] is what the composite adds)
+    streak_down: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    streak_up: Vec<(wgpu::Texture, wgpu::TextureView)>,
     // FXAA intermediate texture (composite renders here, then FXAA to final output)
     fxaa_texture: wgpu::Texture,
     fxaa_view: wgpu::TextureView,
@@ -44,7 +57,8 @@ pub struct PostProcessRenderer {
     bloom_threshold_pipeline: wgpu::RenderPipeline,
     streak_threshold_pipeline: wgpu::RenderPipeline,
     bloom_blur_pipeline: wgpu::RenderPipeline,
-    streak_blur_pipeline: wgpu::RenderPipeline,
+    streak_down_pipeline: wgpu::RenderPipeline,
+    streak_up_pipeline: wgpu::RenderPipeline,
     fxaa_pipeline: wgpu::RenderPipeline,
 
     // Bind groups
@@ -52,10 +66,11 @@ pub struct PostProcessRenderer {
     bloom_threshold_bind_group: wgpu::BindGroup,
     bloom_blur_h_bind_group: wgpu::BindGroup,
     bloom_blur_v_bind_group: wgpu::BindGroup,
-    // Streak bind groups (threshold reuses bloom, just need blur)
+    // Streak bind groups: threshold, then one per downsample (down[k] ->
+    // down[k + 1]) and one per upsample (-> up[k])
     streak_threshold_bind_group: wgpu::BindGroup,
-    streak_blur_h1_bind_group: wgpu::BindGroup,
-    streak_blur_h2_bind_group: wgpu::BindGroup,
+    streak_down_bind_groups: Vec<wgpu::BindGroup>,
+    streak_up_bind_groups: Vec<wgpu::BindGroup>,
     // FXAA bind group
     fxaa_bind_group: wgpu::BindGroup,
     // AO bind group (group 1 on composite pipeline)
@@ -97,9 +112,7 @@ impl PostProcessRenderer {
         // Bloom textures use HDR format for better quality
         let (bloom_texture_a, bloom_view_a) = Self::create_texture(device, width / 2, height / 2, "Bloom A", wgpu::TextureFormat::Rgba16Float);
         let (bloom_texture_b, bloom_view_b) = Self::create_texture(device, width / 2, height / 2, "Bloom B", wgpu::TextureFormat::Rgba16Float);
-        // Streak textures: 1/16 width (the horizontal blur is ~155 px wide), 1/4 height
-        let (streak_texture_a, streak_view_a) = Self::create_texture(device, width / STREAK_DOWNSCALE_X, height / 4, "Streak A", wgpu::TextureFormat::Rgba16Float);
-        let (streak_texture_b, streak_view_b) = Self::create_texture(device, width / STREAK_DOWNSCALE_X, height / 4, "Streak B", wgpu::TextureFormat::Rgba16Float);
+        let (streak_down, streak_up) = Self::create_streak_chain(device, width, height);
         // FXAA intermediate texture (composite renders here when FXAA enabled)
         let (fxaa_texture, fxaa_view) = Self::create_texture(device, width, height, "FXAA", surface_format);
 
@@ -397,9 +410,9 @@ impl PostProcessRenderer {
             cache: None,
         });
 
-        // Streak blur pipeline (wide horizontal blur for anamorphic effect)
-        let streak_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Streak Blur Pipeline"),
+        // Streak pyramid: halve the width of a level
+        let streak_down_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Streak Down Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -409,7 +422,37 @@ impl PostProcessRenderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_streak_blur"),
+                entry_point: Some("fs_streak_down"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Streak pyramid: mix a level with the stretched level below it
+        let streak_up_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Streak Up Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_streak_up"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
@@ -505,89 +548,16 @@ impl PostProcessRenderer {
             ],
         });
 
-        // Create bind groups
-        // Composite: scene + bloom + streak
-        let composite_bind_group = Self::create_bind_group(
+        let groups = Self::create_bind_groups(
             device,
             &bind_group_layout,
             &scene_view,
-            &bloom_view_a,
-            &streak_view_a,
+            [&bloom_view_a, &bloom_view_b],
+            &streak_down,
+            &streak_up,
             &sampler,
             &params_buffer,
-            &blur_h_buffer,
-        );
-
-        // Bloom threshold: scene -> bloom_a (use bloom_b and streak_b as dummies)
-        let bloom_threshold_bind_group = Self::create_bind_group(
-            device,
-            &bind_group_layout,
-            &scene_view,
-            &bloom_view_b,
-            &streak_view_b,
-            &sampler,
-            &params_buffer,
-            &blur_h_buffer,
-        );
-
-        // Bloom blur H: bloom_a -> bloom_b
-        let bloom_blur_h_bind_group = Self::create_bind_group(
-            device,
-            &bind_group_layout,
-            &bloom_view_a,
-            &bloom_view_a,
-            &streak_view_b,
-            &sampler,
-            &params_buffer,
-            &blur_h_buffer,
-        );
-
-        // Bloom blur V: bloom_b -> bloom_a
-        let bloom_blur_v_bind_group = Self::create_bind_group(
-            device,
-            &bind_group_layout,
-            &bloom_view_b,
-            &bloom_view_b,
-            &streak_view_b,
-            &sampler,
-            &params_buffer,
-            &blur_v_buffer,
-        );
-
-        // Streak threshold: scene -> streak_a (use bloom_b and streak_b as dummies)
-        let streak_threshold_bind_group = Self::create_bind_group(
-            device,
-            &bind_group_layout,
-            &scene_view,
-            &bloom_view_b,
-            &streak_view_b,
-            &sampler,
-            &params_buffer,
-            &blur_h_buffer,
-        );
-
-        // Streak blur H pass 1: streak_a -> streak_b
-        let streak_blur_h1_bind_group = Self::create_bind_group(
-            device,
-            &bind_group_layout,
-            &streak_view_a,
-            &bloom_view_b,
-            &streak_view_a,
-            &sampler,
-            &params_buffer,
-            &blur_h_buffer,
-        );
-
-        // Streak blur H pass 2: streak_b -> streak_a (second pass for extra width)
-        let streak_blur_h2_bind_group = Self::create_bind_group(
-            device,
-            &bind_group_layout,
-            &streak_view_b,
-            &bloom_view_b,
-            &streak_view_b,
-            &sampler,
-            &params_buffer,
-            &blur_h_buffer,
+            [&blur_h_buffer, &blur_v_buffer],
         );
 
         Self {
@@ -597,10 +567,8 @@ impl PostProcessRenderer {
             bloom_view_a,
             bloom_texture_b,
             bloom_view_b,
-            streak_texture_a,
-            streak_view_a,
-            streak_texture_b,
-            streak_view_b,
+            streak_down,
+            streak_up,
             fxaa_texture,
             fxaa_view,
             sampler,
@@ -608,15 +576,16 @@ impl PostProcessRenderer {
             bloom_threshold_pipeline,
             streak_threshold_pipeline,
             bloom_blur_pipeline,
-            streak_blur_pipeline,
+            streak_down_pipeline,
+            streak_up_pipeline,
             fxaa_pipeline,
-            composite_bind_group,
-            bloom_threshold_bind_group,
-            bloom_blur_h_bind_group,
-            bloom_blur_v_bind_group,
-            streak_threshold_bind_group,
-            streak_blur_h1_bind_group,
-            streak_blur_h2_bind_group,
+            composite_bind_group: groups.composite,
+            bloom_threshold_bind_group: groups.bloom_threshold,
+            bloom_blur_h_bind_group: groups.bloom_blur_h,
+            bloom_blur_v_bind_group: groups.bloom_blur_v,
+            streak_threshold_bind_group: groups.streak_threshold,
+            streak_down_bind_groups: groups.streak_down,
+            streak_up_bind_groups: groups.streak_up,
             fxaa_bind_group,
             ao_bind_group,
             ao_bind_group_layout,
@@ -657,6 +626,68 @@ impl PostProcessRenderer {
         (texture, view)
     }
 
+    /// Streak pyramid textures for a scene of the given size: (down, up).
+    /// `up` has no narrowest level (that one is read straight from `down`).
+    #[allow(clippy::type_complexity)]
+    fn create_streak_chain(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> (Vec<(wgpu::Texture, wgpu::TextureView)>, Vec<(wgpu::Texture, wgpu::TextureView)>) {
+        let level = |i: u32, label: &str| {
+            Self::create_texture(device, (width / STREAK_BASE_DOWNSCALE_X) >> i, height / 4, label, wgpu::TextureFormat::Rgba16Float)
+        };
+        let down = (0..STREAK_LEVELS).map(|i| level(i, "Streak Down")).collect();
+        let up = (0..STREAK_LEVELS - 1).map(|i| level(i, "Streak Up")).collect();
+        (down, up)
+    }
+
+    /// Every bind group of the bloom / streak / composite passes. All share
+    /// one layout (input, bloom, streak, sampler, params, blur direction); a
+    /// pass must not bind its own target, so slots it does not read repeat
+    /// its input.
+    #[allow(clippy::too_many_arguments)]
+    fn create_bind_groups(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        scene_view: &wgpu::TextureView,
+        [bloom_a, bloom_b]: [&wgpu::TextureView; 2],
+        streak_down: &[(wgpu::Texture, wgpu::TextureView)],
+        streak_up: &[(wgpu::Texture, wgpu::TextureView)],
+        sampler: &wgpu::Sampler,
+        params_buffer: &wgpu::Buffer,
+        [blur_h, blur_v]: [&wgpu::Buffer; 2],
+    ) -> PostProcessBindGroups {
+        let group = |input: &wgpu::TextureView, bloom: &wgpu::TextureView, streak: &wgpu::TextureView, blur: &wgpu::Buffer| {
+            Self::create_bind_group(device, layout, input, bloom, streak, sampler, params_buffer, blur)
+        };
+        let levels = streak_down.len();
+        PostProcessBindGroups {
+            // Composite: scene + bloom + streak
+            composite: group(scene_view, bloom_a, &streak_up[0].1, blur_h),
+            // Bloom threshold: scene -> bloom_a
+            bloom_threshold: group(scene_view, scene_view, scene_view, blur_h),
+            // Bloom blur H: bloom_a -> bloom_b, then V: bloom_b -> bloom_a
+            bloom_blur_h: group(bloom_a, bloom_a, bloom_a, blur_h),
+            bloom_blur_v: group(bloom_b, bloom_b, bloom_b, blur_v),
+            // Streak threshold: scene -> down[0]
+            streak_threshold: group(scene_view, scene_view, scene_view, blur_h),
+            // Streak down: down[k] -> down[k + 1]
+            streak_down: (0..levels - 1)
+                .map(|k| group(&streak_down[k].1, &streak_down[k].1, &streak_down[k].1, blur_h))
+                .collect(),
+            // Streak up: down[k] + the level below (its `up`, or the
+            // narrowest `down`) -> up[k]
+            streak_up: (0..levels - 1)
+                .map(|k| {
+                    let below = if k + 2 == levels { &streak_down[k + 1].1 } else { &streak_up[k + 1].1 };
+                    group(&streak_down[k].1, &streak_down[k].1, below, blur_h)
+                })
+                .collect(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn create_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -815,14 +846,14 @@ impl PostProcessRenderer {
             }
         }
 
-        // If anamorphic streaks are enabled
+        // Anamorphic streaks: bright pixels -> level 0, down the pyramid,
+        // then back up mixing each level with the stretched one below
         if streaks_enabled {
-            // Pass 1: Extract bright pixels -> streak_a
-            {
+            let mut streak_pass = |label: &str, target: &wgpu::TextureView, pipeline: &wgpu::RenderPipeline, bind_group: &wgpu::BindGroup| {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Streak Threshold Pass"),
+                    label: Some(label),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.streak_view_a,
+                        view: target,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -834,56 +865,17 @@ impl PostProcessRenderer {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                pass.set_pipeline(&self.streak_threshold_pipeline);
-                pass.set_bind_group(0, &self.streak_threshold_bind_group, &[]);
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
                 pass.set_bind_group(1, &self.ao_bind_group, &[]);
                 pass.draw(0..3, 0..1);
+            };
+            streak_pass("Streak Threshold Pass", &self.streak_down[0].1, &self.streak_threshold_pipeline, &self.streak_threshold_bind_group);
+            for (k, bind_group) in self.streak_down_bind_groups.iter().enumerate() {
+                streak_pass("Streak Down Pass", &self.streak_down[k + 1].1, &self.streak_down_pipeline, bind_group);
             }
-
-            // Pass 2: Wide horizontal blur -> streak_b
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Streak Blur H Pass 1"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.streak_view_b,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                pass.set_pipeline(&self.streak_blur_pipeline);
-                pass.set_bind_group(0, &self.streak_blur_h1_bind_group, &[]);
-                pass.set_bind_group(1, &self.ao_bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
-
-            // Pass 3: Second wide horizontal blur -> streak_a (for extra width)
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Streak Blur H Pass 2"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.streak_view_a,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                pass.set_pipeline(&self.streak_blur_pipeline);
-                pass.set_bind_group(0, &self.streak_blur_h2_bind_group, &[]);
-                pass.set_bind_group(1, &self.ao_bind_group, &[]);
-                pass.draw(0..3, 0..1);
+            for (k, bind_group) in self.streak_up_bind_groups.iter().enumerate().rev() {
+                streak_pass("Streak Up Pass", &self.streak_up[k].1, &self.streak_up_pipeline, bind_group);
             }
         }
 
@@ -952,8 +944,7 @@ impl PostProcessRenderer {
         let (scene_texture, scene_view) = Self::create_texture(device, width, height, "Scene", super::HDR_FORMAT);
         let (bloom_texture_a, bloom_view_a) = Self::create_texture(device, width / 2, height / 2, "Bloom A", wgpu::TextureFormat::Rgba16Float);
         let (bloom_texture_b, bloom_view_b) = Self::create_texture(device, width / 2, height / 2, "Bloom B", wgpu::TextureFormat::Rgba16Float);
-        let (streak_texture_a, streak_view_a) = Self::create_texture(device, width / STREAK_DOWNSCALE_X, height / 4, "Streak A", wgpu::TextureFormat::Rgba16Float);
-        let (streak_texture_b, streak_view_b) = Self::create_texture(device, width / STREAK_DOWNSCALE_X, height / 4, "Streak B", wgpu::TextureFormat::Rgba16Float);
+        let (streak_down, streak_up) = Self::create_streak_chain(device, width, height);
         let (fxaa_texture, fxaa_view) = Self::create_texture(device, width, height, "FXAA", self.output_format);
 
         self.scene_texture = scene_texture;
@@ -962,90 +953,30 @@ impl PostProcessRenderer {
         self.bloom_view_a = bloom_view_a;
         self.bloom_texture_b = bloom_texture_b;
         self.bloom_view_b = bloom_view_b;
-        self.streak_texture_a = streak_texture_a;
-        self.streak_view_a = streak_view_a;
-        self.streak_texture_b = streak_texture_b;
-        self.streak_view_b = streak_view_b;
+        self.streak_down = streak_down;
+        self.streak_up = streak_up;
         self.fxaa_texture = fxaa_texture;
         self.fxaa_view = fxaa_view;
 
         // Recreate bind groups
-        self.composite_bind_group = Self::create_bind_group(
+        let groups = Self::create_bind_groups(
             device,
             &self.bind_group_layout,
             &self.scene_view,
-            &self.bloom_view_a,
-            &self.streak_view_a,
+            [&self.bloom_view_a, &self.bloom_view_b],
+            &self.streak_down,
+            &self.streak_up,
             &self.sampler,
             &self.params_buffer,
-            &self.blur_h_buffer,
+            [&self.blur_h_buffer, &self.blur_v_buffer],
         );
-
-        self.bloom_threshold_bind_group = Self::create_bind_group(
-            device,
-            &self.bind_group_layout,
-            &self.scene_view,
-            &self.bloom_view_b,
-            &self.streak_view_b,
-            &self.sampler,
-            &self.params_buffer,
-            &self.blur_h_buffer,
-        );
-
-        self.bloom_blur_h_bind_group = Self::create_bind_group(
-            device,
-            &self.bind_group_layout,
-            &self.bloom_view_a,
-            &self.bloom_view_a,
-            &self.streak_view_b,
-            &self.sampler,
-            &self.params_buffer,
-            &self.blur_h_buffer,
-        );
-
-        self.bloom_blur_v_bind_group = Self::create_bind_group(
-            device,
-            &self.bind_group_layout,
-            &self.bloom_view_b,
-            &self.bloom_view_b,
-            &self.streak_view_b,
-            &self.sampler,
-            &self.params_buffer,
-            &self.blur_v_buffer,
-        );
-
-        self.streak_threshold_bind_group = Self::create_bind_group(
-            device,
-            &self.bind_group_layout,
-            &self.scene_view,
-            &self.bloom_view_b,
-            &self.streak_view_b,
-            &self.sampler,
-            &self.params_buffer,
-            &self.blur_h_buffer,
-        );
-
-        self.streak_blur_h1_bind_group = Self::create_bind_group(
-            device,
-            &self.bind_group_layout,
-            &self.streak_view_a,
-            &self.bloom_view_b,
-            &self.streak_view_a,
-            &self.sampler,
-            &self.params_buffer,
-            &self.blur_h_buffer,
-        );
-
-        self.streak_blur_h2_bind_group = Self::create_bind_group(
-            device,
-            &self.bind_group_layout,
-            &self.streak_view_b,
-            &self.bloom_view_b,
-            &self.streak_view_b,
-            &self.sampler,
-            &self.params_buffer,
-            &self.blur_h_buffer,
-        );
+        self.composite_bind_group = groups.composite;
+        self.bloom_threshold_bind_group = groups.bloom_threshold;
+        self.bloom_blur_h_bind_group = groups.bloom_blur_h;
+        self.bloom_blur_v_bind_group = groups.bloom_blur_v;
+        self.streak_threshold_bind_group = groups.streak_threshold;
+        self.streak_down_bind_groups = groups.streak_down;
+        self.streak_up_bind_groups = groups.streak_up;
 
         // Recreate FXAA bind group
         self.fxaa_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
