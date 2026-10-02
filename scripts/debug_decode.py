@@ -58,6 +58,7 @@ ENDS = {
     4: "environment map",
     5: "solid background color",
     6: "exact body hit",
+    7: "projected ground (where the ray lands, off screen)",
 }
 EXITS = {
     0: "no refracted exit (blocked / straight / legacy)",

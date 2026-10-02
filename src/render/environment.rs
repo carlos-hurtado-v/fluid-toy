@@ -248,6 +248,24 @@ pub fn estimate_sun(pixels: &[f32], width: u32, height: u32) -> Option<SunEstima
 
 /// Upper bound on environment texels uploaded to the GPU (see the upload loop)
 const ENV_RADIANCE_CAP: f32 = 64.0;
+/// Levels in the environment map's mip chain (2048x1024 down to 16x8)
+const ENV_MAX_MIPS: u32 = 8;
+
+/// Box-filter an RGB f32 image to (nw, nh), each a floor-halving of (w, h)
+fn downsample_rgb(src: &[f32], w: u32, h: u32, nw: u32, nh: u32) -> Vec<f32> {
+    let mut out = Vec::with_capacity((nw * nh * 3) as usize);
+    for y in 0..nh {
+        for x in 0..nw {
+            let (x0, y0) = ((2 * x).min(w - 1), (2 * y).min(h - 1));
+            let (x1, y1) = ((2 * x + 1).min(w - 1), (2 * y + 1).min(h - 1));
+            for c in 0..3 {
+                let at = |px: u32, py: u32| src[((py * w + px) * 3 + c) as usize];
+                out.push(0.25 * (at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1)));
+            }
+        }
+    }
+    out
+}
 
 /// Load the embedded environment map (compile-time included)
 /// Returns (texture, view, sampler, sh_coefficients, sun)
@@ -291,14 +309,14 @@ pub fn load_embedded_environment_map(
     // they would become inf, and inf texels turn into NaN under filtering.
     // Capped instead — the sun's light is measured from the full-precision data
     // above, and the shown/reflected disk only needs to read far above white.
-    let cap = |v: f32| f16::from_f32(v.min(ENV_RADIANCE_CAP)).to_bits();
-    let mut rgba_data: Vec<u16> = Vec::with_capacity((width * height * 4) as usize);
-    for pixel in rgb32f.pixels() {
-        rgba_data.push(cap(pixel.0[0]));
-        rgba_data.push(cap(pixel.0[1]));
-        rgba_data.push(cap(pixel.0[2]));
-        rgba_data.push(f16::from_f32(1.0).to_bits());
-    }
+    // Mip chain (box filter of the capped radiance): refraction and mirror
+    // lookups that shrink the map read a level that matches their footprint
+    // instead of skipping texels. Direct views sample level 0, as before.
+    let mut level: Vec<f32> = rgb32f
+        .pixels()
+        .flat_map(|p| [p.0[0].min(ENV_RADIANCE_CAP), p.0[1].min(ENV_RADIANCE_CAP), p.0[2].min(ENV_RADIANCE_CAP)])
+        .collect();
+    let mip_level_count = (width.min(height).max(1).ilog2() + 1).min(ENV_MAX_MIPS);
 
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Environment Map"),
@@ -307,7 +325,7 @@ pub fn load_embedded_environment_map(
             height,
             depth_or_array_layers: 1,
         },
-        mip_level_count: 1,
+        mip_level_count,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         // Rgba16Float is filterable (supports linear sampling) and has good HDR precision
@@ -316,25 +334,36 @@ pub fn load_embedded_environment_map(
         view_formats: &[],
     });
 
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        bytemuck::cast_slice(&rgba_data),
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4 * 2), // 4 channels * 2 bytes per f16
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
+    let (mut w, mut h) = (width, height);
+    for mip_level in 0..mip_level_count {
+        let one = f16::from_f32(1.0).to_bits();
+        let rgba_data: Vec<u16> = level
+            .chunks_exact(3)
+            .flat_map(|p| [f16::from_f32(p[0]).to_bits(), f16::from_f32(p[1]).to_bits(), f16::from_f32(p[2]).to_bits(), one])
+            .collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&rgba_data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4 * 2), // 4 channels * 2 bytes per f16
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+        level = downsample_rgb(&level, w, h, nw, nh);
+        (w, h) = (nw, nh);
+    }
 
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -346,6 +375,9 @@ pub fn load_embedded_environment_map(
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
         mipmap_filter: wgpu::FilterMode::Linear,
+        // Only gradient lookups (the water's filtered refraction) use it;
+        // explicit level-0 samples are unaffected
+        anisotropy_clamp: 16,
         ..Default::default()
     });
 

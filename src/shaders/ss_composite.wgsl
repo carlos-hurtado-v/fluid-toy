@@ -238,7 +238,9 @@ fn sample_environment(dir: vec3<f32>) -> vec3<f32> {
     let theta = acos(clamp(dir.y, -1.0, 1.0));
     let u = fract(phi / (2.0 * PI) + 1.0);
     let v = theta / PI;
-    return textureSample(env_tex, tex_sampler, vec2<f32>(u, v)).rgb;
+    // Level 0 explicitly: the map carries mips for the MC renderer's filtered
+    // lookups, and implicit derivatives of u jump at the +-pi seam
+    return textureSampleLevel(env_tex, tex_sampler, vec2<f32>(u, v), 0.0).rgb;
 }
 
 // Evaluate order-2 spherical harmonics irradiance

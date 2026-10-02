@@ -443,6 +443,17 @@ pub struct RenderConfig {
     /// (the free surface seen from above), which the back-face test alone
     /// only notices at the water's on-screen outline
     pub mc_front_face_exit: bool,
+    /// Filter what refracted and mirrored rays finally look up by its
+    /// on-screen footprint (mip chain of the background + environment map,
+    /// anisotropic). Off: one unfiltered sample, which skips texels wherever
+    /// the lookup shrinks the image: streaks, sparkle, shimmer in motion
+    pub mc_filtered_lookup: bool,
+    /// Glass tank: rays inside the water find where they leave it by testing
+    /// the density field the mesh is extracted from (world space: in water =
+    /// field >= iso, exit normal = its gradient). Off: the screen-space test
+    /// against the nearest back/front faces, which cannot see behind bodies,
+    /// behind a nearer layer of surface, or off screen
+    pub mc_volume_trace: bool,
     /// Deep water color - what you see looking into deep water (legacy medium)
     pub deep_water_color: [f32; 3],
     /// Surface smoothing - blur radius for MC density field in voxels (0 = off).
@@ -507,6 +518,8 @@ impl Default for RenderConfig {
             mc_debug_view: McDebugView::Off,
             mc_silhouette_exit: McSilhouetteExit::Exit,
             mc_front_face_exit: true,
+            mc_filtered_lookup: true,
+            mc_volume_trace: true,
             deep_water_color: [0.005, 0.03, 0.08],
             mc_blur_radius: 1,
             mc_calm_smoothing: 1.0,

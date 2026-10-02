@@ -114,7 +114,16 @@ pub struct GpuWaterParams {
     pub silhouette_exit: u32,
     /// rendering.mc_front_face_exit
     pub front_exit: u32,
-    pub _pad_f: [u32; 3],
+    /// Ground-projected backdrop (GpuEnvironmentParams): escaping refraction
+    /// rays that head down land on it
+    pub ground_enabled: u32,
+    pub ground_y: f32,
+    pub ground_capture_height: f32,
+    /// rendering.mc_filtered_lookup
+    pub filtered_lookup: u32,
+    /// rendering.mc_volume_trace
+    pub volume_trace: u32,
+    pub _pad_g: [u32; 2],
 }
 
 impl Default for GpuWaterParams {
@@ -143,7 +152,12 @@ impl Default for GpuWaterParams {
             debug_view: 0,
             silhouette_exit: 0,
             front_exit: 0,
-            _pad_f: [0; 3],
+            ground_enabled: 0,
+            ground_y: 0.0,
+            ground_capture_height: 0.0,
+            filtered_lookup: 0,
+            volume_trace: 0,
+            _pad_g: [0; 2],
         }
     }
 }
@@ -222,24 +236,96 @@ fn create_normal_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgp
     (texture, view)
 }
 
-/// Create a color texture for rendering the background (for screen-space refraction)
-fn create_background_texture(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+/// Bind groups (density field in texture A / in texture B) that hand the water
+/// shader the field the mesh was extracted from, for its world-space in-water
+/// test (group 1 of the water pipeline)
+fn create_volume_bind_groups(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    density_view: &wgpu::TextureView,
+    density_view_b: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    grid_params_buffer: &wgpu::Buffer,
+) -> [wgpu::BindGroup; 2] {
+    [density_view, density_view_b].map(|view| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MC Water Volume BG"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: grid_params_buffer.as_entire_binding() },
+            ],
+        })
+    })
+}
+
+/// Levels in the refraction background's mip chain (level 5 = a 32-texel
+/// footprint; anisotropic filtering stretches that 16x along one axis)
+const BACKGROUND_MIPS: u32 = 6;
+
+/// The scene behind the water (backdrop, container, bodies, spray), read by
+/// screen-space refraction and SSR. Drawn at level 0; the levels below are
+/// regenerated every frame so that lookups which shrink the image (grazing
+/// mirrors, strong lensing) read a footprint instead of skipping texels.
+struct BackgroundTexture {
+    _texture: wgpu::Texture,
+    /// Level 0 alone: the render attachment, and what SSR reads
+    view: wgpu::TextureView,
+    /// Every level: the water shader's refraction lookups
+    mip_view: wgpu::TextureView,
+    /// Per generated level: its view, and a bind group reading the level above
+    mip_passes: Vec<(wgpu::TextureView, wgpu::BindGroup)>,
+}
+
+fn create_background_texture(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    mip_layout: &wgpu::BindGroupLayout,
+    mip_sampler: &wgpu::Sampler,
+) -> BackgroundTexture {
+    let (width, height) = (width.max(1), height.max(1));
+    let mip_level_count = BACKGROUND_MIPS.min(width.min(height).ilog2() + 1);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("MC Background Texture"),
         size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
+            width,
+            height,
             depth_or_array_layers: 1,
         },
-        mip_level_count: 1,
+        mip_level_count,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
+    let level_view = |level: u32| {
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            base_mip_level: level,
+            mip_level_count: Some(1),
+            ..Default::default()
+        })
+    };
+    let view = level_view(0);
+    let mip_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mip_passes = (1..mip_level_count)
+        .map(|level| {
+            let source = level_view(level - 1);
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("MC Background Mip BG"),
+                layout: mip_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&source) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(mip_sampler) },
+                ],
+            });
+            (level_view(level), bind_group)
+        })
+        .collect();
+    BackgroundTexture { _texture: texture, view, mip_view, mip_passes }
 }
 
 /// Create MSAA color texture (for multisampled rendering)
@@ -317,9 +403,16 @@ pub struct MarchingCubesRenderer {
     // for two-interface refraction, written alongside back_depth
     back_normal_texture: wgpu::Texture,
     back_normal_view: wgpu::TextureView,
-    // Background texture for screen-space refraction
-    background_texture: wgpu::Texture,
-    background_view: wgpu::TextureView,
+    // Background texture for screen-space refraction (+ its mip chain)
+    background: BackgroundTexture,
+    mip_pipeline: wgpu::RenderPipeline,
+    mip_bind_group_layout: wgpu::BindGroupLayout,
+    mip_sampler: wgpu::Sampler,
+    /// Clamped trilinear + anisotropic: the water's filtered lookups
+    background_sampler: wgpu::Sampler,
+    /// rendering.mc_filtered_lookup (set with the water params): whether the
+    /// mip chain is needed this frame
+    filtered_lookup: std::cell::Cell<bool>,
     // Half-res foam density field, splatted by SprayRenderer and composited
     // by the water shader (foam reads as connected patches, not sprites)
     foam_density_texture: wgpu::Texture,
@@ -382,6 +475,13 @@ pub struct MarchingCubesRenderer {
     generate_bind_group_b: wgpu::BindGroup, // reads from density_b (used after blur)
     back_face_bind_group: wgpu::BindGroup,
     render_bind_group: wgpu::BindGroup,
+    // The density field for the water shader's world-space in-water test:
+    // [field in texture A, field in texture B], chosen by where this frame's
+    // generate() left the result
+    volume_bind_group_layout: wgpu::BindGroupLayout,
+    volume_sampler: wgpu::Sampler,
+    volume_bind_groups: [wgpu::BindGroup; 2],
+    result_in_b: bool,
     env_bind_group: wgpu::BindGroup,
 
     // Bind group layouts (needed for recreating bind groups on resize)
@@ -671,8 +771,87 @@ impl MarchingCubesRenderer {
         let foam_density_view =
             foam_density_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Create background texture for screen-space refraction
-        let (background_texture, background_view) = create_background_texture(device, surface_format, width, height);
+        // Create background texture for screen-space refraction, and the
+        // pass that fills its mip chain
+        let mip_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Mip Downsample Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mip_downsample.wgsl").into()),
+        });
+        let mip_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Mip Downsample BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let mip_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Mip Downsample Pipeline Layout"),
+            bind_group_layouts: &[&mip_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let mip_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Mip Downsample Pipeline"),
+            layout: Some(&mip_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &mip_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &mip_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let mip_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Mip Downsample Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let background_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("MC Background Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            anisotropy_clamp: 16,
+            ..Default::default()
+        });
+        let background = create_background_texture(
+            device, surface_format, width, height, &mip_bind_group_layout, &mip_sampler,
+        );
 
         // Create single-sampled depth texture for background pass (always 1x, samplable for SSR)
         let (background_depth_texture, background_depth_view) = create_samplable_depth_texture(device, width, height);
@@ -1586,6 +1765,13 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Background sampler for filtered refraction lookups
+                wgpu::BindGroupLayoutEntry {
+                    binding: 23,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
                 // Pixel probe records (only the --probe shader variant uses it)
                 wgpu::BindGroupLayoutEntry {
                     binding: 20,
@@ -1600,9 +1786,54 @@ impl MarchingCubesRenderer {
             ],
         });
 
+        let volume_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("MC Water Volume BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // R32Float, trilinear (FLOAT32_FILTERABLE is required at device creation)
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let volume_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("MC Water Volume Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let volume_bind_groups = create_volume_bind_groups(
+            device, &volume_bind_group_layout, &density_view, &density_view_b, &volume_sampler, &grid_params_buffer,
+        );
+
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("MC Render Pipeline Layout"),
-            bind_group_layouts: &[&render_bind_group_layout],
+            bind_group_layouts: &[&render_bind_group_layout, &volume_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -1797,7 +2028,7 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&background_view),
+                    resource: wgpu::BindingResource::TextureView(&background.mip_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
@@ -1858,6 +2089,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 22,
                     resource: wgpu::BindingResource::TextureView(&normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 23,
+                    resource: wgpu::BindingResource::Sampler(&background_sampler),
                 },
             ],
         });
@@ -2002,7 +2237,7 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&background_view),
+                    resource: wgpu::BindingResource::TextureView(&background.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -2248,8 +2483,12 @@ impl MarchingCubesRenderer {
             back_depth_sampler,
             back_normal_texture,
             back_normal_view,
-            background_texture,
-            background_view,
+            background,
+            mip_pipeline,
+            mip_bind_group_layout,
+            mip_sampler,
+            background_sampler,
+            filtered_lookup: std::cell::Cell::new(true),
             foam_density_texture,
             foam_density_view,
             foam_map_view,
@@ -2268,6 +2507,10 @@ impl MarchingCubesRenderer {
             probe_pixels: Vec::new(),
             probe_pipeline: None,
             render_pipeline_layout,
+            volume_bind_group_layout,
+            volume_sampler,
+            volume_bind_groups,
+            result_in_b: false,
             scene_format: surface_format,
             light_params_buffer,
             env_params_buffer,
@@ -2579,6 +2822,10 @@ impl MarchingCubesRenderer {
         });
 
         self.calm = CalmSmoothing::new(device, new_grid_size, &density_view, &density_view_b);
+        self.volume_bind_groups = create_volume_bind_groups(
+            device, &self.volume_bind_group_layout, &density_view, &density_view_b,
+            &self.volume_sampler, &self.grid_params_buffer,
+        );
 
         // Store new textures and views (old ones are dropped automatically)
         self._density_texture = density_texture;
@@ -2629,7 +2876,11 @@ impl MarchingCubesRenderer {
         debug_view: u32,
         silhouette_exit: u32,
         front_exit: bool,
+        env_params: &GpuEnvironmentParams,
+        filtered_lookup: bool,
+        volume_trace: bool,
     ) {
+        self.filtered_lookup.set(filtered_lookup);
         let params = GpuWaterParams {
             water_color: *water_color,
             roughness,
@@ -2654,7 +2905,12 @@ impl MarchingCubesRenderer {
             debug_view,
             silhouette_exit,
             front_exit: front_exit as u32,
-            _pad_f: [0; 3],
+            ground_enabled: env_params.ground_enabled,
+            ground_y: env_params.ground_y,
+            ground_capture_height: env_params.ground_capture_height,
+            filtered_lookup: filtered_lookup as u32,
+            volume_trace: volume_trace as u32,
+            _pad_g: [0; 2],
         };
         queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
     }
@@ -2972,6 +3228,8 @@ impl MarchingCubesRenderer {
             result_in_b
         };
 
+        self.result_in_b = result_in_b;
+
         // Pass 2: Generate triangles (read from whichever texture has the result)
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3174,7 +3432,7 @@ impl MarchingCubesRenderer {
             let mut env_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MC Environment Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.background_view,
+                    view: &self.background.view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -3211,6 +3469,30 @@ impl MarchingCubesRenderer {
             // Render spray into background (visible through water refraction)
             if let Some(sp) = spray {
                 sp.render(&mut env_pass);
+            }
+        }
+
+        // Pass 2b: the background's mip chain, for filtered refraction lookups
+        if self.filtered_lookup.get() {
+            for (view, bind_group) in &self.background.mip_passes {
+                let mut mip_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("MC Background Mip Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                mip_pass.set_pipeline(&self.mip_pipeline);
+                mip_pass.set_bind_group(0, bind_group, &[]);
+                mip_pass.draw(0..3, 0..1);
             }
         }
 
@@ -3278,6 +3560,7 @@ impl MarchingCubesRenderer {
             // Draw water mesh (samples background_texture for refraction)
             pass.set_pipeline(self.probe_pipeline.as_ref().unwrap_or(&self.render_pipeline));
             pass.set_bind_group(0, &self.render_bind_group, &[]);
+            pass.set_bind_group(1, &self.volume_bind_groups[self.result_in_b as usize], &[]);
             pass.draw_indirect(&self.indirect_buffer, 0);
 
             // Draw whitewater after the water mesh: camera-biased foam wins the
@@ -3336,9 +3619,9 @@ impl MarchingCubesRenderer {
         self.background_depth_view = background_depth_view;
 
         // Recreate background texture
-        let (background_texture, background_view) = create_background_texture(device, self.surface_format, width, height);
-        self.background_texture = background_texture;
-        self.background_view = background_view;
+        self.background = create_background_texture(
+            device, self.surface_format, width, height, &self.mip_bind_group_layout, &self.mip_sampler,
+        );
 
         // Recreate foam density field (half-res)
         let foam_density_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -3396,7 +3679,7 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.background_view),
+                    resource: wgpu::BindingResource::TextureView(&self.background.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -3462,7 +3745,7 @@ impl MarchingCubesRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&self.background_view),
+                    resource: wgpu::BindingResource::TextureView(&self.background.mip_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
@@ -3523,6 +3806,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 22,
                     resource: wgpu::BindingResource::TextureView(&self.normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 23,
+                    resource: wgpu::BindingResource::Sampler(&self.background_sampler),
                 },
             ],
         })

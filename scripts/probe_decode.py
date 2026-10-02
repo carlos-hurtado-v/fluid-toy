@@ -21,6 +21,8 @@ Default output, one row per probed pixel (in probe order):
                 (a ^ before it per back-face silhouette the trace carried
                 on past, rendering.mc_silhouette_exit=Continue);
                 o = left the water (back face crossed / no water behind),
+                h = left the water out of sight behind a body (crossing
+                estimated from the gap closing at the body's outline),
                 u = left through a front face (rendering.mc_front_face_exit),
                 X = opaque surface,
                 - = nothing up to the box; then the exit: S = through the
@@ -53,8 +55,8 @@ from debug_decode import ENDS, EXITS, PATHS  # noqa: E402  (shared id tables)
 EVENTS = {
     1: "FRAG", 2: "NORMAL", 3: "REFRACT_IN", 4: "SECOND",
     10: "EXIT_BEGIN", 11: "EXIT_BOX", 12: "TRACE", 13: "TRACE_REFINE", 14: "TRACE_END",
-    15: "EXIT_CROSS", 16: "EXIT_END", 17: "EXIT_INSIDE", 18: "SILHOUETTE",
-    20: "BOUNCE",
+    15: "EXIT_CROSS", 16: "EXIT_END", 17: "EXIT_INSIDE", 18: "SILHOUETTE", 19: "HIDDEN",
+    20: "BOUNCE", 21: "VTRACE", 22: "VTRACE_REFINE",
     30: "MARCH_BEGIN", 31: "MARCH", 32: "MARCH_REFINE", 33: "MARCH_END",
     40: "SCENE", 41: "BACKDROP", 42: "LOOKUP",
     50: "RESULT", 51: "COLOR",
@@ -95,6 +97,10 @@ def fmt_event(e):
             front = f" front={e[8]:.7f} (front-z)/(1-front)={(e[8] - a[2]) / max(1 - e[8], 1e-6):+.4f}"
         return (f"{name:12s} s={c:.4f} uv=({a[0]:.5f}, {a[1]:.5f}) z={a[2]:.7f} "
                 f"bg={b[0]:.7f} z-bg={a[2] - b[0]:+.2e} {back}{front} -> {kind}")
+    if tag in (21, 22):
+        kind = KIND.get(int(round(b[2])), "?")
+        bg = f"bg={b[1]:.7f}" if b[1] >= 0 else "off screen"
+        return f"{name:12s} s={c:.4f} p={v3(a)} field/iso={b[0]:.4f} {bg} -> {kind}"
     if tag == 14:
         return (f"{name:12s} kind={KIND.get(int(round(a[0])), '?')} dist_in={a[1]:.4f} "
                 f"dist={a[2]:.4f} uv=({b[0]:.5f}, {b[1]:.5f}) max={c:.4f}")
@@ -102,6 +108,14 @@ def fmt_event(e):
         action = {0: "taken as an exit (old)", 1: "CONTINUE behind the nearer layer"}.get(int(round(b[2])), "?")
         return (f"{name:12s} back in={a[0]:.7f} back out={a[1]:.7f} (jump {a[0] - a[1]:.2e}) "
                 f"bracket=[{b[0]:.4f}, {b[1]:.4f}] -> {action}")
+    if tag == 19:
+        if b[0] < 0:
+            why = "gap not closing" if a[2] <= 0 else "no rate"
+            return f"{name:12s} outline s={a[0]:.4f} gap={a[1]:+.4f} m rate={a[2]:+.4f} -> {why}: carried on in the water"
+        verdict = {1: "CROSSING behind the body", 2: "the wall or body comes first: carried on in the water"}.get(
+            int(round(c)), "crossing back in sight: what is seen decides")
+        return (f"{name:12s} outline s={a[0]:.4f} gap={a[1]:+.4f} m rate={a[2]:+.4f} "
+                f"cross s={b[0]:.4f} normal uv=({b[1]:.5f}, {b[2]:.5f}) -> {verdict}")
     if tag == 15:
         has_n = int(round(c)) % 2
         accepted = int(round(c)) % 4 >= 2
@@ -146,12 +160,14 @@ def fmt_event(e):
 def decision(e):
     """The branch an event took, for divergence finding (None = data only)"""
     tag = int(round(e[0]))
-    if tag in (12, 13):
+    if tag in (12, 13, 21, 22):
         return int(round(e[6]))            # trace kind (-1 offscreen)
     if tag == 15:
         return int(round(e[7])) % 4 >= 2     # crossing accepted
     if tag == 18:
         return int(round(e[6]))              # silhouette action
+    if tag == 19:
+        return int(round(e[7]))              # crossing estimated behind a body
     if tag == 16:
         return int(round(e[7]))              # exit flags
     if tag == 17:
@@ -184,7 +200,7 @@ def summarize(events):
             cur = {"k": None, "kind": "-", "exit": "?", "tir": False, "skips": 0}
             s["exits"].append(cur)
             k = 0
-        elif tag == 12 and cur is not None:
+        elif tag in (12, 21) and cur is not None:
             k += 1
             if cur["k"] is None and e[6] > 0.5:
                 cur["k"] = k
@@ -194,6 +210,8 @@ def summarize(events):
             if action == 1:
                 cur["skips"] += 1
                 cur["k"], cur["kind"] = None, "-"   # the next event counts
+        elif tag == 19 and cur is not None and int(round(e[7])) == 1:
+            cur["k"], cur["kind"] = k, "h"
         elif tag == 15 and cur is not None:
             cur["crossed"] = int(round(e[7])) % 4 >= 2
             cur["front"] = int(round(e[7])) >= 4
@@ -230,17 +248,17 @@ def locate(events, j, exact=True):
         if tag == 10:
             call += 1
             sample, refine = 0, 0
-        elif tag == 12:
+        elif tag in (12, 21):
             sample += 1
-        elif tag == 13:
+        elif tag in (13, 22):
             refine += 1
     tag = int(round(events[j][0]))
     where = f"water_exit #{call}" if call else "before any water_exit"
     if not exact:
         return f"{where}, {EVENTS.get(tag, tag)}"
-    if tag == 12:
+    if tag in (12, 21):
         return f"{where}, coarse sample {sample}"
-    if tag == 13:
+    if tag in (13, 22):
         return f"{where}, bisection step {refine}"
     return f"{where}, {EVENTS.get(tag, tag)}"
 
@@ -370,7 +388,7 @@ def main():
         from debug_decode import match_ids
         img = np.asarray(Image.open(args.check_paths).convert("RGB")).astype(int)
         path = match_ids(img[..., 0], 16, PATHS.keys())
-        end = match_ids(img[..., 1], 8, range(1, 7))
+        end = match_ids(img[..., 1], 8, ENDS.keys())
         agree, total, mismatches = 0, 0, []
         for p, s in summaries.items():
             pv, ev = path[p[1], p[0]], end[p[1], p[0]]

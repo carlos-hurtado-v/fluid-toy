@@ -573,6 +573,18 @@ pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAct
                              on screen, with the outline's normal (stripes in mirrors when \
                              looking across the surface)",
                         );
+                    ui.checkbox(&mut state.rendering.mc_volume_trace, "World-Space Water Test")
+                        .on_hover_text(
+                            "Glass tank: rays inside the water test the density field the mesh \
+                             is built from to find where they leave it, instead of the depth \
+                             buffers (which cannot see behind bodies, behind a nearer fold of \
+                             the surface, or off screen: stripes and stair steps in mirrors). \
+                             With it on, Behind-Surface Rays and Front-Face Exits have no effect",
+                        );
+                    ui.checkbox(&mut state.rendering.mc_filtered_lookup, "Filtered Lookups")
+                        .on_hover_text(
+                            "What a refracted or mirrored ray finally shows is read over                              its footprint on screen (mip chain + anisotropic filtering)                              instead of one sample. Off: lookups that shrink the image skip                              texels (streaks and sparkle in grazing mirrors, shimmer in motion)",
+                        );
                     deep_water_color_control(ui, state);
                 }
 

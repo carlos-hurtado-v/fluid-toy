@@ -10,6 +10,7 @@ For every view x variant it captures the beauty (held frame 30, temporal
 history settled) and the Paths debug view (frame 2), then prints:
   flips   route changes between neighbouring water pixels per 100 water px
           (Paths view: stripes / speckle / jaggies in refraction routes;
+          the three far-backdrop lookups count as one;
           blind to stripes within one route, so also look at the sheets)
   changed % of pixels differing by > 8/255 from the first variant
 and writes one contact sheet per view (variants side by side) into --out.
@@ -17,9 +18,9 @@ and writes one contact sheet per view (variants side by side) into --out.
 Default views: every captures/snapshots/snap_*.state at its own camera, plus
 four extra cameras on snap_001 (its crater exercises the back-face
 silhouette case that the other states never hit). Default variants:
-  original  the pre-2026-10-01 behaviour (both refraction fixes off)
-  default   the current defaults
-  continue  current defaults + mc_silhouette_exit=Continue
+  screen      the screen-space in-water test (rendering.mc_volume_trace=false)
+  default     the current defaults (world-space test, filtered lookups)
+  unfiltered  current defaults with rendering.mc_filtered_lookup=false
 A views file is JSON: [{"name": ..., "snapshot": "<path without extension>",
 "set": ["camera.yaw=0.8", ...]}, ...].
 
@@ -40,12 +41,12 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.dont_write_bytecode = True  # no scripts/__pycache__ from the import below
-from debug_decode import PATHS, match_ids  # noqa: E402
+from debug_decode import ENDS, PATHS, match_ids  # noqa: E402
 
 DEFAULT_VARIANTS = [
-    ("original", ["rendering.mc_silhouette_exit=Exit", "rendering.mc_front_face_exit=false"]),
+    ("screen", ["rendering.mc_volume_trace=false"]),
     ("default", []),
-    ("continue", ["rendering.mc_silhouette_exit=Continue"]),
+    ("unfiltered", ["rendering.mc_filtered_lookup=false"]),
 ]
 SNAP_001_CAMERAS = ["camera.yaw=0.8", "camera.yaw=-0.9", "camera.pitch=0.5", "camera.pitch=-0.25"]
 
@@ -65,7 +66,11 @@ def default_views():
 def route_flips(png):
     img = np.asarray(Image.open(png).convert("RGB")).astype(int)
     path = match_ids(img[..., 0], 16, PATHS.keys())
-    end = match_ids(img[..., 1], 8, range(1, 7))
+    end = match_ids(img[..., 1], 8, ENDS.keys())
+    # Escaped to the far backdrop, however it was read (screen at the vanishing
+    # point, environment map, projected ground): one outcome. Counted apart,
+    # rays leaving just above / just below the horizon read as flips.
+    end = np.where((end == 3) | (end == 4) | (end == 7), 4, end)
     route = np.where((path >= 0) & (end >= 0), path * 10 + end, -1)
     v = (route[1:, :] >= 0) & (route[:-1, :] >= 0)
     h = (route[:, 1:] >= 0) & (route[:, :-1] >= 0)

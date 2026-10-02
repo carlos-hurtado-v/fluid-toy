@@ -1940,7 +1940,12 @@ impl App {
                             debug_view: 0,
                             silhouette_exit: 0,
                             front_exit: 0,
-                            _pad_f: [0; 3],
+                            ground_enabled: 0,
+                            ground_y: 0.0,
+                            ground_capture_height: 0.0,
+                            filtered_lookup: 0,
+                            volume_trace: 0,
+                            _pad_g: [0; 2],
                         };
                         ss_renderer.update_water_params(&gpu.queue, &water_params);
                         let env_params = self.state.environment.to_gpu_params(&self.ground_staging());
@@ -2059,6 +2064,9 @@ impl App {
                             self.state.rendering.mc_debug_view.as_u32(),
                             self.state.rendering.mc_silhouette_exit.as_u32(),
                             self.state.rendering.mc_front_face_exit,
+                            &env_params,
+                            self.state.rendering.mc_filtered_lookup,
+                            self.state.rendering.mc_volume_trace,
                         );
                         mc_renderer.update_env_params(&gpu.queue, &env_params);
                         mc_renderer.set_ssr_enabled(&gpu.queue, self.state.rendering.ssr_enabled);
