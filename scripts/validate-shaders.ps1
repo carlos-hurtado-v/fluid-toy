@@ -8,6 +8,9 @@
 # sites: marching_cubes.rs, sph_3d_grid.rs, spray.rs, wireframe.rs, container_renderer.rs,
 # caustics.rs, rigid_body_renderer.rs. RIGIDPREFIXED shaders get
 # container_common + rigid_body_common (sph_3d_grid.rs integrate/predict/solve).
+# mc_render.wgsl links a pixel-probe snippet after container_common
+# (marching_cubes.rs): it is validated with both mc_probe_off.wgsl (normal
+# rendering) and mc_probe_on.wgsl (--probe pipeline).
 
 $ErrorActionPreference = "Stop"
 
@@ -18,7 +21,6 @@ $rigidCommon = Join-Path $shaderDir "rigid_body_common.wgsl"
 $prefixed = @(
     "mc_density.wgsl",
     "foam_map.wgsl",
-    "mc_render.wgsl",
     "mc_back_depth.wgsl",
     "mc_caustics_gbuffer.wgsl",
     "mc_caustics_splat.wgsl",
@@ -40,7 +42,19 @@ $rigidPrefixed = @(
 $failures = 0
 $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "naga_validate_concat.wgsl"
 
-Get-ChildItem $shaderDir -Filter *.wgsl | Where-Object { $_.Name -notin @("container_common.wgsl", "rigid_body_common.wgsl") } | ForEach-Object {
+foreach ($variant in @("mc_probe_off.wgsl", "mc_probe_on.wgsl")) {
+    (Get-Content $common -Raw) + "`n" + (Get-Content (Join-Path $shaderDir $variant) -Raw) + "`n" + (Get-Content (Join-Path $shaderDir "mc_render.wgsl") -Raw) | Set-Content $tempFile -NoNewline
+    $output = & naga $tempFile 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "PASS  mc_render.wgsl + $variant"
+    } else {
+        Write-Host "FAIL  mc_render.wgsl + $variant" -ForegroundColor Red
+        Write-Host ($output | Out-String)
+        $script:failures++
+    }
+}
+
+Get-ChildItem $shaderDir -Filter *.wgsl | Where-Object { $_.Name -notin @("container_common.wgsl", "rigid_body_common.wgsl", "mc_render.wgsl") } | ForEach-Object {
     $target = $_.FullName
     if ($prefixed -contains $_.Name) {
         (Get-Content $common -Raw) + "`n" + (Get-Content $target -Raw) | Set-Content $tempFile -NoNewline

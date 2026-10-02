@@ -479,7 +479,7 @@ impl App {
         let foam_map = crate::simulation::FoamMap::new(&gpu.device);
 
         // Create marching cubes renderer (shares environment map)
-        let mc_renderer = MarchingCubesRenderer::new(
+        let mut mc_renderer = MarchingCubesRenderer::new(
             &gpu.device,
             crate::render::HDR_FORMAT,
             &env_view,
@@ -490,6 +490,13 @@ impl App {
             self.state.rendering.mc_grid_resolution.grid_size(),
             &foam_map,
         );
+        if !self.launch.probe_pixels.is_empty() {
+            mc_renderer.enable_probe(&gpu.device, &env_view, &env_sampler, &self.launch.probe_pixels);
+            println!(
+                "probe: recording {} pixel(s) on capture frames",
+                self.launch.probe_pixels.len()
+            );
+        }
 
         // Create wireframe renderer for container visualization
         let wireframe_renderer = WireframeRenderer::new(
@@ -1730,6 +1737,10 @@ impl App {
         }
         let snapshot = std::mem::take(&mut self.snapshot_requested);
         let capture_due = frame_capture || scheduled_snapshot || snapshot;
+        // Pixel probe: fresh records for this frame's water pass
+        if let Some(mc) = &self.mc_renderer {
+            mc.reset_probe(&gpu.queue);
+        }
         let capture = if capture_due {
             let unpadded_bytes_per_row = gpu.config.width * 4;
             let padded_bytes_per_row = unpadded_bytes_per_row
@@ -2458,6 +2469,11 @@ impl App {
                     .out_dir
                     .join(format!("frame_{:05}.png", self.milestone_frame));
                 self.save_capture(&buffer, padded_bytes_per_row, &path);
+                let probe_path = self
+                    .launch
+                    .out_dir
+                    .join(format!("frame_{:05}_probe.json", self.milestone_frame));
+                self.save_probe(&probe_path);
             }
             if snapshot {
                 self.save_snapshot(&buffer, padded_bytes_per_row, false);
@@ -2660,6 +2676,52 @@ impl App {
         };
         println!("{message}");
         self.state.runtime.last_export = Some(message);
+    }
+
+    /// Pixel probe: this frame's refraction records as JSON (no-op unless
+    /// --probe); decoded by scripts/probe_decode.py
+    fn save_probe(&self, path: &std::path::Path) {
+        let (Some(gpu), Some(mc)) = (self.gpu.as_ref(), self.mc_renderer.as_ref()) else {
+            return;
+        };
+        if !mc.probe_enabled() {
+            return;
+        }
+        let dump = mc.read_probe(&gpu.device, &gpu.queue);
+        let probed: std::collections::HashSet<[u32; 2]> =
+            dump.fragments.iter().map(|f| f.pixel).collect();
+        let overflowed = dump.fragments.iter().filter(|f| f.overflow).count();
+        let mut value = serde_json::to_value(&dump).unwrap_or_default();
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("frame".into(), self.milestone_frame.into());
+            obj.insert("size".into(), serde_json::json!([gpu.config.width, gpu.config.height]));
+            obj.insert(
+                "render_mode".into(),
+                format!("{:?}", self.state.rendering.render_mode).into(),
+            );
+        }
+        let text = serde_json::to_string(&value).unwrap_or_default();
+        match std::fs::write(path, text) {
+            Ok(()) => {
+                println!(
+                    "probe: {} fragment(s) on {}/{} pixel(s) -> {}",
+                    dump.fragments.len(),
+                    probed.len(),
+                    dump.pixels.len(),
+                    path.display()
+                );
+                if self.state.rendering.render_mode != FluidRenderMode::MarchingCubes {
+                    println!("probe: warning: only the MarchingCubes water shader is instrumented");
+                }
+                if overflowed > 0 || dump.slots_dropped > 0 {
+                    println!(
+                        "probe: warning: {overflowed} fragment(s) ran out of event slots, {} fragment(s) dropped",
+                        dump.slots_dropped
+                    );
+                }
+            }
+            Err(e) => eprintln!("error: cannot write {}: {e}", path.display()),
+        }
     }
 
     /// Write the simulation state (GPU buffers + CPU clocks) to a `.state`

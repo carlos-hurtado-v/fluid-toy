@@ -45,6 +45,14 @@ Options:
                            count rendered frames, so --capture 1 is the state
                            as saved and later frames let temporal history
                            (AO, caustics, SS) settle
+  --probe <x,y>            Pixel probe (repeatable): record every step of the
+                           water shader's refraction at this pixel and write
+                           frame_NNNNN_probe.json next to each --capture PNG
+                           (decode: scripts/probe_decode.py). Coordinates are
+                           capture-PNG pixels (physical; x right, y down)
+  --probe-line <x0,y0,x1,y1>
+                           Probe every pixel on this line (e.g. across a
+                           stripe); at most 64 probed pixels in total
   --help                   Show this help
 ";
 
@@ -57,6 +65,42 @@ fn frame_list(text: &str, flag: &str) -> Result<Vec<u64>, String> {
                 .map_err(|_| format!("{flag}: '{part}' is not a frame number"))
         })
         .collect()
+}
+
+/// Comma-separated pixel coordinates (`--probe 640,512`)
+fn number_list(text: &str, flag: &str) -> Result<Vec<u32>, String> {
+    text.split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<u32>()
+                .map_err(|_| format!("{flag}: '{part}' is not a pixel coordinate"))
+        })
+        .collect()
+}
+
+/// Every pixel on the segment a -> b (Bresenham), endpoints included
+fn line_pixels(a: [u32; 2], b: [u32; 2]) -> Vec<[u32; 2]> {
+    let (mut x, mut y) = (a[0] as i64, a[1] as i64);
+    let (x1, y1) = (b[0] as i64, b[1] as i64);
+    let (dx, dy) = ((x1 - x).abs(), -(y1 - y).abs());
+    let (sx, sy) = (if x < x1 { 1 } else { -1 }, if y < y1 { 1 } else { -1 });
+    let mut err = dx + dy;
+    let mut out = Vec::new();
+    loop {
+        out.push([x as u32, y as u32]);
+        if x == x1 && y == y1 {
+            return out;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
 }
 
 /// Parsed command-line options.
@@ -73,6 +117,7 @@ pub struct LaunchOptions {
     pub snapshot_frames: Vec<u64>,
     pub load_state: Option<PathBuf>,
     pub hold: bool,
+    pub probe_pixels: Vec<[u32; 2]>,
 }
 
 impl Default for LaunchOptions {
@@ -90,6 +135,7 @@ impl Default for LaunchOptions {
             snapshot_frames: Vec::new(),
             load_state: None,
             hold: false,
+            probe_pixels: Vec::new(),
         }
     }
 }
@@ -151,6 +197,22 @@ impl LaunchOptions {
                     opts.load_state = Some(PathBuf::from(value(&mut args, "--load-state")?))
                 }
                 "--hold" => opts.hold = true,
+                "--probe" => {
+                    let v = value(&mut args, "--probe")?;
+                    let n = number_list(&v, "--probe")?;
+                    if n.len() != 2 {
+                        return Err(format!("--probe expects x,y, got '{v}'"));
+                    }
+                    opts.probe_pixels.push([n[0], n[1]]);
+                }
+                "--probe-line" => {
+                    let v = value(&mut args, "--probe-line")?;
+                    let n = number_list(&v, "--probe-line")?;
+                    if n.len() != 4 {
+                        return Err(format!("--probe-line expects x0,y0,x1,y1, got '{v}'"));
+                    }
+                    opts.probe_pixels.extend(line_pixels([n[0], n[1]], [n[2], n[3]]));
+                }
                 "--out" => opts.out_dir = PathBuf::from(value(&mut args, "--out")?),
                 "--stats" => opts.stats_path = Some(PathBuf::from(value(&mut args, "--stats")?)),
                 "--exit-after" => {
@@ -180,6 +242,18 @@ impl LaunchOptions {
         opts.snapshot_frames.dedup();
         if opts.hold && opts.load_state.is_none() {
             return Err("--hold needs --load-state (it freezes the loaded state)".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        opts.probe_pixels.retain(|p| seen.insert(*p));
+        if opts.probe_pixels.len() > crate::render::marching_cubes::PROBE_MAX_PIXELS {
+            return Err(format!(
+                "{} probed pixels, at most {} (shorten the --probe-line)",
+                opts.probe_pixels.len(),
+                crate::render::marching_cubes::PROBE_MAX_PIXELS
+            ));
+        }
+        if !opts.probe_pixels.is_empty() && opts.capture_frames.is_empty() {
+            return Err("--probe writes its records on --capture frames: add --capture".into());
         }
         Ok(opts)
     }

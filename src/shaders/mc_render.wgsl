@@ -453,6 +453,7 @@ const SURFACE_CONTACT_REL: f32 = 0.05;
 // skipped here. Floors, walls and the ground are solid: behind is a hit.
 fn behind_background(q: vec3<f32>) -> bool {
     let bg = depth_smooth(background_depth_tex, q.xy);
+    prb_bg = bg;
     return q.z >= bg && (water.body_count == 0u || !on_analytic_body(screen_to_world(q.xy, bg)));
 }
 
@@ -505,6 +506,36 @@ const DBG_EXIT_SURFACE: u32 = 2u;       // back face (free surface, drop) away f
 const DBG_EXIT_SURFACE_WALL: u32 = 3u;  // back face near a wall: the MC contact line / bulge
 const DBG_NEAR_WALL: f32 = 0.06;
 
+// === Pixel probe events (--probe; decoded by scripts/probe_decode.py) ===
+// probe_event(tag, a, b, c) records one step of the refraction code at a
+// probed pixel; normal rendering links no-op stubs (mc_probe_off.wgsl). Keep
+// this table and the field meanings in sync with the script's EVENTS table.
+const PRB_FRAG: u32 = 1u;          // a = world pos, b = mesh normal (camera-facing), c = front raw depth
+const PRB_NORMAL: u32 = 2u;        // a = shading normal (wall snap + ripple), b = (on_wall, physical, -), c = back raw depth
+const PRB_REFRACT_IN: u32 = 3u;    // a = t1, b = (background raw depth, back raw depth, is_pool), c = -
+const PRB_SECOND: u32 = 4u;        // a = t2 (0 = TIR), b = exit normal, c = water path to the exit (m)
+const PRB_EXIT_BEGIN: u32 = 10u;   // water_exit: a = origin, b = dir, c = box exit distance
+const PRB_EXIT_BOX: u32 = 11u;     // a = box exit normal, b = (t_body, trace max distance, -), c = -
+const PRB_TRACE: u32 = 12u;        // in-water sample: a = (uv, raw depth), b = (background depth, back depth, kind), c = distance
+const PRB_TRACE_REFINE: u32 = 13u; // bisection sample, same fields
+const PRB_TRACE_END: u32 = 14u;    // a = (kind, dist_in, dist), b = (uv, -), c = max distance
+const PRB_EXIT_CROSS: u32 = 15u;   // a = back normal (smooth), b = after rim flattening, c = back.w + 2 * accepted
+const PRB_EXIT_END: u32 = 16u;     // a = exit point, b = exit normal, c = on_wall + 2 blocked + 4 body
+const PRB_EXIT_INSIDE: u32 = 17u;  // a = last in-water point, b = (blocked uv, floor contact), c = -
+const PRB_BOUNCE: u32 = 20u;       // a = refracted dir (0 = reflects again), b = incoming dir, c = bounce index
+const PRB_MARCH_BEGIN: u32 = 30u;  // march_to_background: a = origin, b = dir, c = reach
+const PRB_MARCH: u32 = 31u;        // a = (uv, raw depth), b = (background depth, behind, -), c = distance
+const PRB_MARCH_REFINE: u32 = 32u; // bisection sample, same fields
+const PRB_MARCH_END: u32 = 33u;    // a = (uv, hit), b = (lo, hi, t_body), c = -
+const PRB_SCENE: u32 = 40u;        // scene_from: a = (exit uv, background depth there), b = dir, c = -
+const PRB_BACKDROP: u32 = 41u;     // a = (vanishing-point uv or -1, on screen backdrop), b = dir, c = end id
+const PRB_LOOKUP: u32 = 42u;       // background_at: a = (uv, background depth), b = (front raw depth, accepted, -), c = -
+const PRB_RESULT: u32 = 50u;       // a = (dbg path, end, bounces), b = (dbg uv, exit kind), c = mirror kind
+const PRB_COLOR: u32 = 51u;        // a = refracted scene, b = shaded color, c = fresnel
+// Depths behind the last trace_event / behind_background verdict (probe only)
+var<private> prb_bg: f32 = -1.0;
+var<private> prb_back: f32 = -1.0;
+
 fn dbg_exit_interface(p: vec3<f32>, on_wall: bool) -> u32 {
     if (on_wall) {
         return DBG_EXIT_WALL;
@@ -518,13 +549,15 @@ fn dbg_exit_interface(p: vec3<f32>, on_wall: bool) -> u32 {
 }
 
 fn background_at(uv: vec2<f32>, front_depth_raw: f32, straight: vec3<f32>) -> vec3<f32> {
-    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))
-        || background_depth_at(uv) < front_depth_raw) {
+    let depth = background_depth_at(uv);
+    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || depth < front_depth_raw) {
         dbg_end = DBG_END_STRAIGHT;
+        probe_event(PRB_LOOKUP, vec3<f32>(uv, depth), vec3<f32>(front_depth_raw, 0.0, 0.0), 0.0);
         return straight;
     }
     dbg_end = DBG_END_SURFACE;
     dbg_uv = uv;
+    probe_event(PRB_LOOKUP, vec3<f32>(uv, depth), vec3<f32>(front_depth_raw, 1.0, 0.0), 0.0);
     return textureSampleLevel(background_tex, env_sampler, uv, 0.0).rgb;
 }
 
@@ -559,21 +592,26 @@ fn shows_backdrop(uv: vec2<f32>) -> bool {
 // when the backdrop is what shows there, else the backdrop evaluated directly.
 fn backdrop_along(dir: vec3<f32>) -> vec3<f32> {
     let clip = camera.projection * camera.view * vec4<f32>(dir, 0.0);
+    var vanishing = vec3<f32>(-1.0, -1.0, 0.0);
     if (clip.w > 1e-4) {
         let ndc = clip.xy / clip.w;
         let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        vanishing = vec3<f32>(uv, 0.0);
         if (all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0)) && shows_backdrop(uv)) {
             dbg_end = DBG_END_SCREEN_SKY;
             dbg_uv = uv;
+            probe_event(PRB_BACKDROP, vec3<f32>(uv, 1.0), dir, f32(dbg_end));
             return textureSampleLevel(background_tex, env_sampler, uv, 0.0).rgb;
         }
     }
     if (water.use_env_background == 0u) {
         dbg_end = DBG_END_SOLID;
+        probe_event(PRB_BACKDROP, vanishing, dir, f32(dbg_end));
         return vec3<f32>(water.background_r, water.background_g, water.background_b);
     }
     // Same radiance as the backdrop pass (mc_environment.wgsl)
     dbg_end = DBG_END_ENV;
+    probe_event(PRB_BACKDROP, vanishing, dir, f32(dbg_end));
     return max(sample_environment(dir) * water.env_intensity, vec3<f32>(0.0));
 }
 
@@ -602,15 +640,19 @@ fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0
     if (t_body > 0.0) {
         reach = t_body;
     }
+    probe_event(PRB_MARCH_BEGIN, origin, dir, reach);
     var lo = 0.0;
     var hi = -1.0;
     for (var k = 1; k <= MARCH_STEPS; k++) {
         let s = reach * f32(k) / f32(MARCH_STEPS);
         let q = screen_point(origin + dir * s);
         if (any(q.xy < vec2<f32>(0.0)) || any(q.xy > vec2<f32>(1.0))) {
+            probe_event(PRB_MARCH, q, vec3<f32>(-1.0, -1.0, 0.0), s);
             break;  // left the screen
         }
-        if (behind_background(q)) {
+        let behind = behind_background(q);
+        probe_event(PRB_MARCH, q, vec3<f32>(prb_bg, f32(behind), 0.0), s);
+        if (behind) {
             hi = s;
             break;
         }
@@ -618,20 +660,28 @@ fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0
     }
     if (hi < 0.0 && t_body > 0.0) {
         dbg_body = true;
-        return vec3<f32>(screen_point(origin + dir * t_body).xy, 1.0);
+        let body_uv = screen_point(origin + dir * t_body).xy;
+        probe_event(PRB_MARCH_END, vec3<f32>(body_uv, 1.0), vec3<f32>(lo, hi, t_body), 0.0);
+        return vec3<f32>(body_uv, 1.0);
     }
     if (hi < 0.0) {
+        probe_event(PRB_MARCH_END, vec3<f32>(uv0, 0.0), vec3<f32>(lo, hi, t_body), 0.0);
         return vec3<f32>(uv0, 0.0);
     }
     for (var k = 0; k < MARCH_REFINE; k++) {
         let mid = 0.5 * (lo + hi);
-        if (behind_background(screen_point(origin + dir * mid))) {
+        let q = screen_point(origin + dir * mid);
+        let behind = behind_background(q);
+        probe_event(PRB_MARCH_REFINE, q, vec3<f32>(prb_bg, f32(behind), 0.0), mid);
+        if (behind) {
             hi = mid;
         } else {
             lo = mid;
         }
     }
-    return vec3<f32>(screen_point(origin + dir * hi).xy, 1.0);
+    let hit_uv = screen_point(origin + dir * hi).xy;
+    probe_event(PRB_MARCH_END, vec3<f32>(hit_uv, 1.0), vec3<f32>(lo, hi, t_body), 0.0);
+    return vec3<f32>(hit_uv, 1.0);
 }
 
 // === Container walls as optical interfaces ===
@@ -710,6 +760,8 @@ fn box_interior_exit(o: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
 // Rays bent by drops and crests can break it.
 fn trace_event(q: vec3<f32>) -> f32 {
     let bg = depth_smooth(background_depth_tex, q.xy);
+    prb_bg = bg;
+    prb_back = -1.0;
     if (q.z >= bg) {
         // Hidden behind a sphere or box: ray_body_hit owns hits on it, and the
         // back face at this pixel is the water in front of the body (where the
@@ -722,6 +774,7 @@ fn trace_event(q: vec3<f32>) -> f32 {
         return 2.0;
     }
     let back = depth_smooth(back_depth_tex, q.xy);
+    prb_back = back;
     if (back >= 1.0 || q.z > back) {
         return 1.0;
     }
@@ -750,9 +803,11 @@ fn trace_in_water(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> TraceEven
         let s = max_dist * f * f;
         let q = screen_point(origin + dir * s);
         if (any(q.xy < vec2<f32>(0.0)) || any(q.xy > vec2<f32>(1.0))) {
+            probe_event(PRB_TRACE, q, vec3<f32>(-1.0, -1.0, -1.0), s);
             break;
         }
         kind = trace_event(q);
+        probe_event(PRB_TRACE, q, vec3<f32>(prb_bg, prb_back, kind), s);
         if (kind > 0.5) {
             hi = s;
             break;
@@ -760,11 +815,14 @@ fn trace_in_water(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> TraceEven
         lo = s;
     }
     if (hi < 0.0) {
+        probe_event(PRB_TRACE_END, vec3<f32>(0.0, max_dist, max_dist), vec3<f32>(0.0), max_dist);
         return TraceEvent(0.0, max_dist, max_dist, vec2<f32>(0.0));
     }
     for (var k = 0; k < TRACE_REFINE; k++) {
         let mid = 0.5 * (lo + hi);
-        let e = trace_event(screen_point(origin + dir * mid));
+        let q = screen_point(origin + dir * mid);
+        let e = trace_event(q);
+        probe_event(PRB_TRACE_REFINE, q, vec3<f32>(prb_bg, prb_back, e), mid);
         if (e > 0.5) {
             hi = mid;
             kind = e;
@@ -772,7 +830,9 @@ fn trace_in_water(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> TraceEven
             lo = mid;
         }
     }
-    return TraceEvent(kind, lo, hi, screen_point(origin + dir * hi).xy);
+    let event_uv = screen_point(origin + dir * hi).xy;
+    probe_event(PRB_TRACE_END, vec3<f32>(kind, lo, hi), vec3<f32>(event_uv, 0.0), max_dist);
+    return TraceEvent(kind, lo, hi, event_uv);
 }
 
 // The MC surface does not meet a wireframe tank wall at a corner: it rounds
@@ -839,7 +899,10 @@ struct WaterExit {
 fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
     let wall = box_interior_exit(world_to_local(container, origin), world_dir_to_local(container, dir));
     let t_body = ray_body_hit(origin, dir, wall.w);
-    let ev = trace_in_water(origin, dir, select(wall.w, t_body, t_body > 0.0));
+    let trace_max = select(wall.w, t_body, t_body > 0.0);
+    probe_event(PRB_EXIT_BEGIN, origin, dir, wall.w);
+    probe_event(PRB_EXIT_BOX, local_dir_to_world(container, wall.xyz), vec3<f32>(t_body, trace_max, 0.0), 0.0);
+    let ev = trace_in_water(origin, dir, trace_max);
     var out: WaterExit;
     // Reached the body with nothing in between, or left the water through the
     // film just in front of it
@@ -847,10 +910,13 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
         dbg_body = true;
         out.blocked = true;
         out.blocked_uv = screen_point(origin + dir * t_body).xy;
+        probe_event(PRB_EXIT_END, origin + dir * t_body, vec3<f32>(0.0), 6.0);
+        probe_event(PRB_EXIT_INSIDE, origin, vec3<f32>(out.blocked_uv, 0.0), 0.0);
         return out;
     }
     out.blocked = ev.kind > 1.5;
     out.blocked_uv = ev.uv;
+    var floor_contact = 0.0;
     var crossing = ev.kind > 0.5 && ev.dist < wall.w - (container.clip_margin + WALL_SNAP_TOLERANCE);
     if (crossing) {
         let back_n = back_normal_smooth(ev.uv);
@@ -867,6 +933,7 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
         // camera and a point just under the surface reads as dry): ignore it
         // and let the box bound the ray
         crossing = dot(out.normal, dir) > 0.0;
+        probe_event(PRB_EXIT_CROSS, back_n.xyz, out.normal, back_n.w + 2.0 * f32(crossing));
     }
     if (crossing) {
         out.point = origin + dir * ev.dist;
@@ -888,9 +955,12 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
             if (abs(qf.z - bgf) <= SURFACE_CONTACT_REL * (1.0 - bgf)) {
                 out.blocked = true;
                 out.blocked_uv = qf.xy;
+                floor_contact = 1.0;
             }
         }
     }
+    probe_event(PRB_EXIT_END, out.point, out.normal, f32(out.on_wall) + 2.0 * f32(out.blocked));
+    probe_event(PRB_EXIT_INSIDE, out.inside, vec3<f32>(out.blocked_uv, floor_contact), 0.0);
     return out;
 }
 
@@ -899,6 +969,7 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
 fn scene_from(p_out: vec3<f32>, dir: vec3<f32>, front_depth_raw: f32, straight: vec3<f32>) -> vec3<f32> {
     let uv = screen_point(p_out).xy;
     let depth = background_depth_at(uv);
+    probe_event(PRB_SCENE, vec3<f32>(uv, depth), dir, 0.0);
     if (depth < BACKDROP_DEPTH) {
         // Nothing reached: the ray passes the surface behind the exit point
         // (e.g. leaves through the free surface toward the sky while a body
@@ -944,6 +1015,7 @@ fn follow_internal_reflection(
             return straight;
         }
         let out_dir = refract(d, -ex.normal, water.ior);
+        probe_event(PRB_BOUNCE, out_dir, d, f32(bounce + 1));
         if (dot(out_dir, out_dir) > 0.5) {
             dbg_path = DBG_PATH_TIR_EXIT;
             dbg_exit_cos = dot(out_dir, ex.normal);
@@ -982,6 +1054,7 @@ fn refract_scene(
     // n faces the camera; entering the denser medium never totally reflects
     let t1 = refract(-view_dir, n, 1.0 / water.ior);
     let bg_depth = background_depth_at(screen_uv);
+    probe_event(PRB_REFRACT_IN, t1, vec3<f32>(bg_depth, back_depth_raw, f32(container.is_pool)), 0.0);
 
     // Opaque surface inside the water: the ray ends on it
     if (bg_depth < BACKDROP_DEPTH && bg_depth <= back_depth_raw) {
@@ -1033,6 +1106,7 @@ fn refract_scene(
     }
     dbg_water_path = distance(p, p_exit);
     let t2 = refract(t1, -n_exit, water.ior);
+    probe_event(PRB_SECOND, t2, n_exit, dbg_water_path);
     if (dot(t2, t2) < 0.5) {
         // Total internal reflection: in bulk water, follow the mirror bounce;
         // inside a thin drop or crest the next interface isn't knowable here
@@ -1331,6 +1405,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         }
     }
 
+    probe_begin(input.clip_position.xy, input.clip_position.z);
     let view_dir = normalize(camera.camera_pos - input.world_position);
 
     // Get the surface normal - ensure it faces toward the camera
@@ -1339,6 +1414,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     if (dot(normal, view_dir) < 0.0) {
         normal = -normal;
     }
+    probe_event(PRB_FRAG, input.world_position, normal, input.clip_position.z);
 
     let local_pos = world_to_local(container, input.world_position);
     // Pixel footprint on the surface (m), for the foam lace's antialiasing.
@@ -1373,6 +1449,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     let screen_uv = input.clip_position.xy / screen_size;
     let back_depth_raw = textureSample(back_depth_tex, depth_sampler, screen_uv);
     let front_depth_raw = input.clip_position.z;
+    probe_event(PRB_NORMAL, normal, vec3<f32>(f32(on_wall), water.physical_refraction, 0.0), back_depth_raw);
 
     // Convert to linear depth using actual camera near/far planes
     let front_linear = linearize_depth(front_depth_raw, camera.near, camera.far);
@@ -1650,6 +1727,15 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
             color = mix(color, albedo * grain * raft_light, alpha);
         }
     }
+
+    // What the debug views would show, plus the shaded result (probe only)
+    probe_event(
+        PRB_RESULT,
+        vec3<f32>(f32(dbg_path), f32(select(dbg_end, DBG_END_BODY, dbg_body)), f32(dbg_bounces)),
+        vec3<f32>(dbg_uv, f32(dbg_exit_kind)),
+        f32(dbg_mirror_kind),
+    );
+    probe_event(PRB_COLOR, refracted_scene, color, fresnel);
 
     // Refraction debug view: data instead of color (the app bypasses post
     // processing, so these values reach the screen as written; uniform branch,

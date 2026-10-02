@@ -337,6 +337,13 @@ pub struct MarchingCubesRenderer {
     // for exact ray-body hits in refraction: the depth buffer only holds the
     // camera-facing side of a body
     bodies_buffer: wgpu::Buffer,
+    // Pixel probe (--probe): record buffer (a placeholder until enabled), the
+    // probed pixels, and the probe variant of the water pipeline
+    probe_buffer: wgpu::Buffer,
+    probe_pixels: Vec<[u32; 2]>,
+    probe_pipeline: Option<wgpu::RenderPipeline>,
+    render_pipeline_layout: wgpu::PipelineLayout,
+    scene_format: wgpu::TextureFormat,
     light_params_buffer: wgpu::Buffer,
     env_params_buffer: wgpu::Buffer,
     sh_coefficients_buffer: wgpu::Buffer,
@@ -416,6 +423,121 @@ pub struct MarchingCubesRenderer {
 
     // MC grid resolution (cells per dimension)
     grid_size: u32,
+}
+
+/// Pixel probe (--probe) record layout: mirrors ProbeBuffer in
+/// mc_probe_on.wgsl (header, PROBE_MAX_PIXELS pixel slots, then fragment
+/// slots of 2 + 2 * PROBE_EVENTS_PER_SLOT vec4s)
+pub const PROBE_MAX_PIXELS: usize = 64;
+const PROBE_EVENTS_PER_SLOT: u32 = 256;
+/// Fragment slots: every fragment shading a probed pixel takes one (occluded
+/// ones and MSAA edge triangles included)
+const PROBE_MAX_SLOTS: u64 = 4 * PROBE_MAX_PIXELS as u64;
+const PROBE_HEADER_BYTES: u64 = 16 + 16 * PROBE_MAX_PIXELS as u64;
+
+fn create_probe_buffer(device: &wgpu::Device, slots: u64) -> wgpu::Buffer {
+    let slot_bytes = 16 * (2 + 2 * PROBE_EVENTS_PER_SLOT as u64);
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("MC Probe Records"),
+        size: PROBE_HEADER_BYTES + slots * slot_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+/// One fragment that shaded a probed pixel: its recorded refraction events,
+/// each [tag, a.x, a.y, a.z, b.x, b.y, b.z, c] (scripts/probe_decode.py names
+/// them; tags are the PRB_* constants in mc_render.wgsl)
+#[derive(serde::Serialize)]
+pub struct ProbeFragment {
+    pub pixel: [u32; 2],
+    pub frag_xy: [f32; 2],
+    pub depth: f32,
+    pub overflow: bool,
+    pub events: Vec<[f32; 8]>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ProbeDump {
+    pub pixels: Vec<[u32; 2]>,
+    pub events_per_slot: u32,
+    pub slots_dropped: u32,
+    pub fragments: Vec<ProbeFragment>,
+}
+
+/// The water shader: container_common + a pixel-probe snippet + mc_render.
+/// Normal rendering links no-op stubs: any storage write in the fragment
+/// shader can cost the pass its early depth test.
+fn water_render_shader(device: &wgpu::Device, probe: bool) -> wgpu::ShaderModule {
+    let probe_wgsl = if probe {
+        include_str!("../shaders/mc_probe_on.wgsl")
+    } else {
+        include_str!("../shaders/mc_probe_off.wgsl")
+    };
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(if probe { "MC Render Shader (probe)" } else { "MC Render Shader" }),
+        source: wgpu::ShaderSource::Wgsl(
+            format!(
+                "{}\n{}\n{}",
+                include_str!("../shaders/container_common.wgsl"),
+                probe_wgsl,
+                include_str!("../shaders/mc_render.wgsl"),
+            )
+            .into(),
+        ),
+    })
+}
+
+fn water_render_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    render_shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    sample_count: u32,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("MC Render Pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: render_shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: render_shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Cw,  // MC triangles are clockwise
+            cull_mode: Some(wgpu::Face::Back),  // Cull back faces (render front only)
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+        cache: None,
+    })
 }
 
 impl MarchingCubesRenderer {
@@ -632,6 +754,8 @@ impl MarchingCubesRenderer {
             ),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        // Placeholder until enable_probe: the normal shader never touches it
+        let probe_buffer = create_probe_buffer(device, 1);
 
         // Container geometry buffer (shared struct: geometry, rotation, physics, clip)
         let container_geom = GpuContainerGeometry::zeroed();
@@ -718,12 +842,7 @@ impl MarchingCubesRenderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_generate.wgsl").into()),
         });
 
-        let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MC Render Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/mc_render.wgsl")).into(),
-            ),
-        });
+        let render_shader = water_render_shader(device, false);
 
         let env_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Environment Shader"),
@@ -1436,6 +1555,17 @@ impl MarchingCubesRenderer {
                     },
                     count: None,
                 },
+                // Pixel probe records (only the --probe shader variant uses it)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1445,49 +1575,13 @@ impl MarchingCubesRenderer {
             push_constant_ranges: &[],
         });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("MC Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &render_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &render_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Cw,  // MC triangles are clockwise
-                cull_mode: Some(wgpu::Face::Back),  // Cull back faces (render front only)
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: sample_count,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        let render_pipeline = water_render_pipeline(
+            device,
+            &render_pipeline_layout,
+            &render_shader,
+            surface_format,
+            sample_count,
+        );
 
         // === Back Face Pipeline (for thickness) ===
         let back_face_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1721,6 +1815,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 19,
                     resource: bodies_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 20,
+                    resource: probe_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -2127,6 +2225,11 @@ impl MarchingCubesRenderer {
             camera_buffer,
             water_params_buffer,
             bodies_buffer,
+            probe_buffer,
+            probe_pixels: Vec::new(),
+            probe_pipeline: None,
+            render_pipeline_layout,
+            scene_format: surface_format,
             light_params_buffer,
             env_params_buffer,
             sh_coefficients_buffer,
@@ -2519,6 +2622,89 @@ impl MarchingCubesRenderer {
         let count = bodies.len().min(crate::state::MAX_RIGID_BODIES);
         if count > 0 {
             queue.write_buffer(&self.bodies_buffer, 0, bytemuck::cast_slice(&bodies[..count]));
+        }
+    }
+
+    /// Switch the water pass to the pixel-probe shader variant, recording at
+    /// these pixels (PNG coordinates, at most PROBE_MAX_PIXELS)
+    pub fn enable_probe(
+        &mut self,
+        device: &wgpu::Device,
+        env_view: &wgpu::TextureView,
+        env_sampler: &wgpu::Sampler,
+        pixels: &[[u32; 2]],
+    ) {
+        self.probe_pixels = pixels.iter().copied().take(PROBE_MAX_PIXELS).collect();
+        self.probe_buffer = create_probe_buffer(device, PROBE_MAX_SLOTS);
+        let shader = water_render_shader(device, true);
+        self.probe_pipeline = Some(water_render_pipeline(
+            device,
+            &self.render_pipeline_layout,
+            &shader,
+            self.scene_format,
+            self.sample_count,
+        ));
+        self.render_bind_group = self.create_render_bind_group(device, env_view, env_sampler);
+    }
+
+    pub fn probe_enabled(&self) -> bool {
+        self.probe_pipeline.is_some()
+    }
+
+    /// Empty the probe records before this frame's water pass (queue writes
+    /// land ahead of the next submit)
+    pub fn reset_probe(&self, queue: &wgpu::Queue) {
+        if self.probe_pipeline.is_none() {
+            return;
+        }
+        let mut header = vec![0u32; PROBE_HEADER_BYTES as usize / 4];
+        header[0] = self.probe_pixels.len() as u32;
+        header[2] = PROBE_EVENTS_PER_SLOT;
+        for (i, px) in self.probe_pixels.iter().enumerate() {
+            header[4 + 4 * i] = px[0];
+            header[4 + 4 * i + 1] = px[1];
+        }
+        queue.write_buffer(&self.probe_buffer, 0, bytemuck::cast_slice(&header));
+    }
+
+    /// Read the last frame's probe records (blocking)
+    pub fn read_probe(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> ProbeDump {
+        use crate::simulation::snapshot::{read_gpu, GpuSource};
+        let size = self.probe_buffer.size();
+        let bytes = read_gpu(device, queue, vec![("probe", GpuSource::Buffer { buffer: &self.probe_buffer, size })])
+            .remove(0)
+            .1;
+        let words: &[u32] = bytemuck::cast_slice(&bytes);
+        let floats: &[f32] = bytemuck::cast_slice(&bytes);
+        let slots_used = words[1] as usize;
+        let events_per_slot = words[2] as usize;
+        let stride = 4 * (2 + 2 * events_per_slot);
+        let data = &floats[PROBE_HEADER_BYTES as usize / 4..];
+        let capacity = data.len() / stride;
+        let mut fragments = Vec::new();
+        for slot in 0..slots_used.min(capacity) {
+            let d = &data[slot * stride..(slot + 1) * stride];
+            let count = (d[4] as usize).min(events_per_slot);
+            let events = (0..count)
+                .map(|e| {
+                    let v = &d[8 + 8 * e..16 + 8 * e];
+                    // [tag, a.xyz, b.xyz, c]
+                    [v[3], v[0], v[1], v[2], v[4], v[5], v[6], v[7]]
+                })
+                .collect();
+            fragments.push(ProbeFragment {
+                pixel: self.probe_pixels.get(d[0] as usize).copied().unwrap_or([0, 0]),
+                frag_xy: [d[1], d[2]],
+                depth: d[3],
+                overflow: d[5] > 0.5,
+                events,
+            });
+        }
+        ProbeDump {
+            pixels: self.probe_pixels.clone(),
+            events_per_slot: events_per_slot as u32,
+            slots_dropped: slots_used.saturating_sub(capacity) as u32,
+            fragments,
         }
     }
 
@@ -3047,7 +3233,7 @@ impl MarchingCubesRenderer {
             }
 
             // Draw water mesh (samples background_texture for refraction)
-            pass.set_pipeline(&self.render_pipeline);
+            pass.set_pipeline(self.probe_pipeline.as_ref().unwrap_or(&self.render_pipeline));
             pass.set_bind_group(0, &self.render_bind_group, &[]);
             pass.draw_indirect(&self.indirect_buffer, 0);
 
@@ -3282,6 +3468,10 @@ impl MarchingCubesRenderer {
                 wgpu::BindGroupEntry {
                     binding: 19,
                     resource: self.bodies_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 20,
+                    resource: self.probe_buffer.as_entire_binding(),
                 },
             ],
         })
