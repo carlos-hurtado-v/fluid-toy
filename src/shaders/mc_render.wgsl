@@ -2038,6 +2038,15 @@ const RAFT_COVERAGE_K: f32 = 0.9;
 const RAFT_ALPHA_THIN: f32 = 0.35;
 const RAFT_ALPHA_THICK: f32 = 0.92;
 const RAFT_ALPHA_K: f32 = 0.7;
+// Lace geometry
+const LACE_WARP_CELLS: f32 = 3.0;
+const LACE_WARP_AMP: f32 = 0.3;
+const LACE_FEATURE_WEIGHT: f32 = 0.3;
+const LACE_ROUND_DENSE: f32 = 1.9;
+const LACE_ROUND_COV_LO: f32 = 0.45;
+const LACE_ROUND_COV_HI: f32 = 0.9;
+const LACE_METRIC_OFFSET: f32 = 0.3;
+const LACE_WIDTH_NOISE: f32 = 0.5;
 
 struct MapFoam {
     density: f32,
@@ -2130,8 +2139,46 @@ fn worley(p: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(f1, f2 - f1);
 }
 
-// Raft mask at one flow-map position: covered where the distance to the lace
-// network's walls is under a threshold that grows with coverage (thick foam:
+// Worley with additively weighted features (each feature's distance is
+// reduced by a random share of LACE_FEATURE_WEIGHT cells): the cells form an
+// Apollonius diagram - curved walls, varied cell sizes. Returns (F1, F2) in
+// cell units. The weight stays well under a cell so the 3x3 search still
+// finds the two nearest.
+fn worley_weighted(p: vec2<f32>) -> vec2<f32> {
+    let cell = floor(p);
+    let fr = p - cell;
+    var f1 = 8.0;
+    var f2 = 8.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let o = vec2<f32>(f32(x), f32(y));
+            let h = hash22(cell + o);
+            let d = length(o + h - fr) - LACE_FEATURE_WEIGHT * fract(h.x * 7.0 + h.y * 13.0);
+            if (d < f1) {
+                f2 = f1;
+                f1 = d;
+            } else if (d < f2) {
+                f2 = d;
+            }
+        }
+    }
+    return vec2<f32>(f1, f2);
+}
+
+// Divergence-free displacement of the lace domain: rotated value-noise
+// gradients, two octaves (LACE_WARP_CELLS and half that, in lace cells),
+// LACE_WARP_AMP cells rms - the two-octave rotated gradient has an rms of
+// ~0.68 per noise cell, which the scale divides out.
+fn lace_warp(p: vec2<f32>) -> vec2<f32> {
+    let f = 1.0 / (LACE_WARP_CELLS * LACE_CELL);
+    let g0 = value_noise_grad(p * f);
+    let g1 = value_noise_grad(p * (2.0 * f) + vec2<f32>(7.1, 3.3));
+    let w = vec2<f32>(g0.z, -g0.y) + 0.5 * vec2<f32>(g1.z, -g1.y);
+    return p + w * (LACE_WARP_AMP * LACE_CELL / 0.68);
+}
+
+// Raft mask at one flow-map position: covered where the wall metric of the
+// lace network is under a threshold that grows with coverage (thick foam:
 // everything; thinning: holes open from the cell centres; last: strings).
 // Bursting is uneven, so the local coverage is jittered at the patch scale:
 // some areas hold a raft while neighbours are already down to strings.
@@ -2139,20 +2186,32 @@ fn worley(p: vec2<f32>) -> vec2<f32> {
 fn raft_mask(p: vec2<f32>, coverage: f32, px: f32) -> f32 {
     let patch_noise = value_noise_grad(p * LACE_PATCH_FREQ).x;
     let cov = clamp(coverage * (0.45 + 1.1 * patch_noise), 0.0, 1.0);
-    let coarse = worley(p / LACE_CELL).y;
-    let fine = worley(p / LACE_CELL_FINE + vec2<f32>(5.3, 1.7)).y;
+    let q = lace_warp(p);
+    // Wall metric F2 - c F1 (+ offset): 0 on the walls, negative inside them
+    // (most negative at the junctions), positive toward the hole centres
+    let c = mix(1.0, LACE_ROUND_DENSE, smoothstep(LACE_ROUND_COV_LO, LACE_ROUND_COV_HI, cov));
+    let off = (c - 1.0) * LACE_METRIC_OFFSET;
+    let wc = worley_weighted(q / LACE_CELL);
+    let wf = worley_weighted(q / LACE_CELL_FINE + vec2<f32>(5.3, 1.7));
+    let coarse = wc.y - c * wc.x + off;
+    let fine = wf.y - c * wf.x + off;
     // The fine network only subdivides holes while the raft is still dense:
     // thin foam is a few coarse strings, not a uniform net
     let fine_weight = mix(3.5, 1.4, smoothstep(0.3, 0.8, cov));
     let wall = min(coarse, fine * fine_weight);
-    let threshold = -log(max(1.0 - cov * 0.985, 1e-3)) * 0.22;
-    let soft = max(px / LACE_CELL_FINE * 1.5, 0.03);
+    // String-scale noise: wall width along the string, and the snap gate
+    let string_noise = value_noise_grad(q * LACE_SNAP_FREQ + vec2<f32>(3.1, 7.9)).x;
+    let threshold = -log(max(1.0 - cov * 0.985, 1e-3)) * 0.22
+        * (1.0 - LACE_WIDTH_NOISE + 2.0 * LACE_WIDTH_NOISE * string_noise);
+    // Antialiasing width in metric units: the metric's gradient is up to
+    // 1 + c (2 for F2 - F1), so the footprint scales with it
+    let soft = max(px / LACE_CELL_FINE * 1.5, 0.03) * (0.5 * (1.0 + c));
     var mask = 1.0 - smoothstep(threshold - soft, threshold + soft, wall);
     // Thin lace is broken, not a connected net: strings snap into fragments
-    // as the foam thins (gate a string-scale noise by coverage)
-    let snap = value_noise_grad(p * LACE_SNAP_FREQ + vec2<f32>(3.1, 7.9)).x;
+    // as the foam thins (gate the string noise by coverage; a string pinches
+    // where the noise is low, then breaks there)
     let keep = clamp(cov * 1.8, 0.0, 1.0);
-    mask *= smoothstep(1.0 - keep - 0.12, 1.0 - keep + 0.12, snap);
+    mask *= smoothstep(1.0 - keep - 0.12, 1.0 - keep + 0.12, string_noise);
     // Below a pixel the lace can't resolve: converge to its mean coverage
     return mix(mask, cov, smoothstep(0.25, 0.8, px / LACE_CELL_FINE));
 }
