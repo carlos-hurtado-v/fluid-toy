@@ -18,7 +18,7 @@ const DBG_PATH_TIR_POOL: u32 = 10u;    // mirrored onto an opaque pool wall: str
 // Final lookup (dbg_end)
 const DBG_END_STRAIGHT: u32 = 1u;      // the view straight through (occluded or fallback)
 const DBG_END_SURFACE: u32 = 2u;       // background texture where the ray met a surface
-const DBG_END_SCREEN_SKY: u32 = 3u;    // (until 2026-10: backdrop read on screen at the vanishing point; no longer produced)
+const DBG_END_SCREEN_SKY: u32 = 3u;    
 const DBG_END_ENV: u32 = 4u;           // environment map along the direction
 const DBG_END_SOLID: u32 = 5u;         // solid background color
 const DBG_END_BODY: u32 = 6u;          // a body met exactly, shaded at the hit (body_radiance)

@@ -185,9 +185,7 @@ pub struct RigidBodyConfig {
     /// Half-extent (radius for sphere/cylinder/torus/propeller, half side for cube)
     pub half_extent: f32,
     /// Body density relative to the fluid rest density (specific gravity):
-    /// 1.0 = neutral buoyancy, < 1 floats, > 1 sinks. Relative semantics stay
-    /// correct when kernel_radius retunes the SPH rest density (~104k at the
-    /// 2026-07 defaults — absolute values drifted badly when h changed).
+    /// 1.0 = neutral buoyancy, < 1 floats, > 1 sinks.
     pub relative_density: f32,
     /// Render color (RGB)
     pub color: [f32; 3],

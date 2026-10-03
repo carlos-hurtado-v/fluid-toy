@@ -80,22 +80,13 @@ struct TraceEvent {
 // surface (as the camera sees it: a crater wall, a crest) reads as out of the
 // water without crossing anything. Bisecting a real crossing closes onto a
 // continuous back face; across a silhouette the back depth jumps and stays
-// jumped. As an exit (old behaviour) its normal is blended across the two
-// unrelated layers and neighbouring pixels flip between outcomes: stripes,
-// strongest in mirrors (snap_001). Continuing behind the layer is physically
-// right there (the ray is measured to be in water behind a crater), but its
-// switch still follows the near layer's texel-precision outline, which a
-// mirror magnifies into stair steps (snap_003): opt-in until both outcomes can
-// be blended across that outline.
+// jumped.
 const SILHOUETTE_EXIT: u32 = 0u;       // treat it as an exit (old, default)
 const SILHOUETTE_CONTINUE: u32 = 1u;   // behind the nearer layer counts as in the water
 
 // How far behind the nearer layer (relative to (1 - depth), ~ relative
 // distance) the out-of-water sample must lie for the step to count as a slip
-// behind it. A back face seen nearly edge-on also jumps between texels
-// (depth_smooth falls back to the nearest texel on it), but a ray crossing it
-// stays within a few % of it: snap_003 ~2% (a real exit), snap_001's crater
-// wall 16%+ (behind it by 0.56 m and more).
+// behind it.
 const SILHOUETTE_BEHIND_REL: f32 = 0.05;
 
 // Is the step from an in-water sample (back depth back_in) to an out-of-water
@@ -112,13 +103,6 @@ fn is_silhouette(back_in: f32, back_out: f32, z_out: f32) -> bool {
 // closes steadily and reaches zero somewhere behind the body. Left to the
 // coarse samples, the last one still in sight decided: just through the
 // surface = an exit there, a hair short = no exit at all, on to the far wall.
-// With samples ~20 cm apart that verdict flipped in steps across the image
-// (snap_004: a stair-stepped edge between a mirror and the view straight
-// through). Instead the gap and its closing rate are measured at the body's
-// outline, the same place for every pixel, and the crossing is put where the
-// gap runs out, if that is still behind the body.
-// Stretch before the outline over which the closing rate is measured, as a
-// fraction of the distance travelled, and its bounds (m)
 const HIDDEN_RATE_SPAN: f32 = 0.2;
 const HIDDEN_RATE_SPAN_MIN: f32 = 0.05;
 const HIDDEN_RATE_SPAN_MAX: f32 = 0.3;

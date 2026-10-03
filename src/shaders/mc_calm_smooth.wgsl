@@ -123,13 +123,7 @@ fn sample_half(field: texture_3d<f32>, p: vec3<f32>) -> HalfSample {
 // off across a bulk surface, so gating each voxel on its own G lets some of
 // the base field back in on the air side of every crossing - where the base
 // field, a much narrower blur, is far below S - and how much depends on how
-// far above the surface that voxel happens to sit. The surface dips by a
-// sawtooth, one tooth per voxel layer it climbs through (contour-line stripes
-// on any tilted calm surface, period = cell / slope): well under a millimetre
-// of height, but slope enough for a grazing mirror to draw as streaks
-// (snap_004: lookups of neighbouring pixel rows 20 px apart, 4 px without
-// it). Read on the surface, the gate is the same for every voxel along the
-// normal and the crossing is that of one fixed blend.
+// far above the surface that voxel happens to sit.
 fn surface_gate(p: vec3<f32>, s: HalfSample, g: f32) -> f32 {
     let slope = max(length(s.grad), 1e-6 * params.iso);
     let reach = 1.0 - smoothstep(PROJECT_NEAR, PROJECT_FAR, abs(params.iso - s.value) / slope);

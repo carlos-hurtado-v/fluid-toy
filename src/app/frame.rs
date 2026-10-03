@@ -290,7 +290,6 @@ impl App {
     /// the GPU idled from the end of that wait until the frame's render was
     /// submitted, and ran the render slower after the pause: 14.6 ms/frame
     /// with Dynamic bodies against 11.4 with the same bodies Static
-    /// (snap_007, 2560x1351, --profile); 11.0 with this.
     fn submit_early_passes(&mut self, stepped: bool) {
         let gpu = self.gpu.as_ref().unwrap();
         let mut encoder = gpu
