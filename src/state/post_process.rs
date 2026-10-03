@@ -94,13 +94,13 @@ impl Default for PostProcessConfig {
 
             // Bloom
             bloom_enabled: true,
-            bloom_intensity: 0.40,
+            bloom_intensity: 0.20,
             // HDR scene luminance (pre-exposure): only real highlights — sun
             // glints, the sun disk, caustic hot spots — not sunlit white walls
-            bloom_threshold: 4.0,
+            bloom_threshold: 7.0,
 
             // Chromatic aberration
-            chromatic_aberration_enabled: true,
+            chromatic_aberration_enabled: false,
             chromatic_aberration_intensity: 0.0060,
 
             // Anamorphic streaks (cyan tint by default for sci-fi look)
