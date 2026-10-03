@@ -48,8 +48,9 @@ const FORCE_VORTEX: u32 = 2u;
 const FORCE_EXPLODE: u32 = 3u;
 const FORCE_DRAIN: u32 = 4u;
 
-// RigidBody/RigidBodies structs, shape/motion constants, and propeller_sdf
-// come from rigid_body_common.wgsl (concatenated before this file).
+// RigidBody/RigidBodies structs and motion constants come from
+// rigid_body_common.wgsl, the shape constants and SDFs from
+// body_shapes_common.wgsl (both concatenated before this file).
 
 // Penalty (static contact) and damping (velocity drag) reactions accumulate
 // separately: the CPU attenuates the static component by submersion so a

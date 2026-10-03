@@ -57,7 +57,7 @@ ENDS = {
     3: "backdrop on screen (vanishing point)",
     4: "environment map",
     5: "solid background color",
-    6: "exact body hit",
+    6: "body, shaded at the exact hit",
     7: "projected ground (where the ray lands, off screen)",
 }
 EXITS = {

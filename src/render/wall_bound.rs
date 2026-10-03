@@ -1,10 +1,12 @@
-//! Container wall bound for the marching-cubes density field.
+//! Container wall and rigid body bound for the marching-cubes density field.
 //!
 //! Last field pass before mesh generation (see `mc_wall_bound.wgsl`): the
 //! out-of-container sentinel the smoothing filters skipped becomes the field
 //! extended across the wall, cut by a linear ramp that crosses the iso value
 //! exactly on each wall plane — the mesh ends on the walls at any tilt, with
-//! the free surface flat right up to them.
+//! the free surface flat right up to them. The sentinel inside a rigid body
+//! (and the thin band around it) becomes the field from just outside it: the
+//! water runs into the body instead of leaving a moat around it.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -15,6 +17,14 @@ const REST_SPACING_FACTOR: f32 = 0.6;
 /// How far behind the opaque pool's wall faces the mesh's sides are put, in
 /// MC cells: coplanar they would z-fight with the walls.
 const POOL_OFFSET_CELLS: f32 = 1.0;
+
+/// The snippets the field passes that know the rigid bodies (mc_density,
+/// mc_wall_bound) link after container_common.wgsl
+pub const FIELD_BODY_SNIPPETS: &str = concat!(
+    include_str!("../shaders/body_shapes_common.wgsl"),
+    "\n",
+    include_str!("../shaders/field_bodies_common.wgsl"),
+);
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -41,13 +51,15 @@ impl WallBound {
         field_b: &wgpu::TextureView,
         grid_params_buffer: &wgpu::Buffer,
         container_geom_buffer: &wgpu::Buffer,
+        bodies_buffer: &wgpu::Buffer,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Wall Bound Shader"),
             source: wgpu::ShaderSource::Wgsl(
                 format!(
-                    "{}\n{}",
+                    "{}\n{}\n{}",
                     include_str!("../shaders/container_common.wgsl"),
+                    FIELD_BODY_SNIPPETS,
                     include_str!("../shaders/mc_wall_bound.wgsl")
                 )
                 .into(),
@@ -80,6 +92,7 @@ impl WallBound {
                     wgpu::BindGroupEntry { binding: 2, resource: grid_params_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: container_geom_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: params_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: bodies_buffer.as_entire_binding() },
                 ],
             })
         });

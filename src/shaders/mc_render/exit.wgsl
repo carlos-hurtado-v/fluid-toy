@@ -51,9 +51,12 @@ struct WaterExit {
     inside: vec3<f32>,
     // Left through a container wall or the floor (exact plane)
     on_wall: bool,
-    // Something opaque came first, at this screen uv: the ray ends there
+    // Something opaque came first: the ray ends there. A body met exactly
+    // (body.t > 0: shade it, body_radiance), else whatever the depth buffer
+    // shows at this screen uv
     blocked: bool,
     blocked_uv: vec2<f32>,
+    body: BodyHit,
 }
 
 // How a ray inside the water leaves it, decided along the ray itself: through
@@ -63,18 +66,21 @@ struct WaterExit {
 // or not at all because something opaque is in the way.
 fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
     let wall = box_interior_exit(world_to_local(container, origin), world_dir_to_local(container, dir));
-    let t_body = ray_body_hit(origin, dir, wall.w);
+    let body_hit = ray_body_hit(origin, dir, wall.w);
+    let t_body = body_hit.t;
     let trace_max = select(wall.w, t_body, t_body > 0.0);
     probe_event(PRB_EXIT_BEGIN, origin, dir, wall.w);
     probe_event(PRB_EXIT_BOX, local_dir_to_world(container, wall.xyz), vec3<f32>(t_body, trace_max, 0.0), 0.0);
     let ev = trace_in_water(origin, dir, trace_max);
     var out: WaterExit;
+    out.body = NO_BODY_HIT;
     // Reached the body with nothing in between, or left the water through the
     // film just in front of it
     let opaque = ev.kind > 1.5 && ev.kind < 2.5;
-    if (t_body > 0.0 && (ev.kind < 0.5 || (!opaque && t_body - ev.dist < BODY_WET_GAP))) {
-        dbg_body = true;
+    if (t_body > 0.0 && (ev.kind < 0.5
+        || (!opaque && t_body - ev.dist < BODY_WET_GAP && body_has_film(body_hit.index)))) {
         out.blocked = true;
+        out.body = body_hit;
         out.blocked_uv = screen_point(origin + dir * t_body).xy;
         probe_event(PRB_EXIT_END, origin + dir * t_body, vec3<f32>(0.0), 6.0);
         probe_event(PRB_EXIT_INSIDE, origin, vec3<f32>(out.blocked_uv, 0.0), 0.0);
@@ -145,26 +151,31 @@ fn water_exit(origin: vec3<f32>, dir: vec3<f32>) -> WaterExit {
     return out;
 }
 
-// What a ray leaving the water at `p_out` along `dir` reaches: the surface
-// behind that point, if any, else the backdrop far along it
+// What a ray leaving the water at `p_out` along `dir` reaches: a body, the
+// surface behind that point, if any, else the backdrop far along it
 fn scene_from(p_out: vec3<f32>, dir: vec3<f32>, front_depth_raw: f32, straight: vec3<f32>) -> vec3<f32> {
     let uv = screen_point(p_out).xy;
     let depth = background_depth_at(uv);
     probe_event(PRB_SCENE, vec3<f32>(uv, depth), dir, 0.0);
-    if (depth < BACKDROP_DEPTH) {
+    // Only where the depth buffer holds something the ray could land on that
+    // is not known exactly (pool walls and floor, a Custom body): outside the
+    // water of a glass tank there are just the bodies and the backdrop
+    if (water.depth_occluders != 0u && depth < BACKDROP_DEPTH) {
         // Nothing reached: the ray passes the surface behind the exit point
         // (e.g. leaves through the free surface toward the sky while a body
         // sits behind the exit point on screen) and escapes
         let m = march_to_background(p_out, dir, uv, depth);
+        if (march_body.t > 0.0) {
+            return body_radiance(p_out, dir, march_body);
+        }
         if (march_hit_before_ground(m.z > 0.5, ground_distance(p_out, dir))) {
             return background_at(m.xy, front_depth_raw, straight);
         }
         return backdrop_along(p_out, dir);
     }
-    let t_body = ray_body_hit(p_out, dir, BODY_MAX_REACH);
-    if (t_body > 0.0) {
-        dbg_body = true;
-        return background_at(screen_point(p_out + dir * t_body).xy, front_depth_raw, straight);
+    let hit = ray_body_hit(p_out, dir, BODY_MAX_REACH);
+    if (hit.t > 0.0) {
+        return body_radiance(p_out, dir, hit);
     }
     return backdrop_along(p_out, dir);
 }
@@ -187,6 +198,9 @@ fn follow_internal_reflection(
         dbg_bounces = u32(bounce + 1);
         if (ex.blocked) {
             dbg_path = DBG_PATH_TIR_BLOCKED;
+            if (ex.body.t > 0.0) {
+                return body_radiance(o, d, ex.body);
+            }
             return background_at(ex.blocked_uv, front_depth_raw, straight);
         }
         if (container.is_pool != 0u && ex.on_wall) {

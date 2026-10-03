@@ -63,6 +63,9 @@ pub struct App {
     spray_system: Option<SpraySystem>,
     spray_renderer: Option<SprayRenderer>,
     spray_prev_enabled: bool,
+    /// Container geometry the marching-cubes field was generated with this
+    /// frame (`generate_fluid_geometry`), for the passes that follow
+    mc_geom: Option<crate::state::GpuContainerGeometry>,
     post_process_renderer: Option<PostProcessRenderer>,
     gtao_renderer: Option<GtaoRenderer>,
     prev_camera_params: Option<crate::render::GpuCameraParams>,
@@ -185,6 +188,7 @@ impl App {
             spray_system: None,
             spray_renderer: None,
             spray_prev_enabled: true, // default: enabled
+            mc_geom: None,
             post_process_renderer: None,
             gtao_renderer: None,
             prev_camera_params: None,
@@ -417,6 +421,9 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 self.update_and_render();
                 if self.should_exit {
+                    if let Some(gpu) = &self.gpu {
+                        crate::gpu::profile::report(&gpu.device);
+                    }
                     event_loop.exit();
                     return;
                 }

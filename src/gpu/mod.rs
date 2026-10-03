@@ -1,6 +1,7 @@
 //! GPU context - shared wgpu resources
 
 pub mod bind;
+pub mod profile;
 
 use std::sync::Arc;
 use winit::window::Window;
@@ -15,7 +16,9 @@ pub struct GpuContext {
 
 impl GpuContext {
     /// `uncapped` disables vsync (for automation runs that should finish fast).
-    pub async fn new(window: Arc<Window>, uncapped: bool) -> Self {
+    /// `profile` asks for GPU timestamp queries where the adapter has them
+    /// (`--profile`, see profile.rs).
+    pub async fn new(window: Arc<Window>, uncapped: bool, profile: bool) -> Self {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -34,10 +37,14 @@ impl GpuContext {
             .await
             .expect("Failed to find suitable adapter");
 
+        let mut required_features = wgpu::Features::FLOAT32_FILTERABLE;
+        if profile && adapter.features().contains(profile::wanted_features()) {
+            required_features |= profile::wanted_features();
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Primary Device"),
-                required_features: wgpu::Features::FLOAT32_FILTERABLE,
+                required_features,
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,

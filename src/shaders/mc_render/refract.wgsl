@@ -22,8 +22,17 @@ fn refract_scene(
     let bg_depth = background_depth_at(screen_uv);
     probe_event(PRB_REFRACT_IN, t1, vec3<f32>(bg_depth, back_depth_raw, f32(container.is_pool)), 0.0);
 
+    // A body the tracer intersects exactly needs no special case: water_exit
+    // below finds it wherever the refracted ray meets it, or lets the ray
+    // pass where it bends away from it (glass tank, world-space test)
+    let inside_surface = bg_depth < BACKDROP_DEPTH && bg_depth <= back_depth_raw;
+    let exact_body = inside_surface && container.is_pool == 0u && water.volume_trace != 0u
+        && water.body_count > 0u && on_analytic_body(screen_to_world(screen_uv, bg_depth));
+    if (exact_body) {
+        missed_inside = true;
+    }
     // Opaque surface inside the water: the ray ends on it
-    if (bg_depth < BACKDROP_DEPTH && bg_depth <= back_depth_raw) {
+    if (inside_surface && !exact_body) {
         // No crossing: the ray left the screen, or rose toward the water
         // surface from below (side faces near the rounded top edge), where it
         // would reflect back down rather than reach anything far away. The
@@ -31,6 +40,10 @@ fn refract_scene(
         // would paint the horizon into the water.
         dbg_path = DBG_PATH_INSIDE;
         let m = march_to_background(p, t1, screen_uv, bg_depth);
+        if (march_body.t > 0.0) {
+            refracted_path = march_dist;
+            return body_radiance(p, t1, march_body);
+        }
         if (container.is_pool != 0u) {
             return background_at(m.xy, front_depth_raw, straight);
         }
@@ -50,7 +63,7 @@ fn refract_scene(
     }
     // No back face behind this pixel (mesh clipped open): treat the body as
     // deep and let the refracted ray run out to the backdrop
-    if (back_depth_raw >= 1.0) {
+    if (back_depth_raw >= 1.0 && !exact_body) {
         dbg_path = DBG_PATH_NO_BACK;
         return backdrop_along(p, t1);
     }
@@ -68,6 +81,10 @@ fn refract_scene(
         let ex = water_exit(p, t1);
         if (ex.blocked) {
             dbg_path = DBG_PATH_BLOCKED;
+            if (ex.body.t > 0.0) {
+                refracted_path = ex.body.t;
+                return body_radiance(p, t1, ex.body);
+            }
             return background_at(ex.blocked_uv, front_depth_raw, straight);
         }
         p_exit = ex.point;
@@ -94,8 +111,14 @@ fn refract_scene(
     probe_event(PRB_SECOND, t2, n_exit, dbg_water_path);
     if (dot(t2, t2) < 0.5) {
         // Total internal reflection: in bulk water, follow the mirror bounce;
-        // inside a thin drop or crest the next interface isn't knowable here
-        if (distance(p, p_exit) < TIR_MIN_BODY) {
+        // inside a thin drop or crest the next interface is not knowable in
+        // screen space. A short path that ends on a tank wall or the floor is
+        // not a thin body but the edge of the bulk (a ray entering one wall
+        // right next to another), and the world-space test follows its
+        // mirror like any other: taken as thin, every edge of the tank showed
+        // a band of the unrefracted view, like a frame around each face.
+        let bulk_edge = exit_on_wall && water.volume_trace != 0u;
+        if (distance(p, p_exit) < TIR_MIN_BODY && !bulk_edge) {
             dbg_path = DBG_PATH_THIN_TIR;
             dbg_end = DBG_END_STRAIGHT;
             look_kind = LOOK_NONE;

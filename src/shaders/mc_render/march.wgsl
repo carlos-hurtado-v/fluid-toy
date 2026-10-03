@@ -21,6 +21,9 @@ fn screen_point(p: vec3<f32>) -> vec3<f32> {
 // Distance along the ray at which the last march_to_background found its
 // surface (-1: none)
 var<private> march_dist: f32 = -1.0;
+// The body the last march_to_background ended on (t < 0: it did not): the
+// caller shades it (body_radiance) instead of reading the screen at xy
+var<private> march_body: BodyHit = NO_BODY_HIT;
 // In-water path of the refracted ray where it is known better than from the
 // depth buffers at the pixel (-1: not set). The medium otherwise measures to
 // the nearer of back face and opaque surface along the VIEW ray, which is
@@ -31,9 +34,11 @@ var<private> missed_inside: bool = false;
 
 fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0: f32) -> vec3<f32> {
     march_dist = -1.0;
+    march_body = NO_BODY_HIT;
     var reach = MARCH_REACH * distance(origin, screen_to_world(uv0, depth0)) + 0.1;
     // A body on the way ends the ray exactly where the depth buffer can't see
-    let t_body = ray_body_hit(origin, dir, reach);
+    let body_hit = ray_body_hit(origin, dir, reach);
+    let t_body = body_hit.t;
     if (t_body > 0.0) {
         reach = t_body;
     }
@@ -56,7 +61,7 @@ fn march_to_background(origin: vec3<f32>, dir: vec3<f32>, uv0: vec2<f32>, depth0
         lo = s;
     }
     if (hi < 0.0 && t_body > 0.0) {
-        dbg_body = true;
+        march_body = body_hit;
         let body_uv = screen_point(origin + dir * t_body).xy;
         march_dist = t_body;
         probe_event(PRB_MARCH_END, vec3<f32>(body_uv, 1.0), vec3<f32>(lo, hi, t_body), 0.0);

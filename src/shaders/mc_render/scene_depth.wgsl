@@ -1,4 +1,4 @@
-// Water shader (mc_render), part: depth-buffer reads, analytic rigid bodies, smooth G-buffer normals
+// Water shader (mc_render), part: depth-buffer reads, smooth G-buffer normals
 
 // Linearize depth from depth buffer (reverse-Z or standard)
 fn linearize_depth(d: f32, near: f32, far: f32) -> f32 {
@@ -45,90 +45,6 @@ fn depth_smooth(tex: texture_depth_2d, uv: vec2<f32>) -> f32 {
         return textureLoad(tex, texel_at(uv, vec2<u32>(dims)), 0);
     }
     return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
-}
-
-// === Rigid bodies as exact occluders ===
-// The depth buffer holds only the camera-facing side of a body, so a refracted
-// or mirrored ray that meets a body's far side (seen from the camera) finds
-// nothing there: the body turns into a hollow outline. Spheres and boxes are
-// intersected exactly instead; the hit point's screen position supplies the
-// colour (the visible side, a fair stand-in for the hidden one). Other shapes
-// are left to the depth buffer.
-const SHAPE_CUBE: u32 = 0u;
-const SHAPE_SPHERE: u32 = 1u;
-// Water wets a body, but the MC surface stops about a particle radius short of
-// it. A ray leaving the water this close in front of a body hits the body:
-// refracting into that air film painted ragged fringes around submerged
-// bodies (m)
-const BODY_WET_GAP: f32 = 0.05;
-// How far a ray that has left the water may travel to a body (m)
-const BODY_MAX_REACH: f32 = 50.0;
-
-// Distance along the ray to the nearest enabled sphere or box within
-// max_dist, or -1. Rays starting inside a body ignore it.
-fn ray_body_hit(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> f32 {
-    var best = -1.0;
-    let n = min(water.body_count, 8u);
-    for (var i = 0u; i < n; i++) {
-        let body = rigid_bodies[i];
-        var t = -1.0;
-        if (body.shape == SHAPE_SPHERE) {
-            let oc = origin - body.position;
-            let b = dot(oc, dir);
-            let c = dot(oc, oc) - body.half_extent * body.half_extent;
-            let disc = b * b - c;
-            if (c > 0.0 && disc >= 0.0) {
-                t = -b - sqrt(disc);
-            }
-        } else if (body.shape == SHAPE_CUBE) {
-            // Slab test in body-local space (rotation rows map world -> local)
-            let q = origin - body.position;
-            let ro = vec3<f32>(dot(body.rot_row0.xyz, q), dot(body.rot_row1.xyz, q), dot(body.rot_row2.xyz, q));
-            let rd = vec3<f32>(dot(body.rot_row0.xyz, dir), dot(body.rot_row1.xyz, dir), dot(body.rot_row2.xyz, dir));
-            let he = vec3<f32>(body.half_extent);
-            let safe_rd = select(rd, vec3<f32>(1e-6), abs(rd) < vec3<f32>(1e-6));
-            let inv = vec3<f32>(1.0) / safe_rd;
-            let t1 = (-he - ro) * inv;
-            let t2 = (he - ro) * inv;
-            let t_near = max(max(min(t1.x, t2.x), min(t1.y, t2.y)), min(t1.z, t2.z));
-            let t_far = min(min(max(t1.x, t2.x), max(t1.y, t2.y)), max(t1.z, t2.z));
-            if (t_near > 0.0 && t_near <= t_far) {
-                t = t_near;
-            }
-        }
-        if (t > 0.0 && t <= max_dist && (best < 0.0 || t < best)) {
-            best = t;
-        }
-    }
-    return best;
-}
-
-// Distance from an exactly intersected body within which a depth-buffer
-// surface point is taken to be that body (tessellation + depth precision) (m)
-const BODY_SURFACE_EPS: f32 = 0.02;
-
-// Signed distance from a world point to the nearest body that ray_body_hit
-// handles (negative inside), or a large value if there is none
-fn analytic_body_distance(p: vec3<f32>) -> f32 {
-    var best = 1e6;
-    let n = min(water.body_count, 8u);
-    for (var i = 0u; i < n; i++) {
-        let body = rigid_bodies[i];
-        if (body.shape == SHAPE_SPHERE) {
-            best = min(best, distance(p, body.position) - body.half_extent);
-        } else if (body.shape == SHAPE_CUBE) {
-            let q = p - body.position;
-            let lp = vec3<f32>(dot(body.rot_row0.xyz, q), dot(body.rot_row1.xyz, q), dot(body.rot_row2.xyz, q));
-            let d = abs(lp) - vec3<f32>(body.half_extent);
-            best = min(best, length(max(d, vec3<f32>(0.0))) + min(max(d.x, max(d.y, d.z)), 0.0));
-        }
-    }
-    return best;
-}
-
-// Is this world point on the surface of a body that ray_body_hit handles?
-fn on_analytic_body(p: vec3<f32>) -> bool {
-    return abs(analytic_body_distance(p)) < BODY_SURFACE_EPS;
 }
 
 // Back-face normal at a screen point, bilinear between texel centres over the
@@ -193,9 +109,10 @@ const SURFACE_CONTACT_REL: f32 = 0.05;
 // pixel, i.e. has a march reached it? The depth buffer has no thickness, so
 // for a body this would also catch rays passing BEHIND it (as the camera sees
 // it) and land them on its silhouette edge: whole regions of a reflection or
-// refraction then sampled those edge pixels (dithered stripes). Spheres and
-// boxes are intersected exactly instead (ray_body_hit), so their pixels are
-// skipped here. Floors, walls and the ground are solid: behind is a hit.
+// refraction then sampled those edge pixels (dithered stripes). The
+// procedural shapes are intersected exactly instead (ray_body_hit), so their
+// pixels are skipped here. Floors, walls and the ground are solid: behind is
+// a hit.
 fn behind_background(q: vec3<f32>) -> bool {
     let bg = depth_smooth(background_depth_tex, q.xy);
     prb_bg = bg;

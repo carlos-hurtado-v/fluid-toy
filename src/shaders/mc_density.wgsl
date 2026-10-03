@@ -2,6 +2,8 @@
 // Uses SPH spatial hash grid for O(1) neighbor lookups per voxel
 // instead of brute-force O(N) particle iteration.
 // Applies boundary gamma correction so the iso-surface extends to container walls.
+// container_common.wgsl, body_shapes_common.wgsl and field_bodies_common.wgsl
+// are prepended.
 
 struct SphParticle3D {
     position: vec3<f32>,
@@ -67,6 +69,8 @@ struct ParticleAniso {
 @group(0) @binding(6) var<uniform> sph_grid: SphGridParams;
 @group(0) @binding(7) var<storage, read> aniso: array<ParticleAniso>;
 @group(0) @binding(8) var<uniform> aniso_params: AnisoParams;
+// Rigid bodies the field ends on (field_bodies_common.wgsl)
+@group(0) @binding(9) var<storage, read> field_bodies: array<FieldBody>;
 
 // Poly6 kernel for density estimation
 fn poly6_kernel(r_sq: f32, h: f32) -> f32 {
@@ -142,6 +146,20 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let h_sq = h * h;
     let aniso_on = aniso_params.enabled != 0u;
 
+    // Mark voxels outside the container, and those inside a rigid body or in
+    // the band around it, with a sentinel (-1). The smoothing passes skip
+    // sentinels: a wall or a body is not a water/air edge, and filtering
+    // across it would round the free surface off toward it (a valley as wide
+    // as the filter). mc_wall_bound.wgsl turns the sentinel into geometry
+    // before mesh generation: the mesh's sides at a wall, the water's field
+    // continued into a body.
+    let band = FIELD_BODY_BAND * h;
+    if (!is_inside_box(container, world_to_local(container, world_pos), 0.0)
+        || field_body_distance(world_pos, band).x < band) {
+        textureStore(density_field, vec3<i32>(global_id), vec4<f32>(-1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
     // Map this voxel's world position to SPH grid cell
     let center_cell = position_to_sph_cell(world_pos);
 
@@ -211,17 +229,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 }
             }
         }
-    }
-
-    // Mark voxels outside the container with a sentinel (-1). The smoothing
-    // passes skip sentinels: a wall is not a water/air edge, and filtering
-    // across it would round the free surface off toward the wall (a valley as
-    // wide as the filter). mc_wall_bound.wgsl turns the sentinel into the
-    // mesh's sides before mesh generation.
-    let local = world_to_local(container, world_pos);
-    if (!is_inside_box(container, local, 0.0)) {
-        textureStore(density_field, vec3<i32>(global_id), vec4<f32>(-1.0, 0.0, 0.0, 0.0));
-        return;
     }
 
     // Boundary gamma correction: near container walls, the kernel support

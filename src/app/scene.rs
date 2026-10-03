@@ -193,24 +193,21 @@ impl App {
         }
     }
 
-    /// Marching cubes: field + mesh generation, whitewater field, caustics,
-    /// then the water pass (scene objects go into its passes)
-    fn render_marching_cubes(&mut self, encoder: &mut wgpu::CommandEncoder, render_target: &wgpu::TextureView) {
-        // Rebind the whitewater splat depth gate to the MC front
-        // depth after a mode switch or resize
-        self.bind_spray_depth_gate(FluidRenderMode::MarchingCubes);
-
-        // Marching cubes surface mesh rendering
-        let Some(mc_geom) = self.update_marching_cubes() else {
+    /// The water's geometry for this frame, ahead of the rest of the render
+    /// (frame.rs `submit_early_passes`): in marching-cubes mode the density
+    /// field and the mesh. Depends on the particles and the frame's
+    /// parameters, not on where the rigid bodies are.
+    pub(super) fn generate_fluid_geometry(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.mc_geom = None;
+        if self.state.rendering.render_mode != FluidRenderMode::MarchingCubes {
             return;
-        };
-
+        }
+        self.mc_geom = self.update_marching_cubes();
+        if self.mc_geom.is_none() {
+            return;
+        }
         let gpu = self.gpu.as_ref().unwrap();
-        let Some(sph_sim) = &self.sph_simulation else {
-            return;
-        };
-        let caustics_on = self.caustics_active();
-        if let Some(mc_renderer) = &mut self.mc_renderer {
+        if let (Some(sph_sim), Some(mc_renderer)) = (&self.sph_simulation, &mut self.mc_renderer) {
             mc_renderer.generate(
                 encoder,
                 &gpu.device,
@@ -223,6 +220,22 @@ impl App {
                 self.state.rendering.mc_anisotropy,
                 self.state.rendering.mc_calm_smoothing,
             );
+        }
+    }
+
+    /// Marching cubes, after `generate_fluid_geometry`: whitewater field,
+    /// caustics, then the water pass (scene objects go into its passes)
+    fn render_marching_cubes(&mut self, encoder: &mut wgpu::CommandEncoder, render_target: &wgpu::TextureView) {
+        // Rebind the whitewater splat depth gate to the MC front
+        // depth after a mode switch or resize
+        self.bind_spray_depth_gate(FluidRenderMode::MarchingCubes);
+
+        let Some(mc_geom) = self.mc_geom.take() else {
+            return;
+        };
+        let gpu = self.gpu.as_ref().unwrap();
+        let caustics_on = self.caustics_active();
+        if let Some(mc_renderer) = &mut self.mc_renderer {
             // Splat foam into the density field the water shader
             // composites (cleared even when spray is off so no
             // stale foam lingers on the surface)
@@ -337,6 +350,15 @@ impl App {
             &env_params,
             self.state.rendering.mc_filtered_lookup,
             self.state.rendering.mc_volume_trace,
+            // What refraction rays can only find in the depth buffer: the
+            // pool's walls and floor, and Custom (mesh) bodies. Every other
+            // body is intersected exactly.
+            self.state.container.style == ContainerStyle::OpaquePool
+                || self
+                    .state
+                    .rigid_bodies
+                    .iter()
+                    .any(|b| b.enabled && b.shape == crate::state::RigidBodyShape::Custom),
         );
         mc_renderer.update_env_params(&gpu.queue, &env_params);
         mc_renderer.set_ssr_enabled(&gpu.queue, self.state.rendering.ssr_enabled);
@@ -463,7 +485,8 @@ impl App {
             ground_capture_height: 0.0,
             filtered_lookup: 0,
             volume_trace: 0,
-            _pad_g: [0; 2],
+            depth_occluders: 0,
+            _pad_g: 0,
         }
     }
 }

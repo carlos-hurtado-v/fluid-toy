@@ -11,11 +11,11 @@
     "src/render/screen_space_fluid.rs::new": 946,
     "src/render/screen_space_fluid.rs::render": 354,
     "src/render/spray_renderer.rs::new": 364,
-    "src/shaders/mc_render/main.wgsl::fs_main": 360,
+    "src/shaders/mc_render/main.wgsl::fs_main": 358,
     "src/shaders/sph_integrate_3d.wgsl::main": 341,
     "src/shaders/ss_composite.wgsl::fs_main": 274,
-    "src/simulation/sph_3d_grid.rs": 1678,
-    "src/simulation/sph_3d_grid.rs::new": 1199,
+    "src/simulation/sph_3d_grid.rs": 1658,
+    "src/simulation/sph_3d_grid.rs::new": 1191,
     "src/simulation/spray.rs::new": 239
   }
 }

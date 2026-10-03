@@ -1,6 +1,7 @@
 //! Simulation module - physics computation on GPU
 
 pub mod body_contact;
+pub mod body_forces;
 pub mod body_shapes;
 pub mod foam_map;
 pub mod particle;

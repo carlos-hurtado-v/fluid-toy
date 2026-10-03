@@ -1,10 +1,11 @@
-// Marching Cubes - Container wall bound
+// Marching Cubes - Container wall and rigid body bound
 //
 // Last field pass before mesh generation: makes the water end ON the
-// container walls. Until here, voxels outside the container hold a sentinel
-// (-1, see mc_density.wgsl) that the smoothing filters skip, so a wall is not
-// a water/air edge to them and the surface stays flat right up to it. This
-// pass turns the sentinel into geometry:
+// container walls, and run INTO the rigid bodies. Until here, voxels outside
+// the container or in a body hold a sentinel (-1, see mc_density.wgsl) that
+// the smoothing filters skip, so a wall or a body is not a water/air edge to
+// them and the surface stays flat right up to it. This pass turns the
+// sentinel into geometry. At a wall:
 //
 //   final = min(field extended across the wall, wall ramp)
 //
@@ -16,7 +17,13 @@
 // inside, so the free surface runs straight into the wall rather than
 // rounding off toward it.
 //
-// container_common.wgsl is prepended (ContainerGeometry, world_to_local).
+// A body is opaque and drawn by its own renderer, so it needs no ramp: its
+// voxels take the field of the nearest point just outside its band
+// (field_bodies_common.wgsl), i.e. the water continues into the body at the
+// level it has next to it, and the body hides where the mesh ends.
+//
+// container_common.wgsl, body_shapes_common.wgsl and
+// field_bodies_common.wgsl are prepended.
 
 struct GridParams {
     grid_min: vec3<f32>,
@@ -45,18 +52,31 @@ struct BoundParams {
 @group(0) @binding(2) var<uniform> params: GridParams;
 @group(0) @binding(3) var<uniform> container: ContainerGeometry;
 @group(0) @binding(4) var<uniform> bound: BoundParams;
+@group(0) @binding(5) var<storage, read> field_bodies: array<FieldBody>;
 
 // Voxels deeper inside than this keep their value untouched (cells)
 const RAMP_REACH: f32 = 2.0;
 // Voxels further outside than this hold no extension, just the ramp (cells)
 const EXTEND_REACH: f32 = 2.0;
 
-// The filtered field at the nearest point one cell inside the walls: trilinear
-// over the in-container voxels around it.
+// The filtered field at the nearest point one cell inside the walls and one
+// cell outside any body's band: trilinear over the voxels around it that hold
+// a value.
 fn extended_field(local: vec3<f32>) -> f32 {
     let half = vec3<f32>(container.half_width, container.half_height, container.half_depth);
     let lim = max(half - params.cell_size, vec3<f32>(0.0));
-    let q = local_to_world(container, clamp(local, -lim, lim));
+    var q = local_to_world(container, clamp(local, -lim, lim));
+    // Out of a body, sideways (field_body_push). Twice: the first push can
+    // land in the band of a body that touches this one.
+    let clearance = FIELD_BODY_BAND * params.kernel_radius + params.cell_size;
+    for (var i = 0; i < 2; i++) {
+        let body = field_body_distance(q, clearance);
+        if (body.x >= clearance) {
+            break;
+        }
+        q = field_body_push(q, u32(body.y), body.x, clearance);
+    }
+    q = local_to_world(container, clamp(world_to_local(container, q), -lim, lim));
     let g = (q - params.grid_min) / params.cell_size;
     let g0 = vec3<i32>(floor(g));
     let f = g - floor(g);
@@ -97,6 +117,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
+    // (a sentinel inside the walls is a rigid body's voxel)
     var field = value;
     if (value < 0.0) {
         field = 0.0;

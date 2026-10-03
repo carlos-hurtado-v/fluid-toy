@@ -86,6 +86,13 @@ fn mc_surface(ui: &mut egui::Ui, state: &mut AppState, action: &mut GuiAction) {
          more than half this angle; geometry untouched. Needs Calm\n\
          Surface Smoothing. 0 = off.",
     );
+    ui.checkbox(&mut state.rendering.mc_wet_bodies, "Water Meets Bodies")
+        .on_hover_text(
+            "The water surface runs into rigid bodies at the level it has\n\
+             next to them (cube, sphere, cylinder, torus, propeller).\n\
+             Off: the surface stops short of a body and sinks toward it,\n\
+             a moat a few centimetres deep at every waterline.",
+        );
     ui.add(
         egui::Slider::new(&mut state.rendering.mc_density_radius_scale, 1.0..=3.0)
             .text("Density Radius Scale")

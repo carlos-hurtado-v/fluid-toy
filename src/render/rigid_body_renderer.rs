@@ -202,7 +202,7 @@ impl RigidBodyRenderer {
                 format!(
                     "{}\n{}\n{}",
                     container_common,
-                    include_str!("../shaders/sh_common.wgsl"),
+                    concat!(include_str!("../shaders/sh_common.wgsl"), "\n", include_str!("../shaders/body_shading_common.wgsl")),
                     include_str!("../shaders/rigid_body.wgsl")
                 )
                 .into(),
@@ -462,7 +462,7 @@ impl RigidBodyRenderer {
                 format!(
                     "{}\n{}\n{}",
                     include_str!("../shaders/container_common.wgsl"),
-                    include_str!("../shaders/sh_common.wgsl"),
+                    concat!(include_str!("../shaders/sh_common.wgsl"), "\n", include_str!("../shaders/body_shading_common.wgsl")),
                     include_str!("../shaders/rigid_body_mesh.wgsl")
                 )
                 .into(),

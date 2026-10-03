@@ -22,47 +22,6 @@ const NORMAL_WALL_INSET: f32 = 4.0;
 // this close to the start, are the ray still getting under the surface (m)
 const VOLUME_ENTRY_SLACK: f32 = 0.03;
 
-// p moved out of the dry film the mesh leaves around a sphere or box, to the
-// film's outer edge straight out from the body. Water wets a body: the film
-// is water wherever the water next to it is.
-fn body_film_push(p: vec3<f32>) -> vec3<f32> {
-    var q = p;
-    let n = min(water.body_count, 8u);
-    for (var i = 0u; i < n; i++) {
-        let body = rigid_bodies[i];
-        if (body.shape == SHAPE_SPHERE) {
-            let c = q - body.position;
-            let dist = length(c);
-            if (dist - body.half_extent < BODY_WET_GAP && dist > 1e-5) {
-                q = body.position + c * ((body.half_extent + BODY_WET_GAP) / dist);
-            }
-        } else if (body.shape == SHAPE_CUBE) {
-            let c = q - body.position;
-            let lp = vec3<f32>(dot(body.rot_row0.xyz, c), dot(body.rot_row1.xyz, c), dot(body.rot_row2.xyz, c));
-            let d = abs(lp) - vec3<f32>(body.half_extent);
-            let outside = max(d, vec3<f32>(0.0));
-            let sdf = length(outside) + min(max(d.x, max(d.y, d.z)), 0.0);
-            if (sdf < BODY_WET_GAP) {
-                // Outward direction: away from the nearest point of the box
-                var dir_l = outside * sign(lp);
-                if (dot(dir_l, dir_l) < 1e-10) {
-                    // Inside: through the nearest face
-                    if (d.x >= d.y && d.x >= d.z) {
-                        dir_l = vec3<f32>(sign(lp.x), 0.0, 0.0);
-                    } else if (d.y >= d.z) {
-                        dir_l = vec3<f32>(0.0, sign(lp.y), 0.0);
-                    } else {
-                        dir_l = vec3<f32>(0.0, 0.0, sign(lp.z));
-                    }
-                }
-                let moved = lp + normalize(dir_l) * (BODY_WET_GAP - sdf);
-                q = body.position + body.rot_row0.xyz * moved.x + body.rot_row1.xyz * moved.y + body.rot_row2.xyz * moved.z;
-            }
-        }
-    }
-    return q;
-}
-
 // Where the field is read for world point p: out of any body's film, and
 // inside the container by `inset_cells` (sides, floor and top)
 fn volume_point(p: vec3<f32>, inset_cells: f32) -> vec3<f32> {
@@ -236,17 +195,21 @@ fn water_normal(p: vec3<f32>) -> vec4<f32> {
 }
 
 // What a point on a ray inside the water has run into: (kind, field / iso).
-// Kinds as trace_event: 0 in the water, 1 out of it, 2 an opaque surface (the
-// depth buffer still owns those: pool walls, bodies that ray_body_hit does
-// not intersect; unknown off screen).
+// Kinds as trace_event: 0 in the water, 1 out of it, 2 an opaque surface that
+// only the depth buffer knows (water.depth_occluders: pool walls, Custom
+// bodies; unknown off screen). In a glass tank with procedural bodies there
+// is none: ray_body_hit bounds the ray, and the test (five texel loads a
+// sample) is skipped.
 fn volume_event(p: vec3<f32>) -> vec2<f32> {
-    let q = screen_point(p);
     prb_bg = -1.0;
-    if (all(q.xy >= vec2<f32>(0.0)) && all(q.xy <= vec2<f32>(1.0))) {
-        let bg = depth_smooth(background_depth_tex, q.xy);
-        prb_bg = bg;
-        if (q.z >= bg && (water.body_count == 0u || !on_analytic_body(screen_to_world(q.xy, bg)))) {
-            return vec2<f32>(2.0, 0.0);
+    if (water.depth_occluders != 0u) {
+        let q = screen_point(p);
+        if (all(q.xy >= vec2<f32>(0.0)) && all(q.xy <= vec2<f32>(1.0))) {
+            let bg = depth_smooth(background_depth_tex, q.xy);
+            prb_bg = bg;
+            if (q.z >= bg && (water.body_count == 0u || !on_analytic_body(screen_to_world(q.xy, bg)))) {
+                return vec2<f32>(2.0, 0.0);
+            }
         }
     }
     let d = water_density(p);

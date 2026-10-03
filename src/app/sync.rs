@@ -324,7 +324,7 @@ impl App {
                 }
                 rb_renderer.update_bodies(&gpu.queue, &renders, &draws);
                 if let Some(mc_renderer) = &self.mc_renderer {
-                    mc_renderer.update_bodies(&gpu.queue, &renders);
+                    mc_renderer.update_bodies(&gpu.queue, &renders, self.state.rendering.mc_wet_bodies);
                 }
             }
             if let Some(spray_renderer) = &self.spray_renderer {

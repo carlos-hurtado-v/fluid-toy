@@ -33,32 +33,6 @@ fn background_at(uv: vec2<f32>, front_depth_raw: f32, straight: vec3<f32>) -> ve
     return textureSampleLevel(background_tex, env_sampler, uv, 0.0).rgb;
 }
 
-// Distance around the container box that still counts as its walls, rim or
-// contents (pool shell is 6 cm) (m)
-const BACKDROP_OBJECT_MARGIN: f32 = 0.1;
-
-// Does the background image at this uv show the backdrop (sky, or the
-// projected ground) rather than an object at finite distance? A body or the
-// pool walls sitting where a direction vanishes on screen are not what lies
-// infinitely far along that direction: rays leaving the water toward the sky
-// picked up the floating ball there, striped by whichever rays landed on it.
-fn shows_backdrop(uv: vec2<f32>) -> bool {
-    let depth = background_depth_at(uv);
-    if (depth >= BACKDROP_DEPTH) {
-        return true;
-    }
-    let p = screen_to_world(uv, depth);
-    if (water.body_count > 0u && on_analytic_body(p)) {
-        return false;
-    }
-    // In or around the container box, but not the ground plane at (tank) or
-    // below (pool) its floor
-    let l = world_to_local(container, p);
-    let m = BACKDROP_OBJECT_MARGIN;
-    return !(abs(l.x) <= container.half_width + m && abs(l.z) <= container.half_depth + m
-        && l.y > -container.half_height + 0.01 && l.y <= container.half_height + m);
-}
-
 // The projected ground's radiance at a point on it (keep in sync with
 // ground_radiance in mc_environment.wgsl: the map read from its capture
 // point, the nadir patch re-read from a shifted one)
@@ -110,9 +84,8 @@ fn march_hit_before_ground(hit: bool, t_ground: f32) -> bool {
 // point, with parallax): the map along the direction is the ground at
 // infinity, i.e. the horizon's hills and trees where grass belongs. That
 // seam ran along every lookup that left the screen (snap_004: a gray panel
-// with ragged tabs inside a side-wall mirror). Otherwise: the background
-// texture where the direction lands on screen (matches the displayed backdrop
-// exactly) when the backdrop is what shows there, else the map directly.
+// with ragged tabs inside a side-wall mirror). Otherwise the backdrop pass's
+// own radiance: the map along the direction, or the solid colour.
 // The pool's contact occlusion on the ground is not applied here.
 fn backdrop_along(origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let t_ground = ground_distance(origin, dir);
@@ -124,21 +97,7 @@ fn backdrop_along(origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         probe_event(PRB_BACKDROP, vec3<f32>(-1.0, -1.0, 0.0), dir, f32(dbg_end));
         return max(ground_radiance(hit) * water.env_intensity, vec3<f32>(0.0));
     }
-    let clip = camera.projection * camera.view * vec4<f32>(dir, 0.0);
-    var vanishing = vec3<f32>(-1.0, -1.0, 0.0);
-    if (clip.w > 1e-4) {
-        let ndc = clip.xy / clip.w;
-        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        vanishing = vec3<f32>(uv, 0.0);
-        if (all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0)) && shows_backdrop(uv)) {
-            dbg_end = DBG_END_SCREEN_SKY;
-            dbg_uv = uv;
-            look_kind = LOOK_SCREEN;
-            look_uv = uv;
-            probe_event(PRB_BACKDROP, vec3<f32>(uv, 1.0), dir, f32(dbg_end));
-            return textureSampleLevel(background_tex, env_sampler, uv, 0.0).rgb;
-        }
-    }
+    let vanishing = vec3<f32>(-1.0, -1.0, 0.0);
     if (water.use_env_background == 0u) {
         dbg_end = DBG_END_SOLID;
         look_kind = LOOK_NONE;

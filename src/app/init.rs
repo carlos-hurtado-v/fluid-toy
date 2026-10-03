@@ -144,7 +144,14 @@ impl App {
 
     pub(super) fn initialize(&mut self, window: Arc<Window>) {
         // Automation runs render uncapped (no vsync wait between frames)
-        let gpu = pollster::block_on(GpuContext::new(window.clone(), self.launch.is_automated()));
+        let gpu = pollster::block_on(GpuContext::new(
+            window.clone(),
+            self.launch.is_automated(),
+            self.launch.profile_path.is_some(),
+        ));
+        if let Some(path) = &self.launch.profile_path {
+            crate::gpu::profile::init(&gpu.device, &gpu.queue, path.clone());
+        }
 
         // Initialize camera from state
         self.camera.distance = self.state.camera.distance;

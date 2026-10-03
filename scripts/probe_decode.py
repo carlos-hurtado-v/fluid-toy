@@ -56,7 +56,7 @@ EVENTS = {
     1: "FRAG", 2: "NORMAL", 3: "REFRACT_IN", 4: "SECOND",
     10: "EXIT_BEGIN", 11: "EXIT_BOX", 12: "TRACE", 13: "TRACE_REFINE", 14: "TRACE_END",
     15: "EXIT_CROSS", 16: "EXIT_END", 17: "EXIT_INSIDE", 18: "SILHOUETTE", 19: "HIDDEN",
-    20: "BOUNCE", 21: "VTRACE", 22: "VTRACE_REFINE",
+    20: "BOUNCE", 21: "VTRACE", 22: "VTRACE_REFINE", 23: "BODY",
     30: "MARCH_BEGIN", 31: "MARCH", 32: "MARCH_REFINE", 33: "MARCH_END",
     40: "SCENE", 41: "BACKDROP", 42: "LOOKUP",
     50: "RESULT", 51: "COLOR",
@@ -99,8 +99,11 @@ def fmt_event(e):
                 f"bg={b[0]:.7f} z-bg={a[2] - b[0]:+.2e} {back}{front} -> {kind}")
     if tag in (21, 22):
         kind = KIND.get(int(round(b[2])), "?")
-        bg = f"bg={b[1]:.7f}" if b[1] >= 0 else "off screen"
+        # (no depth test: off screen, or nothing in the depth buffer to test against)
+        bg = f"bg={b[1]:.7f}" if b[1] >= 0 else "bg untested"
         return f"{name:12s} s={c:.4f} p={v3(a)} field/iso={b[0]:.4f} {bg} -> {kind}"
+    if tag == 23:
+        return f"{name:12s} hit={v3(a)} normal={v3(b)} body #{int(round(c))}: shaded at the hit"
     if tag == 14:
         return (f"{name:12s} kind={KIND.get(int(round(a[0])), '?')} dist_in={a[1]:.4f} "
                 f"dist={a[2]:.4f} uv=({b[0]:.5f}, {b[1]:.5f}) max={c:.4f}")

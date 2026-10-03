@@ -15,6 +15,28 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
+// What a reflected ray (origin on the water surface, unit dir) meets before
+// the environment: rgb + confidence.
+// A rigid body is met exactly and shaded at the hit, as in the refraction
+// (bodies.wgsl): confidence 1. The screen-space march knows a body by its
+// camera-facing skin only: it showed that side where the reflected ray meets
+// an underside, and its coarse steps hatched the image (the water inside a
+// torus's hole).
+// Everything else is the screen-space reflection (the ground, pool walls;
+// also its false hits on rays that pass behind a body's outline), weaker on
+// rough water: a sharp reflection looks wrong there.
+fn near_reflection(screen_uv: vec2<f32>, origin: vec3<f32>, dir: vec3<f32>, roughness_sq: f32) -> vec4<f32> {
+    if (water.body_count > 0u) {
+        let body = ray_body_hit(origin, dir, BODY_MAX_REACH);
+        if (body.t > 0.0) {
+            return vec4<f32>(body_shade(origin, dir, body), 1.0);
+        }
+    }
+    let ssr_dims = vec2<f32>(textureDimensions(ssr_tex));
+    let ssr_sample = textureLoad(ssr_tex, vec2<i32>(screen_uv * ssr_dims), 0);
+    return vec4<f32>(ssr_sample.rgb, ssr_sample.a * (1.0 - roughness_sq));
+}
+
 @fragment
 fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     // Clip to container bounds with margin (MC interpolation can place vertices
@@ -124,13 +146,11 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
         below_horizon = 1.0 - horizon_fade;
     }
 
-    // Screen-space reflections — blend with env map based on SSR confidence
-    // Reduce SSR contribution for rough surfaces (sharp reflections look wrong on rough water)
-    let ssr_dims = textureDimensions(ssr_tex);
-    let ssr_coord = vec2<i32>(screen_uv * vec2<f32>(f32(ssr_dims.x), f32(ssr_dims.y)));
-    let ssr_sample = textureLoad(ssr_tex, ssr_coord, 0);
-    let ssr_confidence = ssr_sample.a * (1.0 - roughness_sq);
-    reflection_color = mix(reflection_color, ssr_sample.rgb, ssr_confidence);
+    // What the reflected ray meets nearby (a rigid body, the screen-space
+    // reflection) over the environment, by its confidence
+    let near = near_reflection(screen_uv, input.world_position, reflect_dir, roughness_sq);
+    let ssr_confidence = near.w;
+    reflection_color = mix(reflection_color, near.rgb, near.w);
 
     // === SCREEN-SPACE REFRACTION ===
     var refracted_background: vec3<f32>;
@@ -358,7 +378,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
     // What the debug views would show, plus the shaded result (probe only)
     probe_event(
         PRB_RESULT,
-        vec3<f32>(f32(dbg_path), f32(select(dbg_end, DBG_END_BODY, dbg_body)), f32(dbg_bounces)),
+        vec3<f32>(f32(dbg_path), f32(dbg_end), f32(dbg_bounces)),
         vec3<f32>(dbg_uv, f32(dbg_exit_kind)),
         f32(dbg_mirror_kind),
     );

@@ -63,7 +63,11 @@ pub struct GpuWaterParams {
     pub filtered_lookup: u32,
     /// rendering.mc_volume_trace
     pub volume_trace: u32,
-    pub _pad_g: [u32; 2],
+    /// 1 = the depth buffer holds opaque surfaces the refraction tracer does
+    /// not know exactly (pool walls and floor, a Custom body) and rays are
+    /// tested against it; 0 = glass tank with procedural bodies only
+    pub depth_occluders: u32,
+    pub _pad_g: u32,
 }
 
 impl Default for GpuWaterParams {
@@ -97,7 +101,8 @@ impl Default for GpuWaterParams {
             ground_capture_height: 0.0,
             filtered_lookup: 0,
             volume_trace: 0,
-            _pad_g: [0; 2],
+            depth_occluders: 1,
+            _pad_g: 0,
         }
     }
 }
@@ -380,6 +385,7 @@ fn create_volume_bind_groups(
 const WATER_SHADER_PARTS: &[&str] = &[
     include_str!("../shaders/mc_render/bindings.wgsl"),
     include_str!("../shaders/mc_render/scene_depth.wgsl"),
+    include_str!("../shaders/mc_render/bodies.wgsl"),
     include_str!("../shaders/mc_render/debug_records.wgsl"),
     include_str!("../shaders/mc_render/backdrop.wgsl"),
     include_str!("../shaders/mc_render/march.wgsl"),
@@ -402,6 +408,8 @@ const WATER_SHADER_COMMON: &[&str] = &[
     include_str!("../shaders/noise_common.wgsl"),
     include_str!("../shaders/sh_common.wgsl"),
     include_str!("../shaders/octahedral_common.wgsl"),
+    include_str!("../shaders/body_shapes_common.wgsl"),
+    include_str!("../shaders/body_shading_common.wgsl"),
 ];
 
 /// The water shader: the shared snippets + a pixel-probe snippet + the

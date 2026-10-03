@@ -39,7 +39,7 @@ pub enum RigidBodyMotion {
 }
 
 // Propeller proportions in units of half_extent (body-local, spin axis = Y).
-// Mesh generation (rigid_body.wgsl) and the SDF (sph_integrate_3d.wgsl) must
+// Mesh generation (rigid_body.wgsl) and the shapes (body_shapes_common.wgsl) must
 // stay in sync with these.
 pub const PROP_HUB_RADIUS: f32 = 0.25;
 pub const PROP_HUB_HALF_HEIGHT: f32 = 0.30;

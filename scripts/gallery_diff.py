@@ -21,7 +21,9 @@ from PIL import Image
 def gallery(base, new):
     views = sorted(d for d in os.listdir(new) if os.path.isdir(os.path.join(new, d)))
     for view in views:
-        for var in ("original", "default", "continue"):
+        # Every variant both runs rendered (the gallery's variant names are
+        # its own business: --variant replaces the defaults)
+        for var in sorted(os.listdir(os.path.join(new, view))):
             pa = f"{base}/{view}/{var}/frame_00030.png"
             pb = f"{new}/{view}/{var}/frame_00030.png"
             if not (os.path.exists(pa) and os.path.exists(pb)):
@@ -31,9 +33,9 @@ def gallery(base, new):
             d = np.abs(a - b).max(axis=2) > 8
             ys, xs = np.nonzero(d)
             if len(xs) == 0:
-                print(f"{view:22s} {var:9s}      0 px")
+                print(f"{view:22s} {var:10s}      0 px")
             else:
-                print(f"{view:22s} {var:9s} {d.sum():6d} px {100 * d.mean():6.3f}%  bbox {xs.min()},{ys.min()} - {xs.max()},{ys.max()}")
+                print(f"{view:22s} {var:10s} {d.sum():6d} px {100 * d.mean():6.3f}%  bbox {xs.min()},{ys.min()} - {xs.max()},{ys.max()}")
 
 
 def pair(a, b, box, scale, out):

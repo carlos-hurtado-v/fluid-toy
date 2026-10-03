@@ -48,7 +48,7 @@ fn resolve_lookup(unfiltered: vec3<f32>) -> vec3<f32> {
     // Screen derivatives first: of the route (do the neighbours' lookups
     // belong to the same image?), the uv, and the environment direction
     let route = f32((((((dbg_path * 4u + look_kind) * 4u + dbg_bounces) * 4u + dbg_exit_kind) * 4u
-        + dbg_mirror_kind) * 2u) + u32(dbg_body));
+        + dbg_mirror_kind) * 2u) + u32(dbg_end == DBG_END_BODY));
     let same_x = dpdx(route) == 0.0;
     let same_y = dpdy(route) == 0.0;
     let uv_dx = dpdx(look_uv);

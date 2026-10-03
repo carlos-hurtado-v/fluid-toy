@@ -53,7 +53,10 @@ struct WaterParams {
     filtered_lookup: u32,
     // rendering.mc_volume_trace (1 = in-water tests read the density field)
     volume_trace: u32,
-    _pad_g1: u32,
+    // 1 = the depth buffer holds opaque surfaces the tracer does not know
+    // exactly (pool walls and floor, a Custom body): rays are tested against
+    // it. 0 = glass tank with procedural bodies only: nothing to test.
+    depth_occluders: u32,
     _pad_g2: u32,
 }
 
@@ -134,7 +137,9 @@ struct RigidBodyParams {
     rot_row2: vec4<f32>,
     prop_blades: u32,
     prop_pitch: f32,
-    _pad0: f32,
+    // 1 = the water's field is continued into this body (mc_wet_bodies,
+    // field_bodies_common.wgsl): the mesh meets it, no dry film around it
+    wet: f32,
     _pad1: f32,
 }
 @group(0) @binding(19) var<storage, read> rigid_bodies: array<RigidBodyParams>;

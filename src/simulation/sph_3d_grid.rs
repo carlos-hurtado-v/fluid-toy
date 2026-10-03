@@ -3,6 +3,7 @@
 use crate::render::mesh_loader::SdfData;
 use crate::simulation::particle::SphParticle3D;
 use crate::simulation::snapshot::{GpuSource, SimState};
+use super::body_forces::BodyForces;
 use crate::state::{GpuContainerGeometry, GpuGravity, GpuMouseForce, GpuRigidBodiesHeader, GpuRigidBody, GpuRigidBodyAccum, GpuSphParams3D, MAX_RIGID_BODIES};
 use wgpu::util::DeviceExt;
 
@@ -73,9 +74,7 @@ pub struct SphSimulation3DGrid {
 
     // Rigid body buffers (multi-body: count header + body array; per-body accums)
     rigid_bodies_buffer: wgpu::Buffer,
-    rigid_body_accum_buffer: wgpu::Buffer,
-    rigid_body_accum_staging: wgpu::Buffer,
-    last_accums: [GpuRigidBodyAccum; MAX_RIGID_BODIES],
+    body_forces: BodyForces,
 
     // SDF texture for custom mesh collision (kept alive for bind group)
     _sdf_texture: wgpu::Texture,
@@ -187,7 +186,12 @@ impl SphSimulation3DGrid {
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/sph_force_3d_grid.wgsl").into()),
         });
 
-        let rigid_body_common_wgsl = include_str!("../shaders/rigid_body_common.wgsl");
+        // (the shapes first: rigid_body_common.wgsl builds on them)
+        let rigid_body_common_wgsl = concat!(
+            include_str!("../shaders/body_shapes_common.wgsl"),
+            "\n",
+            include_str!("../shaders/rigid_body_common.wgsl"),
+        );
 
         let integrate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SPH 3D Integrate Shader"),
@@ -311,18 +315,7 @@ impl SphSimulation3DGrid {
             })
         };
 
-        let rigid_body_accum_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Rigid Body Accum Buffer"),
-            contents: bytemuck::cast_slice(&[GpuRigidBodyAccum::default(); MAX_RIGID_BODIES]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let rigid_body_accum_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Rigid Body Accum Staging"),
-            size: (std::mem::size_of::<GpuRigidBodyAccum>() * MAX_RIGID_BODIES) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let body_forces = BodyForces::new(device);
 
         // SDF 3D texture for custom mesh collision
         let (sdf_texture, sdf_texture_view, sdf_sampler) = if let Some(sdf) = sdf_data {
@@ -1040,7 +1033,7 @@ impl SphSimulation3DGrid {
                 wgpu::BindGroupEntry { binding: 2, resource: container_geom_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: mouse_force_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: rigid_bodies_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: rigid_body_accum_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: body_forces.accum_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&sdf_texture_view) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&sdf_sampler) },
             ],
@@ -1280,9 +1273,7 @@ impl SphSimulation3DGrid {
             force_bind_group,
             integrate_bind_group,
             rigid_bodies_buffer,
-            rigid_body_accum_buffer,
-            rigid_body_accum_staging,
-            last_accums: [GpuRigidBodyAccum::default(); MAX_RIGID_BODIES],
+            body_forces,
             _sdf_texture: sdf_texture,
             _sdf_sampler: sdf_sampler,
             pcisph_predict_pipeline,
@@ -1304,7 +1295,8 @@ impl SphSimulation3DGrid {
     }
 
     /// Run one simulation step (single encoder, single submit).
-    pub fn step(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    /// One substep. Returns its submission (see `request_rigid_body_accum`).
+    pub fn step(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::SubmissionIndex {
         let particle_workgroups = self.num_particles.div_ceil(WORKGROUP_SIZE);
         let cell_workgroups = self.grid_params.total_cells.div_ceil(CELL_WORKGROUP_SIZE);
 
@@ -1478,15 +1470,9 @@ impl SphSimulation3DGrid {
         }
 
         // Copy accumulators to staging for CPU readback
-        encoder.copy_buffer_to_buffer(
-            &self.rigid_body_accum_buffer,
-            0,
-            &self.rigid_body_accum_staging,
-            0,
-            (std::mem::size_of::<GpuRigidBodyAccum>() * MAX_RIGID_BODIES) as u64,
-        );
+        self.body_forces.encode_copy(&mut encoder);
 
-        queue.submit(std::iter::once(encoder.finish()));
+        queue.submit(std::iter::once(encoder.finish()))
     }
 
     pub fn update_sph_params(&mut self, queue: &wgpu::Queue, params: &GpuSphParams3D) {
@@ -1526,29 +1512,23 @@ impl SphSimulation3DGrid {
         self.pcisph_iterations = iterations.max(1);
     }
 
+    /// The fluid's forces on the Dynamic bodies (body_forces.rs): cleared
+    /// before a frame's substeps, requested after them, collected where the
+    /// bodies are integrated
     pub fn clear_rigid_body_accum(&self, queue: &wgpu::Queue) {
-        queue.write_buffer(
-            &self.rigid_body_accum_buffer,
-            0,
-            bytemuck::cast_slice(&[GpuRigidBodyAccum::default(); MAX_RIGID_BODIES]),
-        );
+        self.body_forces.clear(queue);
     }
 
-    pub fn read_rigid_body_accum(&mut self, device: &wgpu::Device) {
-        let slice = self.rigid_body_accum_staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    pub fn request_rigid_body_accum(&mut self, last_step: wgpu::SubmissionIndex) {
+        self.body_forces.request(last_step);
+    }
 
-        {
-            let data = slice.get_mapped_range();
-            let accums: &[GpuRigidBodyAccum] = bytemuck::cast_slice(&data);
-            self.last_accums.copy_from_slice(&accums[..MAX_RIGID_BODIES]);
-        }
-        self.rigid_body_accum_staging.unmap();
+    pub fn collect_rigid_body_accum(&mut self, device: &wgpu::Device) -> bool {
+        self.body_forces.collect(device)
     }
 
     pub fn rigid_body_accums(&self) -> &[GpuRigidBodyAccum; MAX_RIGID_BODIES] {
-        &self.last_accums
+        self.body_forces.latest()
     }
 
     pub fn particle_buffer(&self) -> &wgpu::Buffer {

@@ -5,6 +5,7 @@
 use std::time::Instant;
 
 use super::App;
+use crate::gpu::profile;
 use crate::gui::{self, GuiAction};
 use crate::state::{integrate_rigid_body, ContainerStyle, FluidRenderMode, RigidBodyMotion};
 
@@ -24,14 +25,17 @@ impl App {
             return;
         }
 
+        profile::begin_frame(&self.gpu.as_ref().unwrap().device);
         let (frame_dt, held) = self.tick_clock();
         let gui = self.run_gui();
+        profile::cpu("gui");
 
         // Fire due scenario events before this frame's state reaches the GPU
         self.pump_scenario_events();
 
         // Sync state to GPU
         self.sync_gpu_state();
+        profile::cpu("sync state");
 
         // Detect HDR environment switch
         if self.state.environment.hdr_selection != self.current_hdr {
@@ -48,26 +52,32 @@ impl App {
             Err(_) => return,
         };
 
+        profile::cpu("acquire frame");
+
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Main Encoder"),
-            });
 
         // Smoothly interpolate container tilt toward target each frame (total frame time)
         if !held {
             self.state.container.update_tilt(frame_dt);
         }
 
-        // Simulate, then encode what measures or follows the new state
+        // Simulate, then submit what follows the new state without needing
+        // the rigid bodies' new poses: integrate_rigid_bodies waits for the
+        // substeps, and the GPU needs work queued behind them meanwhile
         let stepped = self.step_simulation(frame_dt, held);
-        self.encode_measurements(&mut encoder, stepped);
+        self.submit_early_passes(stepped);
         let capture = self.begin_capture();
         self.integrate_rigid_bodies();
+        profile::cpu("rigid bodies");
+
+        let gpu = self.gpu.as_ref().unwrap();
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Main Encoder"),
+            });
 
         // Scene renderers always draw into the HDR scene buffer (HDR_FORMAT);
         // post-processing (or its passthrough when disabled) writes the screen
@@ -86,14 +96,23 @@ impl App {
         // Render the fluid (and the scene objects that go with it) by render
         // mode, then everything that works on the finished scene
         self.render_fluid(&mut encoder, &render_target);
+        profile::gpu(&mut encoder, "fluid (rest)");
         self.encode_gtao(&mut encoder, post_process_enabled);
+        profile::gpu(&mut encoder, "gtao");
         self.encode_post_process(&mut encoder, &view, post_process_enabled, debug_view_on);
         self.encode_wireframe(&mut encoder, &view);
+        profile::gpu(&mut encoder, "post + wireframe");
         self.encode_capture_copy(&mut encoder, &output.texture, &capture);
         self.encode_gui(&mut encoder, &view, &gui);
+        profile::gpu(&mut encoder, "gui");
+        profile::end_frame(&mut encoder);
+        profile::cpu("encode render");
 
         self.gpu.as_ref().unwrap().queue.submit(std::iter::once(encoder.finish()));
+        profile::after_submit();
+        profile::cpu("submit");
         output.present();
+        profile::cpu("present");
 
         // After the submit: readbacks, automation outputs, GUI requests
         self.read_back_measurements(stepped);
@@ -101,6 +120,7 @@ impl App {
         self.write_stats_row(stepped);
         self.check_automation_exit();
         self.handle_gui_action(gui.action);
+        profile::cpu("readbacks + automation");
     }
 
     /// FPS estimate and the visual clock. Returns (frame_dt, held): the
@@ -175,11 +195,13 @@ impl App {
         // Note: Grid simulation manages its own command encoding/submission
         let num_substeps = self.state.simulation.substeps;
         let substep_dt = self.simulation_substep_dt();
+        // Closes the GPU interval since the previous frame's last mark
+        profile::gpu_submit(&gpu.device, &gpu.queue, "idle between frames");
+        profile::cpu("frame setup");
         if !self.state.simulation.paused {
             if let Some(sph_sim) = &mut self.sph_simulation {
                 // Only Dynamic bodies consume the reaction accumulators;
-                // Static/Kinematic skip the clear AND the blocking readback
-                // (saves a hard GPU sync per frame).
+                // Static/Kinematic skip the clear and the readback
                 let any_dynamic = self
                     .state
                     .rigid_bodies
@@ -194,6 +216,7 @@ impl App {
                 if any_dynamic {
                     sph_sim.clear_rigid_body_accum(&gpu.queue);
                 }
+                let mut last_step = None;
                 for _ in 0..num_substeps {
                     // Advance kinematic spin per substep so fast bodies sweep
                     // smoothly instead of jumping once per frame (each step()
@@ -211,10 +234,14 @@ impl App {
                             .collect();
                         sph_sim.update_rigid_bodies(&gpu.queue, &gpu_bodies);
                     }
-                    sph_sim.step(&gpu.device, &gpu.queue);
+                    last_step = Some(sph_sim.step(&gpu.device, &gpu.queue));
                 }
-                if any_dynamic {
-                    sph_sim.read_rigid_body_accum(&gpu.device);
+                profile::gpu_submit(&gpu.device, &gpu.queue, "sph substeps");
+                profile::cpu("sph encode + submit");
+                // Asked for here, read in integrate_rigid_bodies: the passes
+                // submitted in between keep the GPU busy through that wait
+                if let (true, Some(last_step)) = (any_dynamic, last_step) {
+                    sph_sim.request_rigid_body_accum(last_step);
                 }
             }
 
@@ -240,6 +267,8 @@ impl App {
             }
         }
         self.spray_prev_enabled = self.state.spray.enabled;
+        profile::gpu_submit(&gpu.device, &gpu.queue, "spray");
+        profile::cpu("spray encode + submit");
 
         // Advance the deterministic frame clock (drives captures and stats)
         let stepped = !self.state.simulation.paused;
@@ -251,6 +280,29 @@ impl App {
             self.milestone_frame += 1;
         }
         stepped
+    }
+
+    /// The passes that need this frame's particles but not the rigid bodies'
+    /// new poses, in their own command buffer, submitted now: the wave gauges
+    /// and foam map, and the water's geometry (marching-cubes field + mesh).
+    /// `integrate_rigid_bodies` then waits for the fluid's forces on the
+    /// bodies, i.e. for the substeps. With nothing queued behind the substeps
+    /// the GPU idled from the end of that wait until the frame's render was
+    /// submitted, and ran the render slower after the pause: 14.6 ms/frame
+    /// with Dynamic bodies against 11.4 with the same bodies Static
+    /// (snap_007, 2560x1351, --profile); 11.0 with this.
+    fn submit_early_passes(&mut self, stepped: bool) {
+        let gpu = self.gpu.as_ref().unwrap();
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Early Encoder"),
+            });
+        self.encode_measurements(&mut encoder, stepped);
+        profile::gpu(&mut encoder, "measure + foam map");
+        self.generate_fluid_geometry(&mut encoder);
+        self.gpu.as_ref().unwrap().queue.submit(std::iter::once(encoder.finish()));
+        profile::cpu("early passes");
     }
 
     /// Passes over the post-integrate state: the wave gauges / extents and
@@ -308,7 +360,12 @@ impl App {
         let num_substeps = self.state.simulation.substeps;
         let substep_dt = self.simulation_substep_dt();
         if !self.state.simulation.paused {
-            if let Some(sph_sim) = &self.sph_simulation {
+            if let Some(sph_sim) = &mut self.sph_simulation {
+                // This frame's forces (requested in step_simulation): the
+                // one CPU-GPU sync of a frame with Dynamic bodies
+                if sph_sim.collect_rigid_body_accum(&self.gpu.as_ref().unwrap().device) {
+                    profile::cpu("body force readback (wait)");
+                }
                 let accums = *sph_sim.rigid_body_accums();
                 let gravity = self.state.simulation.gravity_vector();
                 let fluid_density = self.state.sph.rest_density();

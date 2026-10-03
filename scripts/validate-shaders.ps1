@@ -23,11 +23,17 @@ $ErrorActionPreference = "Stop"
 $shaderDir = Join-Path $PSScriptRoot "..\src\shaders"
 
 $container = "container_common.wgsl"
+# Rigid bodies in the SPH shaders: the shapes, then the helpers built on them
+$bodies = @("body_shapes_common.wgsl", "rigid_body_common.wgsl")
+# Scene-lit body shading (rigid body renderers; the water shader links it too)
+$bodyShading = @("sh_common.wgsl", "body_shading_common.wgsl")
+# Rigid bodies in the marching-cubes field passes (wall_bound.rs FIELD_BODY_SNIPPETS)
+$fieldBodies = @("body_shapes_common.wgsl", "field_bodies_common.wgsl")
 $prefixes = @{
     # MC field + G-buffers (mc_field.rs, mc_anisotropy.rs, wall_bound.rs, mc_faces.rs)
-    "mc_density.wgsl"          = @($container)
+    "mc_density.wgsl"          = @($container) + $fieldBodies
     "mc_anisotropy.wgsl"       = @($container)
-    "mc_wall_bound.wgsl"       = @($container)
+    "mc_wall_bound.wgsl"       = @($container) + $fieldBodies
     "mc_back_depth.wgsl"       = @($container)
     # Voxel normal texture: writer and mesh reader (voxel_normals.rs, mc_mesh.rs)
     "mc_voxel_normals.wgsl"    = @("octahedral_common.wgsl")
@@ -40,14 +46,14 @@ $prefixes = @{
     # Scene objects (container_renderer.rs, wireframe.rs, rigid_body_renderer.rs, spray_renderer.rs)
     "container.wgsl"           = @($container, "sh_common.wgsl")
     "wireframe.wgsl"           = @($container)
-    "rigid_body.wgsl"          = @($container, "sh_common.wgsl")
-    "rigid_body_mesh.wgsl"     = @($container, "sh_common.wgsl")
+    "rigid_body.wgsl"          = @($container) + $bodyShading
+    "rigid_body_mesh.wgsl"     = @($container) + $bodyShading
     "spray_render.wgsl"        = @($container, "sh_common.wgsl")
     # Simulation (sph_3d_grid.rs, spray.rs, foam_map.rs)
     "sph_density_3d_grid.wgsl" = @($container)
-    "sph_integrate_3d.wgsl"    = @($container, "rigid_body_common.wgsl")
-    "pcisph_predict.wgsl"      = @($container, "rigid_body_common.wgsl")
-    "pcisph_solve.wgsl"        = @($container, "rigid_body_common.wgsl")
+    "sph_integrate_3d.wgsl"    = @($container) + $bodies
+    "pcisph_predict.wgsl"      = @($container) + $bodies
+    "pcisph_solve.wgsl"        = @($container) + $bodies
     "spray_simulate.wgsl"      = @($container)
     "foam_map.wgsl"            = @($container)
 }

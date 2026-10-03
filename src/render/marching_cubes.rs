@@ -32,6 +32,7 @@ use super::wall_bound::WallBound;
 use super::ContainerRenderer;
 use super::RigidBodyRenderer;
 use super::SprayRenderer;
+use crate::gpu::profile;
 use crate::render::GpuCameraParams;
 use crate::state::{GpuContainerGeometry, GpuEnvironmentParams, GpuLightParams, GpuShCoefficients};
 
@@ -167,6 +168,7 @@ impl MarchingCubesRenderer {
             &field.view_b,
             &buffers.grid_params,
             &buffers.container_geom,
+            &buffers.bodies,
         );
         let voxel_normals = VoxelNormals::new(
             device,
@@ -364,6 +366,7 @@ impl MarchingCubesRenderer {
             &field.view_b,
             &self.buffers.grid_params,
             &self.buffers.container_geom,
+            &self.buffers.bodies,
         );
         self.voxel_normals = VoxelNormals::new(
             device,
@@ -436,6 +439,7 @@ impl MarchingCubesRenderer {
         env_params: &GpuEnvironmentParams,
         filtered_lookup: bool,
         volume_trace: bool,
+        depth_occluders: bool,
     ) {
         self.filtered_lookup.set(filtered_lookup);
         let params = GpuWaterParams {
@@ -467,18 +471,25 @@ impl MarchingCubesRenderer {
             ground_capture_height: env_params.ground_capture_height,
             filtered_lookup: filtered_lookup as u32,
             volume_trace: volume_trace as u32,
-            _pad_g: [0; 2],
+            depth_occluders: depth_occluders as u32,
+            _pad_g: 0,
         };
         queue.write_buffer(&self.buffers.water_params, 0, bytemuck::bytes_of(&params));
     }
 
     /// Upload this frame's enabled rigid bodies (render layout, in order; the
-    /// count rides in GpuWaterParams::body_count)
-    pub fn update_bodies(&self, queue: &wgpu::Queue, bodies: &[crate::state::GpuRigidBodyRender]) {
-        let count = bodies.len().min(crate::state::MAX_RIGID_BODIES);
-        if count > 0 {
-            queue.write_buffer(&self.buffers.bodies, 0, bytemuck::cast_slice(&bodies[..count]));
+    /// count rides in GpuWaterParams::body_count). Every slot is written:
+    /// the field passes have no count and skip slots of zero size. `wet` =
+    /// rendering.mc_wet_bodies: the water's field is continued into the
+    /// bodies (field_bodies_common.wgsl reads the flag from the first pad).
+    pub fn update_bodies(&self, queue: &wgpu::Queue, bodies: &[crate::state::GpuRigidBodyRender], wet: bool) {
+        let empty = crate::state::GpuRigidBodyRender { half_extent: 0.0, ..Default::default() };
+        let mut slots = [empty; crate::state::MAX_RIGID_BODIES];
+        for (slot, body) in slots.iter_mut().zip(bodies) {
+            let wet = wet && body.shape != crate::state::RigidBodyShape::Custom as u32;
+            *slot = crate::state::GpuRigidBodyRender { _pad0: if wet { 1.0 } else { 0.0 }, ..*body };
         }
+        queue.write_buffer(&self.buffers.bodies, 0, bytemuck::cast_slice(&slots));
     }
 
     /// Switch the water pass to the pixel-probe shader variant, recording at
@@ -623,9 +634,12 @@ impl MarchingCubesRenderer {
                 container_geom: &self.buffers.container_geom,
                 aniso_records: self.aniso.records(),
                 aniso_params: self.aniso.params_buffer(),
+                bodies: &self.buffers.bodies,
             },
             self.grid_size,
         );
+
+        profile::gpu(encoder, "mc density");
 
         // Calm-surface smoothing helper fields, from the raw field in A
         // (before the base blur ping-pongs through it)
@@ -652,13 +666,16 @@ impl MarchingCubesRenderer {
         let result_in_b = self.wall_bound.encode(encoder, result_in_b);
 
         self.result_in_b = result_in_b;
+        profile::gpu(encoder, "mc blur + calm + walls");
 
         // Pass 1.8: the final field's normals, for generate and the water shader
         self.voxel_normals.encode(encoder, result_in_b);
+        profile::gpu(encoder, "mc voxel normals");
 
         // Pass 2: Generate triangles (read from whichever texture has the
         // result), then hand the count to the indirect draw and the readback
         self.mesh.encode(encoder, result_in_b, self.grid_size);
+        profile::gpu(encoder, "mc mesh");
     }
 
     /// Last read-back mesh vertex count (see `read_vertex_count`)
@@ -697,11 +714,15 @@ impl MarchingCubesRenderer {
 
         // Pass 0a: water front faces to depth + normal G-buffer (for GTAO + SSR)
         // Pass 0b: rigid body + container into front depth (depth-only)
+        // (the first mark here also closes whatever ran since mesh
+        // generation: the whitewater field splat, the caustics)
+        profile::gpu(encoder, "foam field + caustics");
         self.faces.encode_front(encoder, indirect_buffer, rigid_body, container);
 
         // Pass 1: back faces to back depth (for thickness calculation) and
         // their normals (refraction exit interface)
         self.faces.encode_back(encoder, indirect_buffer);
+        profile::gpu(encoder, "water face g-buffers");
 
         // Pass 2: Render environment to background texture (for screen-space refraction)
         // Uses single-sampled depth and pipeline since background_texture is single-sampled
@@ -730,9 +751,11 @@ impl MarchingCubesRenderer {
         if self.filtered_lookup.get() {
             self.background.encode_mips(encoder);
         }
+        profile::gpu(encoder, "background + mips");
 
         // SSR compute pass: ray-march against background depth for screen-space reflections
         self.ssr.encode(encoder, self.width, self.height);
+        profile::gpu(encoder, "ssr");
 
         // Pass 3: Render water mesh with screen-space refraction from background
         // Uses MSAA if enabled (renders to the MSAA target, resolves to color_view)
@@ -762,6 +785,7 @@ impl MarchingCubesRenderer {
                 sp.render_msaa(&mut pass);
             }
         }
+        profile::gpu(encoder, "water pass");
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, env_view: &wgpu::TextureView, env_sampler: &wgpu::Sampler, width: u32, height: u32) {

@@ -86,10 +86,6 @@ pub enum McSilhouetteExit {
     #[default]
     #[serde(alias = "Straight")]
     Exit,
-    /// Behind the nearer layer counts as still in the water: keep tracing.
-    /// Physically right where measured (snap_001), but the switch follows the
-    /// layer's texel-precision outline and mirrors magnify it into stair steps
-    /// (snap_003), so it is opt-in
     Continue,
 }
 
@@ -459,9 +455,6 @@ pub struct RenderConfig {
     /// Surface smoothing - blur radius for MC density field in voxels (0 = off).
     /// Low-pass on the density texture: smooths the bulk surface but erodes thin
     /// features (sheets/droplets) whose field width is comparable to the window.
-    /// Default 1: keeps splash droplets and sheets. Still water's particle-scale
-    /// lumps ("orbeez") are handled by `mc_calm_smoothing` instead; raising this
-    /// to 3 calms them only partly and erases most droplets (A/B'd 2026-10-01).
     pub mc_blur_radius: u32,
     /// Calm-surface smoothing strength (0 = off, 1 = full): bulk-gated wide
     /// low-pass of the MC density field. Flattens the particle-scale lumps on
@@ -477,6 +470,13 @@ pub struct RenderConfig {
     /// more than half this angle; the geometry is untouched. Needs calm
     /// smoothing on (scales with its strength).
     pub mc_normal_denoise: f32,
+    /// The water's field is continued into the rigid bodies (procedural
+    /// shapes), like it is ended on the container walls: the surface meets a
+    /// body at the level it has next to it. Off = a body is a hole in the
+    /// field, and the smoothing filters round the water off toward it: a moat
+    /// a few centimetres deep around every body at its waterline, and a dry
+    /// film between the mesh and the body under water.
+    pub mc_wet_bodies: bool,
     /// Water surface roughness for PBR specular (0.01 = mirror, 0.5 = rough)
     pub water_roughness: f32,
     /// Micro-ripple normal perturbation strength (0 = glass-smooth, 1 = choppy)
@@ -533,6 +533,7 @@ impl Default for RenderConfig {
             mc_blur_radius: 1,
             mc_calm_smoothing: 1.0,
             mc_normal_denoise: 1.5,
+            mc_wet_bodies: true,
             water_roughness: 0.1,
             ripple_strength: 0.015,
             water_clarity: 0.60,

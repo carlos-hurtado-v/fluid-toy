@@ -1,6 +1,7 @@
 // Rigid body rendering shader — procedural shape generation
 // Generates Cube, Sphere, Cylinder, or Torus from vertex_index
-// Concatenated with container_common.wgsl (rim_visibility for sun shadowing).
+// Concatenated with container_common.wgsl (rim_visibility for sun shadowing),
+// sh_common.wgsl and body_shading_common.wgsl (shade_body_lit).
 
 struct CameraParams {
     view: mat4x4<f32>,
@@ -48,33 +49,10 @@ struct RbLightParams {
 @group(0) @binding(3) var<uniform> sh_coeffs: array<vec4<f32>, 9>;
 @group(0) @binding(4) var<uniform> container: ContainerGeometry;
 
-const INV_PI: f32 = 0.31830988;
-const BODY_SPEC_STRENGTH: f32 = 0.5;
-
-// evaluate_sh_irradiance(): sh_common.wgsl, prepended at module creation
-
-// Scene-coherent body shading: SH ambient + rim-shadowed sun, Lambert with
-// the proper 1/pi (evaluate_sh_irradiance returns irradiance, and the sun
-// term ndotl * sun_rgb is one too), plus a Schlick-Fresnel Blinn-Phong lobe
-// carrying the sun color (F0 = 0.04 dielectric).
+// Scene-coherent body shading (body_shading_common.wgsl, which the water
+// shader uses for the bodies its rays hit) under this renderer's lighting
 fn shade_body(albedo: vec3<f32>, n: vec3<f32>, v: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
-    let l = normalize(rb_light.sun_dir);
-    let ndotl = max(dot(n, l), 0.0);
-
-    let local = world_to_local(container, world_pos);
-    let l_local = world_dir_to_local(container, l);
-    let rim = rim_visibility(container, local, l_local);
-
-    let ambient = evaluate_sh_irradiance(n) * rb_light.ibl_strength;
-    let sun = rb_light.sun_rgb * (ndotl * rim);
-
-    let h = normalize(l + v);
-    let ndoth = max(dot(n, h), 0.0);
-    let ndotv = max(dot(n, v), 0.0);
-    let fresnel = 0.04 + 0.96 * pow(1.0 - ndotv, 5.0);
-    let spec = rb_light.sun_rgb * (fresnel * pow(ndoth, 64.0) * BODY_SPEC_STRENGTH * rim);
-
-    return albedo * (ambient + sun) * INV_PI + spec;
+    return shade_body_lit(albedo, n, v, world_pos, rb_light.sun_dir, rb_light.sun_rgb, rb_light.ibl_strength);
 }
 
 struct VertexOutput {
@@ -94,7 +72,8 @@ const SHAPE_TORUS: u32 = 3u;
 const SHAPE_PROPELLER: u32 = 5u;
 
 // Propeller proportions in units of half_extent (spin axis = Y).
-// Must match state/rigid_body.rs PROP_* and the SDF in sph_integrate_3d.wgsl.
+// Must match state/rigid_body.rs PROP_* and body_shapes_common.wgsl (the SDF
+// and the ray intersection the fluid and the water shader use).
 const PROP_HUB_RADIUS: f32 = 0.25;
 const PROP_HUB_HALF_HEIGHT: f32 = 0.30;
 const PROP_BLADE_CENTER: f32 = 0.55;

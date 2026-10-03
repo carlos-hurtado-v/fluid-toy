@@ -186,6 +186,8 @@ pub struct DensityInputs<'a> {
     pub container_geom: &'a wgpu::Buffer,
     pub aniso_records: &'a wgpu::Buffer,
     pub aniso_params: &'a wgpu::Buffer,
+    /// Rigid bodies the field ends on (field_bodies_common.wgsl)
+    pub bodies: &'a wgpu::Buffer,
 }
 
 /// Splats the particles into field texture A (SPH-grid accelerated gather)
@@ -202,8 +204,9 @@ impl DensityPass {
             label: Some("MC Density Shader"),
             source: wgpu::ShaderSource::Wgsl(
                 format!(
-                    "{}\n{}",
+                    "{}\n{}\n{}",
                     include_str!("../shaders/container_common.wgsl"),
+                    super::wall_bound::FIELD_BODY_SNIPPETS,
                     include_str!("../shaders/mc_density.wgsl")
                 )
                 .into(),
@@ -231,6 +234,8 @@ impl DensityPass {
                 layout::storage(7, COMPUTE),
                 // Anisotropic kernel params (uniform)
                 layout::uniform(8, COMPUTE),
+                // Rigid bodies the field ends on
+                layout::storage(9, COMPUTE),
             ],
         });
 
@@ -286,6 +291,7 @@ impl DensityPass {
                     entry::buffer(6, sim.grid_params),
                     entry::buffer(7, inputs.aniso_records),
                     entry::buffer(8, inputs.aniso_params),
+                    entry::buffer(9, inputs.bodies),
                 ],
             })
         });

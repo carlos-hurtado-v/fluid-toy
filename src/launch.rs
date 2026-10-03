@@ -57,6 +57,9 @@ Options:
                            field of each captured frame (frame_NNNNN_field.bin
                            + .json; scripts/field_profile.py measures the
                            surface in it)
+  --profile <file.json>    Time every frame phase on the CPU and the GPU
+                           (timestamp queries) and print / write the averages
+                           at exit: where a slow configuration spends its time
   --help                   Show this help
 ";
 
@@ -123,6 +126,7 @@ pub struct LaunchOptions {
     pub hold: bool,
     pub probe_pixels: Vec<[u32; 2]>,
     pub dump_field: bool,
+    pub profile_path: Option<PathBuf>,
 }
 
 impl Default for LaunchOptions {
@@ -142,6 +146,7 @@ impl Default for LaunchOptions {
             hold: false,
             probe_pixels: Vec::new(),
             dump_field: false,
+            profile_path: None,
         }
     }
 }
@@ -204,6 +209,7 @@ impl LaunchOptions {
                 }
                 "--hold" => opts.hold = true,
                 "--dump-field" => opts.dump_field = true,
+                "--profile" => opts.profile_path = Some(PathBuf::from(value(&mut args, "--profile")?)),
                 "--probe" => {
                     let v = value(&mut args, "--probe")?;
                     let n = number_list(&v, "--probe")?;

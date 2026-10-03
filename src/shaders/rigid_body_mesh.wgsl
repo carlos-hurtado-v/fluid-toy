@@ -1,6 +1,7 @@
 // Mesh rigid body rendering shader — vertex buffer + textured
 // Used for custom GLB models alongside the procedural shape shader
-// Concatenated with container_common.wgsl (rim_visibility for sun shadowing).
+// Concatenated with container_common.wgsl (rim_visibility for sun shadowing),
+// sh_common.wgsl and body_shading_common.wgsl (shade_body_lit).
 
 struct CameraParams {
     view: mat4x4<f32>,
@@ -51,30 +52,10 @@ struct RbLightParams {
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
 
-const INV_PI: f32 = 0.31830988;
-const BODY_SPEC_STRENGTH: f32 = 0.5;
-
-// evaluate_sh_irradiance(): sh_common.wgsl, prepended at module creation
-
-// Scene-coherent body shading — identical to rigid_body.wgsl's shade_body
+// Scene-coherent body shading (body_shading_common.wgsl) under this
+// renderer's lighting
 fn shade_body(albedo: vec3<f32>, n: vec3<f32>, v: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
-    let l = normalize(rb_light.sun_dir);
-    let ndotl = max(dot(n, l), 0.0);
-
-    let local = world_to_local(container, world_pos);
-    let l_local = world_dir_to_local(container, l);
-    let rim = rim_visibility(container, local, l_local);
-
-    let ambient = evaluate_sh_irradiance(n) * rb_light.ibl_strength;
-    let sun = rb_light.sun_rgb * (ndotl * rim);
-
-    let h = normalize(l + v);
-    let ndoth = max(dot(n, h), 0.0);
-    let ndotv = max(dot(n, v), 0.0);
-    let fresnel = 0.04 + 0.96 * pow(1.0 - ndotv, 5.0);
-    let spec = rb_light.sun_rgb * (fresnel * pow(ndoth, 64.0) * BODY_SPEC_STRENGTH * rim);
-
-    return albedo * (ambient + sun) * INV_PI + spec;
+    return shade_body_lit(albedo, n, v, world_pos, rb_light.sun_dir, rb_light.sun_rgb, rb_light.ibl_strength);
 }
 
 struct VertexInput {

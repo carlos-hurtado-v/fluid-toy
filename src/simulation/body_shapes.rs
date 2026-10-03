@@ -20,8 +20,8 @@
 //! pushed sideways by the face points around it). What reaches into a face
 //! is the other body's own probe.
 //!
-//! Keep the SDFs in sync with `rb_analytic_sdf` / `propeller_sdf` in
-//! `shaders/rigid_body_common.wgsl` and the `PROP_*` constants in
+//! Keep the SDFs in sync with `body_shape_sdf` / `propeller_sdf` in
+//! `shaders/body_shapes_common.wgsl` and the `PROP_*` constants in
 //! `state/rigid_body.rs`: the fluid and the other bodies must agree on where
 //! a body's surface is.
 
@@ -280,7 +280,7 @@ fn box_sdf(p: V3, half: V3) -> f32 {
 }
 
 /// Hub cylinder + N pitched blades via angular domain repetition
-/// (`propeller_sdf` in rigid_body_common.wgsl)
+/// (`propeller_sdf` in body_shapes_common.wgsl)
 fn propeller_sdf(p: V3, he: f32, blades: u32, pitch: f32) -> f32 {
     let hub = (p[0].hypot(p[2]) - PROP_HUB_RADIUS * he).max(p[1].abs() - PROP_HUB_HALF_HEIGHT * he);
 

@@ -1,10 +1,11 @@
 // Shared rigid body definitions for SPH compute shaders (integrate, PCISPH
-// predict/solve): structs, shape/motion constants, analytic SDFs, and the
-// boundary-aware pressure helpers.
+// predict/solve): structs, motion constants, and the boundary-aware pressure
+// helpers. The shapes themselves (constants, SDFs) are body_shapes_common.wgsl.
 //
 // Conventions:
-// - container_common.wgsl is always concatenated BEFORE this file (the
-//   helpers below use ContainerGeometry + world_to_local/local_to_world).
+// - container_common.wgsl and body_shapes_common.wgsl are always concatenated
+//   BEFORE this file (the helpers below use ContainerGeometry +
+//   world_to_local/local_to_world, and body_shape_sdf).
 // - Each consumer shader declares its own @group/@binding for
 //   `container: ContainerGeometry` and `rigid_bodies: RigidBodies` (WGSL
 //   module-scope declarations are order-independent, so the helper functions
@@ -12,20 +13,11 @@
 // - The Custom (voxel SDF) shape is handled only by the integrate shader,
 //   which owns the 3D texture binding; the analytic helpers here skip it.
 
-const SHAPE_CUBE: u32 = 0u;
-const SHAPE_SPHERE: u32 = 1u;
-const SHAPE_CYLINDER: u32 = 2u;
-const SHAPE_TORUS: u32 = 3u;
-const SHAPE_CUSTOM: u32 = 4u;
-const SHAPE_PROPELLER: u32 = 5u;
-
 const MOTION_STATIC: u32 = 0u;
 const MOTION_KINEMATIC: u32 = 1u;
 const MOTION_DYNAMIC: u32 = 2u;
 
 const MAX_RIGID_BODIES: u32 = 8u;
-
-const RB_TWO_PI: f32 = 6.28318530718;
 
 struct RigidBody {
     position: vec3<f32>,
@@ -51,66 +43,11 @@ struct RigidBodies {
     bodies: array<RigidBody>,
 }
 
-// Propeller proportions in units of half_extent (spin axis = body-local Y).
-// Must match state/rigid_body.rs PROP_* constants and the mesh generator in
-// rigid_body.wgsl.
-const PROP_HUB_RADIUS: f32 = 0.25;
-const PROP_HUB_HALF_HEIGHT: f32 = 0.30;
-const PROP_BLADE_CENTER: f32 = 0.55;
-const PROP_BLADE_HALF: vec3<f32> = vec3<f32>(0.44, 0.18, 0.045);
-
-// Hub cylinder + N pitched blades via angular domain repetition
-fn propeller_sdf(p: vec3<f32>, he: f32, blades: u32, pitch: f32) -> f32 {
-    let hub = max(length(p.xz) - PROP_HUB_RADIUS * he, abs(p.y) - PROP_HUB_HALF_HEIGHT * he);
-
-    // Snap to the nearest blade sector and rotate that blade onto +X
-    let sector = RB_TWO_PI / f32(blades);
-    let ang = atan2(p.z, p.x);
-    let snapped = round(ang / sector) * sector;
-    let cs = cos(snapped);
-    let sn = sin(snapped);
-    let q = vec3<f32>(cs * p.x + sn * p.z, p.y, -sn * p.x + cs * p.z);
-    // Un-pitch around the radial (X) axis
-    let cp = cos(pitch);
-    let sp = sin(pitch);
-    let v = vec3<f32>(q.x, cp * q.y + sp * q.z, -sp * q.y + cp * q.z);
-    // Exact box SDF for the blade
-    let d = abs(v - vec3<f32>(PROP_BLADE_CENTER * he, 0.0, 0.0)) - PROP_BLADE_HALF * he;
-    let blade = length(max(d, vec3<f32>(0.0))) + min(max(d.x, max(d.y, d.z)), 0.0);
-
-    return min(hub, blade);
-}
-
-// Analytic body SDF in body-local space. Custom (voxel) bodies return "far"
-// — only the integrate shader has the SDF texture to resolve them.
-// This and propeller_sdf have CPU copies in simulation/body_shapes.rs (rigid
-// body contact): change both, or bodies and fluid disagree on a surface.
+// Analytic body SDF in body-local space (body_shapes_common.wgsl). Custom
+// (voxel) bodies return "far": only the integrate shader has the SDF texture
+// to resolve them.
 fn rb_analytic_sdf(body: RigidBody, p: vec3<f32>) -> f32 {
-    let he = body.half_extent;
-    switch (body.shape) {
-        case SHAPE_SPHERE: {
-            return length(p) - he;
-        }
-        case SHAPE_CYLINDER: {
-            let d = vec2<f32>(length(p.xz) - he, abs(p.y) - he);
-            return min(max(d.x, d.y), 0.0) + length(max(d, vec2<f32>(0.0)));
-        }
-        case SHAPE_TORUS: {
-            let q = vec2<f32>(length(p.xz) - he, p.y);
-            return length(q) - he * 0.3;
-        }
-        case SHAPE_PROPELLER: {
-            return propeller_sdf(p, he, max(body.prop_blades, 1u), body.prop_pitch);
-        }
-        case SHAPE_CUSTOM: {
-            return 1e9;
-        }
-        default: {
-            // Cube: exact box SDF
-            let d = abs(p) - vec3<f32>(he);
-            return length(max(d, vec3<f32>(0.0))) + min(max(d.x, max(d.y, d.z)), 0.0);
-        }
-    }
+    return body_shape_sdf(body.shape, body.half_extent, body.prop_blades, body.prop_pitch, p);
 }
 
 // Project a predicted position out of the container box and all active
@@ -146,18 +83,8 @@ fn boundary_clamp_predicted(pos: vec3<f32>) -> vec3<f32> {
         let sdf = rb_analytic_sdf(body, local);
         if (sdf < 0.0) {
             // Gradient by central differences (penetrating predictions are rare)
-            let eps = max(0.01 * body.half_extent, 1e-4);
-            let ex = vec3<f32>(eps, 0.0, 0.0);
-            let ey = vec3<f32>(0.0, eps, 0.0);
-            let ez = vec3<f32>(0.0, 0.0, eps);
-            let grad = vec3<f32>(
-                rb_analytic_sdf(body, local + ex) - rb_analytic_sdf(body, local - ex),
-                rb_analytic_sdf(body, local + ey) - rb_analytic_sdf(body, local - ey),
-                rb_analytic_sdf(body, local + ez) - rb_analytic_sdf(body, local - ez),
-            );
-            let glen = length(grad);
-            if (glen > 1e-6) {
-                let ln = grad / glen;
+            let ln = body_shape_gradient(body.shape, body.half_extent, body.prop_blades, body.prop_pitch, local);
+            if (dot(ln, ln) > 0.5) {
                 // Local -> world (transpose multiply)
                 let wn = vec3<f32>(
                     body.rot_row0.x * ln.x + body.rot_row1.x * ln.y + body.rot_row2.x * ln.z,

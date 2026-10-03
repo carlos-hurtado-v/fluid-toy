@@ -18,14 +18,13 @@ const DBG_PATH_TIR_POOL: u32 = 10u;    // mirrored onto an opaque pool wall: str
 // Final lookup (dbg_end)
 const DBG_END_STRAIGHT: u32 = 1u;      // the view straight through (occluded or fallback)
 const DBG_END_SURFACE: u32 = 2u;       // background texture where the ray met a surface
-const DBG_END_SCREEN_SKY: u32 = 3u;    // backdrop read on screen at the direction's vanishing point
+const DBG_END_SCREEN_SKY: u32 = 3u;    // (until 2026-10: backdrop read on screen at the vanishing point; no longer produced)
 const DBG_END_ENV: u32 = 4u;           // environment map along the direction
 const DBG_END_SOLID: u32 = 5u;         // solid background color
-const DBG_END_BODY: u32 = 6u;          // exact sphere/box hit (ray_body_hit)
+const DBG_END_BODY: u32 = 6u;          // a body met exactly, shaded at the hit (body_radiance)
 const DBG_END_GROUND: u32 = 7u;        // projected ground where the ray lands on it, off screen or past the march
 var<private> dbg_path: u32 = 0u;
 var<private> dbg_end: u32 = 0u;
-var<private> dbg_body: bool = false;
 var<private> dbg_bounces: u32 = 0u;
 var<private> dbg_uv: vec2<f32> = vec2<f32>(-1.0);
 var<private> dbg_exit_cos: f32 = 0.0;
@@ -59,6 +58,7 @@ const PRB_SILHOUETTE: u32 = 18u;   // out-of-water bracket whose back depth jump
 const PRB_HIDDEN: u32 = 19u;       // ray going out of sight behind a body: a = (outline distance, gap to the back face there (m), closing rate), b = (estimated crossing distance, normal uv), c = 1 crossing taken, 0 crossing in sight (the samples decide), 2 beyond the trace's reach
 const PRB_VTRACE: u32 = 21u;        // world-space in-water sample: a = world pos, b = (density / iso, background depth or -1 off screen, kind), c = distance
 const PRB_VTRACE_REFINE: u32 = 22u; // bisection sample, same fields
+const PRB_BODY: u32 = 23u;         // body_radiance: a = hit point, b = surface normal, c = body index
 const PRB_BOUNCE: u32 = 20u;       // a = refracted dir (0 = reflects again), b = incoming dir, c = bounce index
 const PRB_MARCH_BEGIN: u32 = 30u;  // march_to_background: a = origin, b = dir, c = reach
 const PRB_MARCH: u32 = 31u;        // a = (uv, raw depth), b = (background depth, behind, -), c = distance
@@ -101,10 +101,7 @@ fn dbg_exit_interface(p: vec3<f32>, on_wall: bool) -> u32 {
 
 // Encoding per McDebugView (state/rendering.rs) - decoded by scripts/debug_decode.py
 fn debug_view_output() -> vec3<f32> {
-    var end = dbg_end;
-    if (dbg_body) {
-        end = DBG_END_BODY;
-    }
+    let end = dbg_end;
     let bounces = f32(dbg_bounces + 1u) / 8.0;
     switch (water.debug_view) {
         case 1u: {
