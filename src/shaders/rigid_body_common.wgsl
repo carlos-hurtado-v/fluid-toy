@@ -83,6 +83,8 @@ fn propeller_sdf(p: vec3<f32>, he: f32, blades: u32, pitch: f32) -> f32 {
 
 // Analytic body SDF in body-local space. Custom (voxel) bodies return "far"
 // — only the integrate shader has the SDF texture to resolve them.
+// This and propeller_sdf have CPU copies in simulation/body_shapes.rs (rigid
+// body contact): change both, or bodies and fluid disagree on a surface.
 fn rb_analytic_sdf(body: RigidBody, p: vec3<f32>) -> f32 {
     let he = body.half_extent;
     switch (body.shape) {

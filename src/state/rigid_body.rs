@@ -10,6 +10,9 @@
 //!   integrate shader).
 //! - `Dynamic` — full physics: fluid reaction forces + gravity, CPU
 //!   integration, container collision.
+//!
+//! Bodies collide with each other in `simulation/body_contact.rs`, which runs
+//! after `integrate_rigid_body` has moved every Dynamic body.
 
 use super::simulation::ContainerConfig;
 
@@ -258,6 +261,11 @@ impl RigidBodyConfig {
                 (self.spin_angle + self.spin_rate() * dt).rem_euclid(std::f32::consts::TAU);
             self.refresh_pose();
         }
+    }
+
+    /// Mass: specific gravity x the SPH rest density x the shape's volume
+    pub fn mass(&self, fluid_density: f32) -> f32 {
+        self.relative_density.max(0.01) * fluid_density * self.shape.volume(self.half_extent)
     }
 
     /// Vertex count for the procedural renderer (propeller depends on blades)
@@ -516,8 +524,7 @@ pub fn integrate_rigid_body(
     accum: &GpuRigidBodyAccum,
 ) {
     let he = rigid_body.half_extent;
-    let volume = rigid_body.shape.volume(he);
-    let body_mass = rigid_body.relative_density.max(0.01) * fluid_density * volume;
+    let body_mass = rigid_body.mass(fluid_density);
     let total_dt = num_substeps as f32 * delta_time;
 
     if body_mass <= 0.0 {
@@ -534,8 +541,13 @@ pub fn integrate_rigid_body(
     let submerged = (accum.contact_count as f32 / expected).clamp(0.0, 1.0);
     if std::env::var_os("RB_DEBUG").is_some() {
         eprintln!(
-            "rb sub={:.3} count={} expected={:.0} y={:.3}",
-            submerged, accum.contact_count, expected, rigid_body.position[1]
+            "rb sub={:.3} count={} expected={:.0} pos={:.4} {:.4} {:.4}",
+            submerged,
+            accum.contact_count,
+            expected,
+            rigid_body.position[0],
+            rigid_body.position[1],
+            rigid_body.position[2]
         );
     }
 
@@ -681,6 +693,46 @@ fn rotated_aabb_half_extents(
     }
 
     aabb
+}
+
+/// The six container faces as contact planes for a body, by the same rotated
+/// AABB `clamp_rigid_body_to_container` clamps: per face the inward normal
+/// (world space) and the gap to it, negative where the body pokes through.
+/// The body contact pass uses these to keep a wall solid while it pushes
+/// bodies apart next to it.
+pub fn container_face_gaps(
+    rigid_body: &RigidBodyConfig,
+    container: &ContainerConfig,
+) -> [([f32; 3], f32); 6] {
+    let (forward, inverse) = container.rotation_matrices();
+    let inv = [
+        [inverse[0][0], inverse[0][1], inverse[0][2]],
+        [inverse[1][0], inverse[1][1], inverse[1][2]],
+        [inverse[2][0], inverse[2][1], inverse[2][2]],
+    ];
+    let aabb = rotated_aabb_half_extents(
+        rigid_body.shape,
+        rigid_body.half_extent,
+        rigid_body.orientation,
+        inv,
+    );
+    let center_y = container.floor_y + container.height / 2.0;
+    let rel = [
+        rigid_body.position[0],
+        rigid_body.position[1] - center_y,
+        rigid_body.position[2],
+    ];
+    let half = [container.half_width(), container.height / 2.0, container.half_depth()];
+
+    let mut faces = [([0.0f32; 3], 0.0f32); 6];
+    for axis in 0..3 {
+        let local = inv[axis][0] * rel[0] + inv[axis][1] * rel[1] + inv[axis][2] * rel[2];
+        // The container-local axis in world space: a column of the forward rotation
+        let dir = [forward[0][axis], forward[1][axis], forward[2][axis]];
+        faces[2 * axis] = (dir, local - aabb[axis] + half[axis]);
+        faces[2 * axis + 1] = ([-dir[0], -dir[1], -dir[2]], half[axis] - local - aabb[axis]);
+    }
+    faces
 }
 
 /// Clamp rigid body position (and optionally velocity) to container bounds.

@@ -14,6 +14,77 @@ pub struct MeshVertex {
 pub struct SdfData {
     pub data: Vec<f32>,
     pub resolution: u32,
+    /// Points on the field's zero surface, about two voxels apart (normalized
+    /// mesh space): what a Custom body touches other rigid bodies with
+    pub surface_points: Vec<[f32; 3]>,
+}
+
+impl SdfData {
+    /// Trilinear sample at a point of the normalized [-1, 1]^3 mesh space:
+    /// the lookup the integrate shader does on the 3D texture. Outside the
+    /// grid the distance to the grid is added, so the field keeps growing.
+    pub fn sample(&self, p: [f32; 3]) -> f32 {
+        let res = self.resolution as usize;
+        let edge = 1.0 - 1.0 / self.resolution as f32; // outermost voxel centres
+        let mut outside_sq = 0.0f32;
+        let mut cell = [0usize; 3];
+        let mut frac = [0.0f32; 3];
+        for axis in 0..3 {
+            let inside = p[axis].clamp(-edge, edge);
+            outside_sq += (p[axis] - inside) * (p[axis] - inside);
+            // Voxel i is centred at -1 + (i + 0.5) * 2 / res
+            let coord = ((inside + 1.0) * 0.5 * res as f32 - 0.5).clamp(0.0, (res - 1) as f32);
+            cell[axis] = (coord as usize).min(res - 2);
+            frac[axis] = coord - cell[axis] as f32;
+        }
+        let at = |dx: usize, dy: usize, dz: usize| {
+            self.data[(cell[0] + dx) + (cell[1] + dy) * res + (cell[2] + dz) * res * res]
+        };
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let along_x = |dy: usize, dz: usize| lerp(at(0, dy, dz), at(1, dy, dz), frac[0]);
+        let near = lerp(along_x(0, 0), along_x(1, 0), frac[1]);
+        let far = lerp(along_x(0, 1), along_x(1, 1), frac[1]);
+        lerp(near, far, frac[2]) + outside_sq.sqrt()
+    }
+
+    /// Every second voxel centre near the surface, walked onto the zero
+    /// surface along the field's gradient
+    fn find_surface_points(&self) -> Vec<[f32; 3]> {
+        let res = self.resolution as usize;
+        let voxel = 2.0 / self.resolution as f32;
+        let mut points = Vec::new();
+        for zi in (0..res).step_by(2) {
+            for yi in (0..res).step_by(2) {
+                for xi in (0..res).step_by(2) {
+                    if self.data[xi + yi * res + zi * res * res].abs() > 1.5 * voxel {
+                        continue;
+                    }
+                    let mut p = [xi, yi, zi].map(|i| -1.0 + (i as f32 + 0.5) * voxel);
+                    for _ in 0..3 {
+                        let distance = self.sample(p);
+                        let mut gradient = [0.0f32; 3];
+                        for axis in 0..3 {
+                            let (mut hi, mut lo) = (p, p);
+                            hi[axis] += voxel;
+                            lo[axis] -= voxel;
+                            gradient[axis] = self.sample(hi) - self.sample(lo);
+                        }
+                        let len = dot3(gradient, gradient).sqrt();
+                        if len < 1e-6 {
+                            break;
+                        }
+                        for axis in 0..3 {
+                            p[axis] -= distance * gradient[axis] / len;
+                        }
+                    }
+                    if self.sample(p).abs() < 0.25 * voxel {
+                        points.push(p);
+                    }
+                }
+            }
+        }
+        points
+    }
 }
 
 /// CPU-side mesh data extracted from a GLB file, normalized to [-1, 1]^3
@@ -291,7 +362,9 @@ fn voxelize_sdf(vertices: &[MeshVertex], indices: &[u32], resolution: u32) -> Sd
         }
     }
 
-    SdfData { data, resolution }
+    let mut sdf = SdfData { data, resolution, surface_points: Vec::new() };
+    sdf.surface_points = sdf.find_surface_points();
+    sdf
 }
 
 /// Möller–Trumbore ray-triangle intersection.

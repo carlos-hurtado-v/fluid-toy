@@ -303,7 +303,7 @@ impl App {
 
     /// Integrate dynamic rigid bodies on CPU (Static/Kinematic bodies are
     /// pose-driven and intentionally skip the container clamp so obstacles
-    /// can be embedded in walls/floor)
+    /// can be embedded in walls/floor), then resolve body-body contacts
     fn integrate_rigid_bodies(&mut self) {
         let num_substeps = self.state.simulation.substeps;
         let substep_dt = self.simulation_substep_dt();
@@ -314,6 +314,9 @@ impl App {
                 let fluid_density = self.state.sph.rest_density();
                 let kernel_radius = self.state.sph.kernel_radius;
                 let particles_per_volume = fluid_density / self.state.sph.mass.max(1e-6);
+                // What each body arrives with, before this frame's forces
+                let arrival: Vec<[f32; 3]> =
+                    self.state.rigid_bodies.iter().map(|body| body.velocity).collect();
                 for (i, body) in self
                     .state
                     .rigid_bodies
@@ -335,6 +338,16 @@ impl App {
                         );
                     }
                 }
+                // Bodies do not see each other until here: collide them at
+                // the poses the fluid just moved them to
+                crate::simulation::resolve_body_contacts(
+                    &mut self.state.rigid_bodies,
+                    &arrival,
+                    &self.state.container,
+                    num_substeps as f32 * substep_dt,
+                    fluid_density,
+                    self.sdf_data.as_ref(),
+                );
             }
         }
     }
