@@ -79,6 +79,7 @@ pub struct GtaoRenderer {
 }
 
 impl GtaoRenderer {
+    #[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let half_width = (width / 2).max(1);
         let half_height = (height / 2).max(1);

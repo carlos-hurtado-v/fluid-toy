@@ -89,6 +89,7 @@ pub struct ContainerRenderer {
 }
 
 impl ContainerRenderer {
+    #[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
     pub fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
@@ -107,7 +108,13 @@ impl ContainerRenderer {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Container Shader"),
             source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/container.wgsl")).into(),
+                format!(
+                    "{}\n{}\n{}",
+                    container_common_wgsl,
+                    include_str!("../shaders/sh_common.wgsl"),
+                    include_str!("../shaders/container.wgsl")
+                )
+                .into(),
             ),
         });
 

@@ -83,16 +83,7 @@ fn grid_to_world(grid_pos: vec3<f32>) -> vec3<f32> {
     return params.grid_min + grid_pos * params.cell_size;
 }
 
-// Octahedral unit vector, 16 + 16 bits (encoder: mc_voxel_normals.wgsl - keep
-// in sync)
-fn oct_decode(v: u32) -> vec3<f32> {
-    let o = (vec2<f32>(f32(v & 0xffffu), f32(v >> 16u)) - 32767.0) / 32767.0;
-    var n = vec3<f32>(o.x, o.y, 1.0 - abs(o.x) - abs(o.y));
-    let t = max(-n.z, 0.0);
-    n.x += select(t, -t, n.x >= 0.0);
-    n.y += select(t, -t, n.y >= 0.0);
-    return normalize(n);
-}
+// oct_decode(): octahedral_common.wgsl, prepended at module creation
 
 // The normal at a grid point: the field's gradient, denoised on calm water.
 // mc_voxel_normals.wgsl writes it for this pass and for mc_render's

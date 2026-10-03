@@ -3,6 +3,7 @@
 use crate::state::{AoDebugMode, AppState, BackgroundMode, ContainerStyle, FluidRenderMode, ForceMode, HdrEnvironment, McGridResolution, RigidBodyConfig, RigidBodyMotion, RigidBodyShape, SimulationConfig, MAX_RIGID_BODIES};
 
 /// Renders the control panel and returns any triggered action
+#[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
 pub fn render_control_panel(ctx: &egui::Context, state: &mut AppState) -> GuiAction {
     let mut action = GuiAction::None;
 

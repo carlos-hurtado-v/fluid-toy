@@ -1,7 +1,7 @@
 // Screen-space fluid rendering — Composition / Water Shading
 // Fullscreen pass that reads filtered depth, thickness, normals, and the
 // pre-rendered opaque scene (environment + container + rigid body + spray,
-// with depth), then applies the same PBR water shading as mc_render.wgsl.
+// with depth), then applies the same PBR water shading as mc_render (mc_render/main.wgsl).
 // Writes every pixel: water shading where the water surface is the nearest
 // thing, the opaque scene elsewhere. Refraction samples the scene texture,
 // so submerged objects are visible through the water.
@@ -80,45 +80,10 @@ struct VertexOutput {
 
 const PI: f32 = 3.14159265359;
 
-// Whitewater composite constants — keep in sync with mc_render.wgsl (same
-// field, same calibration; the two modes must read foam identically)
-const FOAM_DENSITY_LO: f32 = 0.07;
-const FOAM_COVERAGE_K: f32 = 1.1;
-const FOAM_NOISE_SCALE: f32 = 50.0;
-const FOAM_NOISE_SCALE_FINE: f32 = 187.0;
-const FOAM_NOISE_BREAKUP: f32 = 0.9;
-const FOAM_TEX_CONTRAST: f32 = 0.22;
-const FOAM_TEX_CONTRAST_FINE: f32 = 0.13;
-const FOAM_ALBEDO: vec3<f32> = vec3<f32>(0.34, 0.36, 0.37);
-const FOAM_VEIL_ALBEDO: vec3<f32> = vec3<f32>(0.22, 0.26, 0.29);
-const FOAM_THICK_LO: f32 = 0.45;
-const FOAM_THICK_HI: f32 = 0.85;
-const AERATION_K: f32 = 0.15;
-const AERATION_ALBEDO: vec3<f32> = vec3<f32>(0.22, 0.27, 0.31);
-
-fn hash2(p: vec2<f32>) -> f32 {
-    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-}
-
-// Smooth value noise with analytic gradient (returns: vec3(noise, dN/dx, dN/dz))
-fn value_noise_grad(p: vec2<f32>) -> vec3<f32> {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-    let du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
-
-    let a = hash2(i + vec2<f32>(0.0, 0.0));
-    let b = hash2(i + vec2<f32>(1.0, 0.0));
-    let c = hash2(i + vec2<f32>(0.0, 1.0));
-    let d = hash2(i + vec2<f32>(1.0, 1.0));
-
-    let val = a + (b - a) * u.x + (c - a) * u.y + (a - b - c + d) * u.x * u.y;
-    let dx = du.x * ((b - a) + (a - b - c + d) * u.y);
-    let dy = du.y * ((c - a) + (a - b - c + d) * u.x);
-    return vec3<f32>(val, dx, dy);
-}
+// Prepended at module creation (screen_space_fluid.rs): water_common.wgsl
+// (GGX BRDF, physical water medium, whitewater calibration: one copy for this
+// shader and the MC water shader), noise_common.wgsl (hash2,
+// value_noise_grad), sh_common.wgsl (evaluate_sh_irradiance).
 
 // Fullscreen triangle (3 vertices cover entire screen)
 @vertex
@@ -139,96 +104,6 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-// === PBR: GGX/Cook-Torrance BRDF ===
-fn D_GGX(NdotH: f32, alpha: f32) -> f32 {
-    let a2 = alpha * alpha;
-    let d = NdotH * NdotH * (a2 - 1.0) + 1.0;
-    return a2 / (PI * d * d);
-}
-
-fn G_SchlickGGX(NdotX: f32, k: f32) -> f32 {
-    return NdotX / (NdotX * (1.0 - k) + k);
-}
-
-fn G_Smith(NdotV: f32, NdotL: f32, roughness: f32) -> f32 {
-    let r = roughness + 1.0;
-    let k = (r * r) / 8.0;
-    return G_SchlickGGX(NdotV, k) * G_SchlickGGX(NdotL, k);
-}
-
-// === Physical water medium (keep in sync: mc_render.wgsl / ss_composite.wgsl) ===
-// Single scattering in a homogeneous medium along the in-water view path:
-//   interior = background * exp(-sigma_t d) + in-scattered sun + sky
-// Absorption is pure water at representative R/G/B wavelengths (Pope & Fry
-// 1997, ~620 / 550 / 460 nm, per metre). Scattering (turbidity) comes from
-// the Clarity slider, its spectral shape from the water color. The body
-// color is not set by hand: it emerges as (sigma_s / sigma_t) x light x phase.
-const WATER_ABSORPTION: vec3<f32> = vec3<f32>(0.30, 0.055, 0.015);
-// Clarity 0 -> 3 /m (murky), 1 -> 0.02 /m (very clear pool), log-mapped;
-// the 0.65 default is ~0.1 /m, a real swimming pool
-const TURBIDITY_MAX: f32 = 3.0;
-const TURBIDITY_MIN: f32 = 0.02;
-// Particle scattering is forward-peaked (Henyey-Greenstein g), with a small
-// isotropic lobe so skylight and the sun still backscatter a little
-const PHASE_G: f32 = 0.85;
-const PHASE_ISOTROPIC: f32 = 0.2;
-// Diffuse skylight under water: transmission through the surface and the
-// mean cosine of the downwelling light field
-const SKY_TRANSMISSION: f32 = 0.93;
-const SKY_MEAN_COSINE: f32 = 0.8;
-
-struct Medium {
-    transmittance: vec3<f32>,
-    inscatter: vec3<f32>,
-}
-
-fn medium_scattering() -> vec3<f32> {
-    let turbidity = TURBIDITY_MAX * pow(TURBIDITY_MIN / TURBIDITY_MAX, water.clarity);
-    let c = water.water_color;
-    return turbidity * c / max(max(c.r, c.g), max(c.b, 1e-4));
-}
-
-fn medium_phase(cos_theta: f32) -> f32 {
-    let g2 = PHASE_G * PHASE_G;
-    let hg = (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * PHASE_G * cos_theta, 1.5));
-    return mix(hg, 1.0 / (4.0 * PI), PHASE_ISOTROPIC);
-}
-
-// `d`: path length in water along the view ray. `view_in`: refracted view
-// direction inside the water (travelling away from the camera). `sun_rgb`:
-// sun irradiance (zero when off or shadowed). `sky_down`: sky irradiance on a
-// horizontal surface. Light enters through the mean (flat) surface and the
-// path is taken to start at the surface (side faces start deeper: their sun
-// in-scatter is overestimated). In-scattered radiance leaves the water
-// scaled by 1/n^2; the exit Fresnel is applied by the caller's mix.
-fn water_medium(d: f32, view_in: vec3<f32>, sun_dir: vec3<f32>, sun_rgb: vec3<f32>, sky_down: vec3<f32>) -> Medium {
-    let sigma_s = medium_scattering();
-    let sigma_t = WATER_ABSORPTION + sigma_s;
-    var m: Medium;
-    m.transmittance = exp(-sigma_t * d);
-    // Depth gained per unit of path (0 for a horizontal ray)
-    let cos_v = max(-view_in.y, 0.0);
-
-    // Skylight: diffuse downwelling field, dimming with depth
-    let k_sky = sigma_t * (1.0 + cos_v / SKY_MEAN_COSINE);
-    let sky_scalar = sky_down * (SKY_TRANSMISSION / SKY_MEAN_COSINE);
-    var inscatter = sigma_s * sky_scalar / (4.0 * PI) * (1.0 - exp(-k_sky * d)) / k_sky;
-
-    // Sun: a refracted beam, dimming along its own (steeper) path with depth
-    if (sun_dir.y > 0.0) {
-        let s_in = refract(-sun_dir, vec3<f32>(0.0, 1.0, 0.0), 1.0 / water.ior);
-        let cos_s = max(-s_in.y, 0.05);
-        let f0 = pow((water.ior - 1.0) / (water.ior + 1.0), 2.0);
-        let entry = 1.0 - (f0 + (1.0 - f0) * pow(1.0 - sun_dir.y, 5.0));
-        // Irradiance across the beam: refraction narrows it by cos_L / cos_s
-        let beam = sun_rgb * entry * sun_dir.y / cos_s;
-        let k_sun = sigma_t * (1.0 + cos_v / cos_s);
-        inscatter += sigma_s * medium_phase(dot(s_in, -view_in)) * beam * (1.0 - exp(-k_sun * d)) / k_sun;
-    }
-    m.inscatter = inscatter / (water.ior * water.ior);
-    return m;
-}
-
 // Sample equirectangular environment map. Same convention as the CPU SH
 // projection (compute_sh_irradiance in environment.rs): row 0 = +Y, and
 // u = phi / 2pi for dir = (sin t cos phi, cos t, sin t sin phi). (The old
@@ -241,20 +116,6 @@ fn sample_environment(dir: vec3<f32>) -> vec3<f32> {
     // Level 0 explicitly: the map carries mips for the MC renderer's filtered
     // lookups, and implicit derivatives of u jump at the +-pi seam
     return textureSampleLevel(env_tex, tex_sampler, vec2<f32>(u, v), 0.0).rgb;
-}
-
-// Evaluate order-2 spherical harmonics irradiance
-fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
-    var irradiance = sh_coeffs[0].rgb * 0.282095;
-    irradiance += sh_coeffs[1].rgb * 0.488603 * n.y;
-    irradiance += sh_coeffs[2].rgb * 0.488603 * n.z;
-    irradiance += sh_coeffs[3].rgb * 0.488603 * n.x;
-    irradiance += sh_coeffs[4].rgb * 1.092548 * n.x * n.y;
-    irradiance += sh_coeffs[5].rgb * 1.092548 * n.y * n.z;
-    irradiance += sh_coeffs[6].rgb * 0.315392 * (3.0 * n.z * n.z - 1.0);
-    irradiance += sh_coeffs[7].rgb * 1.092548 * n.x * n.z;
-    irradiance += sh_coeffs[8].rgb * 0.546274 * (n.x * n.x - n.y * n.y);
-    return max(irradiance, vec3<f32>(0.0));
 }
 
 // Reconstruct view-space position from UV and linear depth
@@ -452,7 +313,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         // pinpoint glints that bloom into white sparkle noise.
         sun_specular = min(sun_specular, vec3<f32>(3.0));
 
-        // Body light sees the mean (flat) surface, not the facet — see mc_render.wgsl
+        // Body light sees the mean (flat) surface, not the facet — see mc_render/main.wgsl
         let light_entering = max(light_dir.y, 0.0) * (1.0 - F_spec);
         let interior_glow = water.water_color * transmittance;
         sun_subsurface = interior_glow * light_entering * light.sun_color * light.sun_intensity * 0.18;
@@ -488,7 +349,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     // === AERATION (submerged whitewater) ===
     // G channel of the whitewater field: milkiness INSIDE the water, mixed
     // before the Fresnel combine so reflections survive on top. Same mapping
-    // as mc_render.wgsl.
+    // as mc_render/main.wgsl.
     let whitewater_field = textureSampleLevel(foam_density_tex, tex_sampler, input.uv, 0.0).rg;
     let aeration = 1.0 - exp(-AERATION_K * water.aeration_strength * whitewater_field.g);
     if (aeration > 0.002) {
@@ -501,7 +362,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         lit_interior = mix(lit_interior, AERATION_ALBEDO * aeration_light, aeration);
     }
 
-    // Below-horizon reflection rays mostly hit more water (see mc_render.wgsl)
+    // Below-horizon reflection rays mostly hit more water (see mc_render/main.wgsl)
     reflection_color += lit_interior * below_horizon;
 
     var color = mix(lit_interior, reflection_color, fresnel);
@@ -510,7 +371,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     // === FOAM OVERLAY ===
     // R channel: surface whitening after the Fresnel combine (foam is rough
     // and diffuse — it replaces the specular water response). Same mapping as
-    // mc_render.wgsl.
+    // mc_render/main.wgsl.
     let foam_density = whitewater_field.r;
     if (foam_density > 0.01) {
         let n_coarse = value_noise_grad(world_pos.xz * FOAM_NOISE_SCALE).x;

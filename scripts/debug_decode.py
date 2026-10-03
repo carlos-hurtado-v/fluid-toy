@@ -15,7 +15,7 @@ then
 Prints a histogram for the region (whole image by default) and writes a
 false-color map (default: <capture>_<mode>.png) with the region outlined.
 
-Encoding (written by debug_view_output() in src/shaders/mc_render.wgsl; the id
+Encoding (written by debug_view_output() in src/shaders/mc_render/debug_records.wgsl; the id
 tables below must match its DBG_PATH_* / DBG_END_* constants):
   paths : R = path id / 16, G = lookup id / 8, B = (mirror bounces + 1) / 8
   lookup: R, G = screen uv of the final background lookup, B = lookup id / 8

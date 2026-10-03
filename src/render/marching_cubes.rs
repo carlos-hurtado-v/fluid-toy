@@ -1,662 +1,115 @@
 //! Marching Cubes fluid surface renderer
 //!
-//! Generates a triangle mesh from particle density field using the marching cubes algorithm.
+//! Generates a triangle mesh from the particle density field with marching
+//! cubes and shades it as water. This file only wires the passes together
+//! (construction, per-frame order, resize / grid rebuild / HDR switch); each
+//! pass lives in its own module:
+//!
+//! - field: mc_anisotropy -> mc_field (density, blur) -> calm_smoothing ->
+//!   wall_bound -> voxel_normals -> mc_mesh
+//! - screen: mc_faces (front/back G-buffers) -> mc_backdrop + mc_background
+//!   (scene behind the water, mips) -> mc_ssr -> mc_water (mc_probe for
+//!   `--probe`)
+//!
+//! A new pass gets its own `mc_<pass>.rs` with `new` / `update` / `encode`
+//! (and `resize` / `rebuild_bind_groups` if it owns sized resources), on the
+//! wall_bound.rs pattern; this file only constructs it and calls it.
 
-use bytemuck::{Pod, Zeroable};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use wgpu::util::DeviceExt;
+use std::cell::Cell;
 
 use super::calm_smoothing::CalmSmoothing;
-use super::mc_tables::{EDGE_TABLE, TRI_TABLE};
+use super::mc_anisotropy::AnisotropyPass;
+use super::mc_backdrop::Backdrop;
+use super::mc_background::Background;
+use super::mc_faces::FaceBuffers;
+use super::mc_field::{BlurPass, DensityInputs, DensityPass, FieldTextures, GpuGridParams, SimBuffers};
+use super::mc_mesh::{MeshPass, MAX_VERTICES};
+use super::mc_probe::PixelProbe;
+use super::mc_ssr::Ssr;
+use super::mc_water::{FoamMapViews, SharedBuffers, VolumeBindings, WaterBindings, WaterPass};
 use super::voxel_normals::VoxelNormals;
 use super::wall_bound::WallBound;
 use super::ContainerRenderer;
 use super::RigidBodyRenderer;
 use super::SprayRenderer;
 use crate::render::GpuCameraParams;
-use crate::state::{GpuContainerGeometry, GpuEnvironmentParams, GpuLightParams, GpuShCoefficients, GpuSsrParams};
+use crate::state::{GpuContainerGeometry, GpuEnvironmentParams, GpuLightParams, GpuShCoefficients};
 
-/// Maximum vertices for the output mesh buffer.
-/// Capped at 4M to avoid absurd VRAM allocation (96 MB at 24 bytes/vertex).
-/// The atomic counter in the generate shader handles overflow gracefully.
-const MAX_VERTICES: u32 = 4_000_000;
+pub use super::mc_anisotropy::ANISO_MAX_STRETCH;
+pub use super::mc_probe::{ProbeDump, PROBE_MAX_PIXELS};
+pub use super::mc_water::GpuWaterParams;
 
-/// Hard cap on anisotropic ellipsoid axis scale. Bounds the density pass
-/// neighbor search radius (and the MC grid margin in app.rs). 1.6 covers the
-/// flat-sheet case fully (in-plane stretch kr^(1/3) ≈ 1.59 at kr = 4) while
-/// keeping the gather loop footprint small; only extreme strings get capped.
-pub const ANISO_MAX_STRETCH: f32 = 1.6;
-/// Yu & Turk k_r: max ratio between largest and smallest covariance stddev.
-const ANISO_KR: f32 = 4.0;
-/// Center smoothing factor toward the weighted neighbor mean (Yu & Turk λ).
-const ANISO_LAMBDA: f32 = 0.9;
-/// Covariance neighborhood radius as a multiple of the sim kernel radius.
-const ANISO_SUPPORT_SCALE: f32 = 2.0;
-/// Center smoothing shift cap as a multiple of the sim kernel radius.
-const ANISO_MAX_SHIFT_SCALE: f32 = 0.4;
-/// Bytes per ParticleAniso record (3 × vec4<f32>).
-const ANISO_STRIDE: u64 = 48;
-
-/// Anisotropic kernel parameters (matches AnisoParams in mc_anisotropy.wgsl
-/// and mc_density.wgsl — all scalars, no padding needed).
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct GpuAnisoParams {
-    enabled: u32,
-    strength: f32,
-    support_radius: f32,
-    h_mc: f32,
-    kr: f32,
-    lambda: f32,
-    max_stretch: f32,
-    max_shift: f32,
-}
-
-/// Grid parameters for compute shaders
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct GpuGridParams {
-    pub grid_min: [f32; 3],
-    pub grid_size: u32,
-    pub grid_max: [f32; 3],
-    pub cell_size: f32,
-    pub kernel_radius: f32,
-    pub iso_value: f32,
-    pub num_particles: u32,
-    pub max_vertices: u32,
-}
-
-/// Blur parameters for density field smoothing
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct GpuBlurParams {
-    dir_x: i32,
-    dir_y: i32,
-    dir_z: i32,
-    radius: i32,
-    grid_size: u32,
-    _pad: [u32; 3],
-}
-
-/// Water shading parameters
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct GpuWaterParams {
-    pub water_color: [f32; 3],
-    pub roughness: f32,
-    pub ior: f32,
-    pub refraction_strength: f32,
-    pub env_intensity: f32,
-    pub use_env_background: u32,
-    pub background_r: f32,
-    pub background_g: f32,
-    pub background_b: f32,
-    pub time: f32,
-    pub deep_color_r: f32,
-    pub deep_color_g: f32,
-    pub deep_color_b: f32,
-    pub ripple_strength: f32,
-    pub clarity: f32,
-    /// Mode slot: the SS path stores its debug-view index here, the MC path
-    /// its physical-refraction flag (1 = Snell two-interface, 0 = legacy offset)
-    pub _pad1: f32,
-    /// Master scale on surface foam coverage response (whitewater GUI)
-    pub foam_coverage: f32,
-    /// Master scale on entrained-air milkiness (whitewater GUI)
-    pub aeration_strength: f32,
-    /// 1 = physical water medium (absorption + single scattering), 0 = legacy
-    pub physical_medium: f32,
-    /// Enabled rigid bodies at the front of the MC body array (refraction
-    /// rays intersect them exactly; the SS path leaves it 0)
-    pub body_count: u32,
-    /// McDebugView::as_u32 (0 = off)
-    pub debug_view: u32,
-    /// rendering.mc_silhouette_exit (McSilhouetteExit::as_u32)
-    pub silhouette_exit: u32,
-    /// rendering.mc_front_face_exit
-    pub front_exit: u32,
-    /// Ground-projected backdrop (GpuEnvironmentParams): escaping refraction
-    /// rays that head down land on it
-    pub ground_enabled: u32,
-    pub ground_y: f32,
-    pub ground_capture_height: f32,
-    /// rendering.mc_filtered_lookup
-    pub filtered_lookup: u32,
-    /// rendering.mc_volume_trace
-    pub volume_trace: u32,
-    pub _pad_g: [u32; 2],
-}
-
-impl Default for GpuWaterParams {
-    fn default() -> Self {
-        Self {
-            water_color: [0.1, 0.4, 0.8],
-            roughness: 0.03,
-            ior: 1.333,
-            refraction_strength: 0.15,
-            env_intensity: 1.0,
-            use_env_background: 1,
-            background_r: 0.15,
-            background_g: 0.15,
-            background_b: 0.2,
-            time: 0.0,
-            deep_color_r: 0.01,
-            deep_color_g: 0.04,
-            deep_color_b: 0.1,
-            ripple_strength: 0.015,
-            clarity: 0.65,
-            _pad1: 0.0,
-            foam_coverage: 0.8,
-            aeration_strength: 0.95,
-            physical_medium: 1.0,
-            body_count: 0,
-            debug_view: 0,
-            silhouette_exit: 0,
-            front_exit: 0,
-            ground_enabled: 0,
-            ground_y: 0.0,
-            ground_capture_height: 0.0,
-            filtered_lookup: 0,
-            volume_trace: 0,
-            _pad_g: [0; 2],
-        }
-    }
-}
-
-/// Vertex output from marching cubes
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct McVertex {
-    pub position: [f32; 3],
-    pub normal: [f32; 3],
-}
-
-/// Atomic counter for vertex allocation
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct Counter {
-    vertex_count: u32,
-}
-
-fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("MC Depth Texture"),
+/// Foam density field (half-res: cheaper splatting + free smoothing when the
+/// water shader samples it with a linear filter)
+fn create_foam_density_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let foam_density_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Foam Density Texture"),
         size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
+            width: (width / 2).max(1),
+            height: (height / 2).max(1),
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
-}
-
-/// Create a depth texture that can be sampled (for back-face depth / thickness calculation)
-fn create_samplable_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("MC Back Depth Texture"),
-        size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
+        format: super::spray_renderer::FOAM_DENSITY_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
-}
-
-/// Create a normal G-buffer texture for SSR (smooth world-space normals, Rgba16Float)
-fn create_normal_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("MC Normal G-Buffer"),
-        size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
-}
-
-/// Bind groups (density field in texture A / in texture B) that hand the water
-/// shader the field the mesh was extracted from, for its world-space in-water
-/// test (group 1 of the water pipeline)
-fn create_volume_bind_groups(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    density_view: &wgpu::TextureView,
-    density_view_b: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-    grid_params_buffer: &wgpu::Buffer,
-    tri_table_buffer: &wgpu::Buffer,
-    voxel_normals: &wgpu::TextureView,
-) -> [wgpu::BindGroup; 2] {
-    [density_view, density_view_b].map(|view| {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Water Volume BG"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: grid_params_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: tri_table_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(voxel_normals) },
-            ],
-        })
-    })
-}
-
-/// Levels in the refraction background's mip chain (level 5 = a 32-texel
-/// footprint; anisotropic filtering stretches that 16x along one axis)
-const BACKGROUND_MIPS: u32 = 6;
-
-/// The scene behind the water (backdrop, container, bodies, spray), read by
-/// screen-space refraction and SSR. Drawn at level 0; the levels below are
-/// regenerated every frame so that lookups which shrink the image (grazing
-/// mirrors, strong lensing) read a footprint instead of skipping texels.
-struct BackgroundTexture {
-    _texture: wgpu::Texture,
-    /// Level 0 alone: the render attachment, and what SSR reads
-    view: wgpu::TextureView,
-    /// Every level: the water shader's refraction lookups
-    mip_view: wgpu::TextureView,
-    /// Per generated level: its view, and a bind group reading the level above
-    mip_passes: Vec<(wgpu::TextureView, wgpu::BindGroup)>,
-}
-
-fn create_background_texture(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-    width: u32,
-    height: u32,
-    mip_layout: &wgpu::BindGroupLayout,
-    mip_sampler: &wgpu::Sampler,
-) -> BackgroundTexture {
-    let (width, height) = (width.max(1), height.max(1));
-    let mip_level_count = BACKGROUND_MIPS.min(width.min(height).ilog2() + 1);
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("MC Background Texture"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let level_view = |level: u32| {
-        texture.create_view(&wgpu::TextureViewDescriptor {
-            base_mip_level: level,
-            mip_level_count: Some(1),
-            ..Default::default()
-        })
-    };
-    let view = level_view(0);
-    let mip_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let mip_passes = (1..mip_level_count)
-        .map(|level| {
-            let source = level_view(level - 1);
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("MC Background Mip BG"),
-                layout: mip_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&source) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(mip_sampler) },
-                ],
-            });
-            (level_view(level), bind_group)
-        })
-        .collect();
-    BackgroundTexture { _texture: texture, view, mip_view, mip_passes }
-}
-
-/// Create MSAA color texture (for multisampled rendering)
-fn create_msaa_texture(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32, sample_count: u32) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("MC MSAA Color Texture"),
-        size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
-}
-
-/// Create multisampled depth texture
-fn create_msaa_depth_texture(device: &wgpu::Device, width: u32, height: u32, sample_count: u32) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("MC MSAA Depth Texture"),
-        size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
+    let foam_density_view =
+        foam_density_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (foam_density_texture, foam_density_view)
 }
 
 pub struct MarchingCubesRenderer {
-    // Density field (3D texture) - two textures for ping-pong blur
-    density_texture: wgpu::Texture,
-    density_view: wgpu::TextureView,
-    density_texture_b: wgpu::Texture,
-    _density_view_b: wgpu::TextureView,
-
-    // MSAA render targets
-    msaa_texture: Option<wgpu::Texture>,
-    msaa_view: Option<wgpu::TextureView>,
-    sample_count: u32,
-
-    // Depth buffers for rendering (multisampled if MSAA enabled)
-    depth_texture: wgpu::Texture,
-    depth_view: wgpu::TextureView,
-    // Single-sampled depth for background pass (always 1x)
-    background_depth_texture: wgpu::Texture,
-    background_depth_view: wgpu::TextureView,
-    // Front face depth for GTAO (single-sampled, samplable)
-    front_depth_texture: wgpu::Texture,
-    front_depth_view: wgpu::TextureView,
-    // Front face normal G-buffer for SSR (smooth interpolated normals)
-    normal_texture: wgpu::Texture,
-    normal_view: wgpu::TextureView,
-    // Front face depth+normal pipeline (cull none, writes depth + normals)
-    front_face_pipeline: wgpu::RenderPipeline,
-
-    // Back face depth for thickness calculation
-    back_depth_texture: wgpu::Texture,
-    back_depth_view: wgpu::TextureView,
-    back_depth_sampler: wgpu::Sampler,
-    // Back face normals (outward, w = 1 where present): the exit interface
-    // for two-interface refraction, written alongside back_depth
-    back_normal_texture: wgpu::Texture,
-    back_normal_view: wgpu::TextureView,
-    // Background texture for screen-space refraction (+ its mip chain)
-    background: BackgroundTexture,
-    mip_pipeline: wgpu::RenderPipeline,
-    mip_bind_group_layout: wgpu::BindGroupLayout,
-    mip_sampler: wgpu::Sampler,
-    /// Clamped trilinear + anisotropic: the water's filtered lookups
-    background_sampler: wgpu::Sampler,
-    /// rendering.mc_filtered_lookup (set with the water params): whether the
-    /// mip chain is needed this frame
-    filtered_lookup: std::cell::Cell<bool>,
-    // Half-res foam density field, splatted by SprayRenderer and composited
-    // by the water shader (foam reads as connected patches, not sprites)
-    foam_density_texture: wgpu::Texture,
-    foam_density_view: wgpu::TextureView,
-    // Surface foam map (simulation::FoamMap): foam layer, coarse surface grid
-    // (column tops) and its params, composited on the top surface
-    foam_map_view: wgpu::TextureView,
-    foam_surface_view: wgpu::TextureView,
-    foam_map_params: wgpu::Buffer,
-    foam_coords_view: wgpu::TextureView,
-
-    // Buffers
-    grid_params_buffer: wgpu::Buffer,
-    _edge_table_buffer: wgpu::Buffer,
-    _tri_table_buffer: wgpu::Buffer,
-    counter_buffer: wgpu::Buffer,
-    vertex_buffer: wgpu::Buffer,
-    camera_buffer: wgpu::Buffer,
-    water_params_buffer: wgpu::Buffer,
-    // Render-side rigid body array (same layout as the body renderer uses),
-    // for exact ray-body hits in refraction: the depth buffer only holds the
-    // camera-facing side of a body
-    bodies_buffer: wgpu::Buffer,
-    // Pixel probe (--probe): record buffer (a placeholder until enabled), the
-    // probed pixels, and the probe variant of the water pipeline
-    probe_buffer: wgpu::Buffer,
-    probe_pixels: Vec<[u32; 2]>,
-    probe_pipeline: Option<wgpu::RenderPipeline>,
-    render_pipeline_layout: wgpu::PipelineLayout,
-    scene_format: wgpu::TextureFormat,
-    light_params_buffer: wgpu::Buffer,
-    env_params_buffer: wgpu::Buffer,
-    sh_coefficients_buffer: wgpu::Buffer,
-    indirect_buffer: wgpu::Buffer,  // For indirect draw calls
-
-    // Pipelines
-    density_pipeline: wgpu::ComputePipeline,
-    generate_pipeline: wgpu::ComputePipeline,
+    // --- The density field and the passes that fill it, in frame order ---
+    field: FieldTextures,
     // Anisotropic kernel pass (Yu & Turk): covariance + eigensolve per particle
-    aniso_pipeline: wgpu::ComputePipeline,
-    aniso_params_buffer: wgpu::Buffer,
-    aniso_buffer: wgpu::Buffer,
-    aniso_capacity: u32,
-    back_face_pipeline: wgpu::RenderPipeline,  // Renders back faces for thickness
-    render_pipeline: wgpu::RenderPipeline,
-    env_pipeline: wgpu::RenderPipeline,        // MSAA version for main render
-    env_pipeline_1x: wgpu::RenderPipeline,     // Single-sampled for background pass
-
-    // Blur pipeline and bind groups
-    blur_pipeline: wgpu::ComputePipeline,
-    blur_params_buffers: [wgpu::Buffer; 3], // X, Y, Z directions
-    // blur_bind_groups[dir][0] = a->b, blur_bind_groups[dir][1] = b->a
-    blur_bind_groups: [[wgpu::BindGroup; 2]; 3],
+    aniso: AnisotropyPass,
+    density: DensityPass,
+    blur: BlurPass,
     // Bulk-gated smoothing of calm water (half-res helper fields + combine)
     calm: CalmSmoothing,
     // Ends the field on the container walls (last field pass)
     wall_bound: WallBound,
     // Normal at every voxel of the final field, for generate and the water shader
     voxel_normals: VoxelNormals,
-
-    // Bind groups
-    _density_bind_group: wgpu::BindGroup,
-    generate_bind_group: wgpu::BindGroup,
-    generate_bind_group_b: wgpu::BindGroup, // reads from density_b (used after blur)
-    back_face_bind_group: wgpu::BindGroup,
-    render_bind_group: wgpu::BindGroup,
-    // The density field for the water shader's world-space in-water test:
-    // [field in texture A, field in texture B], chosen by where this frame's
-    // generate() left the result
-    volume_bind_group_layout: wgpu::BindGroupLayout,
-    volume_sampler: wgpu::Sampler,
-    volume_bind_groups: [wgpu::BindGroup; 2],
+    mesh: MeshPass,
+    /// Which field texture this frame's generate() left the result in
     result_in_b: bool,
-    env_bind_group: wgpu::BindGroup,
-
-    // Bind group layouts (needed for recreating bind groups on resize)
-    render_bind_group_layout: wgpu::BindGroupLayout,
-
-    // Container geometry (shared: geometry, rotation, physics, clip)
-    container_geom_buffer: wgpu::Buffer,
-
-    // SSR (screen-space reflections)
-    ssr_texture: wgpu::Texture,
-    ssr_view: wgpu::TextureView,
-    ssr_pipeline: wgpu::ComputePipeline,
-    ssr_bind_group: wgpu::BindGroup,
-    ssr_bind_group_layout: wgpu::BindGroupLayout,
-    ssr_params_buffer: wgpu::Buffer,
-    ssr_color_sampler: wgpu::Sampler,
-
-    // For reading back vertex count
-    counter_staging_buffer: wgpu::Buffer,
-    // Some(flag) while a staging map is in flight or mapped; the flag is set
-    // by the map_async callback. While Some, the staging buffer must not be
-    // copied into (validation error), so generate() skips that copy.
-    counter_map_done: Option<Arc<AtomicBool>>,
-    // A counter copy was encoded whose result hasn't been mapped yet
-    counter_copy_in_flight: bool,
-
-    // Current vertex count (updated after generate pass)
-    current_vertex_count: u32,
-
-    // Per-frame bind groups cached across frames; invalidated when the sim
-    // buffers they bind are swapped out (sim rebuild), the aniso buffer
-    // grows, or the density grid is rebuilt.
-    cached_density_bg: Option<wgpu::BindGroup>,
-    cached_aniso_bg: Option<wgpu::BindGroup>,
+    /// The sim buffers the density / anisotropy passes cached their bind
+    /// groups over; a sim rebuild swaps them out
     cached_sim_buffers: Option<[wgpu::Buffer; 4]>,
+
+    // --- Screen-space inputs of the water pass ---
+    faces: FaceBuffers,
+    background: Background,
+    backdrop: Backdrop,
+    ssr: Ssr,
+    /// rendering.mc_filtered_lookup (set with the water params): whether the
+    /// background's mip chain is needed this frame
+    filtered_lookup: Cell<bool>,
+    // Half-res foam density field, splatted by SprayRenderer and composited
+    // by the water shader (foam reads as connected patches, not sprites)
+    _foam_density_texture: wgpu::Texture,
+    foam_density_view: wgpu::TextureView,
+    foam_map: FoamMapViews,
+
+    // --- The water pass ---
+    buffers: SharedBuffers,
+    water: WaterPass,
+    // Pixel probe (--probe): the records its shader variant writes
+    probe: PixelProbe,
 
     // Grid bounds
     grid_min: [f32; 3],
     grid_max: [f32; 3],
-
-    // Screen dimensions for depth buffer
-    width: u32,
-    height: u32,
-    surface_format: wgpu::TextureFormat,
-
     // MC grid resolution (cells per dimension)
     grid_size: u32,
-}
 
-/// Pixel probe (--probe) record layout: mirrors ProbeBuffer in
-/// mc_probe_on.wgsl (header, PROBE_MAX_PIXELS pixel slots, then fragment
-/// slots of 2 + PROBE_EVENT_VEC4S * PROBE_EVENTS_PER_SLOT vec4s)
-pub const PROBE_MAX_PIXELS: usize = 64;
-const PROBE_EVENTS_PER_SLOT: u32 = 256;
-/// vec4s per event: (a.xyz, tag), (b.xyz, c), d
-const PROBE_EVENT_VEC4S: u64 = 3;
-/// Fragment slots: every fragment shading a probed pixel takes one (occluded
-/// ones and MSAA edge triangles included)
-const PROBE_MAX_SLOTS: u64 = 4 * PROBE_MAX_PIXELS as u64;
-const PROBE_HEADER_BYTES: u64 = 16 + 16 * PROBE_MAX_PIXELS as u64;
-
-fn create_probe_buffer(device: &wgpu::Device, slots: u64) -> wgpu::Buffer {
-    let slot_bytes = 16 * (2 + PROBE_EVENT_VEC4S * PROBE_EVENTS_PER_SLOT as u64);
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("MC Probe Records"),
-        size: PROBE_HEADER_BYTES + slots * slot_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    })
-}
-
-/// One fragment that shaded a probed pixel: its recorded refraction events,
-/// each [tag, a.x, a.y, a.z, b.x, b.y, b.z, c, d.x, d.y, d.z, d.w]
-/// (scripts/probe_decode.py names
-/// them; tags are the PRB_* constants in mc_render.wgsl)
-#[derive(serde::Serialize)]
-pub struct ProbeFragment {
-    pub pixel: [u32; 2],
-    pub frag_xy: [f32; 2],
-    pub depth: f32,
-    pub overflow: bool,
-    pub events: Vec<[f32; 12]>,
-}
-
-#[derive(serde::Serialize)]
-pub struct ProbeDump {
-    pub pixels: Vec<[u32; 2]>,
-    pub events_per_slot: u32,
-    pub slots_dropped: u32,
-    pub fragments: Vec<ProbeFragment>,
-}
-
-/// The water shader: container_common + a pixel-probe snippet + mc_render.
-/// Normal rendering links no-op stubs: any storage write in the fragment
-/// shader can cost the pass its early depth test.
-fn water_render_shader(device: &wgpu::Device, probe: bool) -> wgpu::ShaderModule {
-    let probe_wgsl = if probe {
-        include_str!("../shaders/mc_probe_on.wgsl")
-    } else {
-        include_str!("../shaders/mc_probe_off.wgsl")
-    };
-    device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(if probe { "MC Render Shader (probe)" } else { "MC Render Shader" }),
-        source: wgpu::ShaderSource::Wgsl(
-            format!(
-                "{}\n{}\n{}",
-                include_str!("../shaders/container_common.wgsl"),
-                probe_wgsl,
-                include_str!("../shaders/mc_render.wgsl"),
-            )
-            .into(),
-        ),
-    })
-}
-
-fn water_render_pipeline(
-    device: &wgpu::Device,
-    layout: &wgpu::PipelineLayout,
-    render_shader: &wgpu::ShaderModule,
-    surface_format: wgpu::TextureFormat,
-    sample_count: u32,
-) -> wgpu::RenderPipeline {
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("MC Render Pipeline"),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: render_shader,
-            entry_point: Some("vs_main"),
-            buffers: &[],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: render_shader,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Cw,  // MC triangles are clockwise
-            cull_mode: Some(wgpu::Face::Back),  // Cull back faces (render front only)
-            unclipped_depth: false,
-            polygon_mode: wgpu::PolygonMode::Fill,
-            conservative: false,
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        multisample: wgpu::MultisampleState {
-            count: sample_count,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-        multiview: None,
-        cache: None,
-    })
+    // Screen dimensions
+    width: u32,
+    height: u32,
 }
 
 impl MarchingCubesRenderer {
@@ -672,10 +125,6 @@ impl MarchingCubesRenderer {
         grid_size: u32,
         foam_map: &crate::simulation::FoamMap,
     ) -> Self {
-        let foam_map_view = foam_map.foam_view().clone();
-        let foam_surface_view = foam_map.surface_view().clone();
-        let foam_map_params = foam_map.params_buffer().clone();
-        let foam_coords_view = foam_map.coords_view().clone();
         // Clamp sample count to valid values (1, 2, 4, 8)
         // Note: Not all GPUs support 8x MSAA - wgpu will validate this
         let sample_count = match sample_count {
@@ -694,2020 +143,125 @@ impl MarchingCubesRenderer {
         let extent_z = grid_max[2] - grid_min[2];
         let cell_size = extent_x.max(extent_y).max(extent_z) / grid_size as f32;
 
-        // Create 3D density texture
-        let density_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("MC Density Field"),
-            size: wgpu::Extent3d {
-                width: grid_size,
-                height: grid_size,
-                depth_or_array_layers: grid_size,
+        let buffers = SharedBuffers::new(
+            device,
+            &GpuGridParams {
+                grid_min,
+                grid_size,
+                grid_max,
+                cell_size,
+                kernel_radius: 0.1,
+                iso_value: 500.0, // Will be tuned based on rest_density
+                num_particles: 0,
+                max_vertices: MAX_VERTICES,
             },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let density_view = density_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Second density texture for ping-pong blur
-        let density_texture_b = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("MC Density Field B"),
-            size: wgpu::Extent3d {
-                width: grid_size,
-                height: grid_size,
-                depth_or_array_layers: grid_size,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let density_view_b = density_texture_b.create_view(&wgpu::TextureViewDescriptor::default());
-        let calm = CalmSmoothing::new(device, grid_size, &density_view, &density_view_b);
-
-        // Create MSAA textures if sample_count > 1
-        let (msaa_texture, msaa_view) = if sample_count > 1 {
-            let (tex, view) = create_msaa_texture(device, surface_format, width, height, sample_count);
-            (Some(tex), Some(view))
-        } else {
-            (None, None)
-        };
-
-        // Create depth texture for rendering (multisampled if MSAA enabled)
-        let (depth_texture, depth_view) = if sample_count > 1 {
-            create_msaa_depth_texture(device, width, height, sample_count)
-        } else {
-            create_depth_texture(device, width, height)
-        };
-
-        // Create front-face depth texture for GTAO (samplable, always single-sampled)
-        let (front_depth_texture, front_depth_view) = create_samplable_depth_texture(device, width, height);
-
-        // Create normal G-buffer for SSR (smooth interpolated world normals)
-        let (normal_texture, normal_view) = create_normal_texture(device, width, height);
-
-        // Create back-face depth texture for thickness calculation (samplable, always single-sampled)
-        let (back_depth_texture, back_depth_view) = create_samplable_depth_texture(device, width, height);
-        let (back_normal_texture, back_normal_view) = create_normal_texture(device, width, height);
-        let back_depth_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("MC Back Depth Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        // Foam density field (half-res: cheaper splatting + free smoothing
-        // when the water shader samples it with a linear filter)
-        let foam_density_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Foam Density Texture"),
-            size: wgpu::Extent3d {
-                width: (width / 2).max(1),
-                height: (height / 2).max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: super::spray_renderer::FOAM_DENSITY_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let foam_density_view =
-            foam_density_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Create background texture for screen-space refraction, and the
-        // pass that fills its mip chain
-        let mip_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Mip Downsample Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mip_downsample.wgsl").into()),
-        });
-        let mip_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Mip Downsample BGL"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let mip_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Mip Downsample Pipeline Layout"),
-            bind_group_layouts: &[&mip_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-        let mip_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Mip Downsample Pipeline"),
-            layout: Some(&mip_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &mip_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &mip_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-        let mip_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Mip Downsample Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let background_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("MC Background Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
-            anisotropy_clamp: 16,
-            ..Default::default()
-        });
-        let background = create_background_texture(
-            device, surface_format, width, height, &mip_bind_group_layout, &mip_sampler,
         );
 
-        // Create single-sampled depth texture for background pass (always 1x, samplable for SSR)
-        let (background_depth_texture, background_depth_view) = create_samplable_depth_texture(device, width, height);
-
-        // Create buffers
-        let grid_params = GpuGridParams {
-            grid_min,
-            grid_size,
-            grid_max,
-            cell_size,
-            kernel_radius: 0.1,
-            iso_value: 500.0,  // Will be tuned based on rest_density
-            num_particles: 0,
-            max_vertices: MAX_VERTICES,
-        };
-        let grid_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Grid Params"),
-            contents: bytemuck::bytes_of(&grid_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-        });
-
-        // Edge table buffer
-        let edge_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Edge Table"),
-            contents: bytemuck::cast_slice(&EDGE_TABLE),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        // Triangle table buffer (flatten 2D array)
-        let tri_table_flat: Vec<i32> = TRI_TABLE.iter().flatten().copied().collect();
-        let tri_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Tri Table"),
-            contents: bytemuck::cast_slice(&tri_table_flat),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        // Counter buffer
-        let counter = Counter { vertex_count: 0 };
-        let counter_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Counter"),
-            contents: bytemuck::bytes_of(&counter),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Staging buffer for reading back counter
-        let counter_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MC Counter Staging"),
-            size: std::mem::size_of::<Counter>() as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Indirect draw buffer: [vertex_count, instance_count, first_vertex, first_instance]
-        let indirect_data: [u32; 4] = [0, 1, 0, 0];
-        let indirect_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Indirect Draw"),
-            contents: bytemuck::cast_slice(&indirect_data),
-            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Vertex buffer
-        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MC Vertices"),
-            size: (MAX_VERTICES as usize * std::mem::size_of::<McVertex>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: false,
-        });
-
-        // Camera buffer
-        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MC Camera"),
-            size: std::mem::size_of::<GpuCameraParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Water params buffer
-        let water_params = GpuWaterParams::default();
-        let water_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Water Params"),
-            contents: bytemuck::bytes_of(&water_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let bodies_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Rigid Bodies"),
-            contents: bytemuck::cast_slice(
-                &[crate::state::GpuRigidBodyRender::default(); crate::state::MAX_RIGID_BODIES],
-            ),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-        // Placeholder until enable_probe: the normal shader never touches it
-        let probe_buffer = create_probe_buffer(device, 1);
-
-        // Container geometry buffer (shared struct: geometry, rotation, physics, clip)
-        let container_geom = GpuContainerGeometry::zeroed();
-        let container_geom_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Container Geometry"),
-            contents: bytemuck::bytes_of(&container_geom),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        // The density field and the passes that fill it
+        let field = FieldTextures::new(device, grid_size);
+        let calm = CalmSmoothing::new(device, grid_size, &field.view_a, &field.view_b);
         let wall_bound = WallBound::new(
             device,
             grid_size,
-            &density_view,
-            &density_view_b,
-            &grid_params_buffer,
-            &container_geom_buffer,
+            &field.view_a,
+            &field.view_b,
+            &buffers.grid_params,
+            &buffers.container_geom,
         );
         let voxel_normals = VoxelNormals::new(
             device,
             grid_size,
-            &density_view,
-            &density_view_b,
-            &grid_params_buffer,
+            &field.view_a,
+            &field.view_b,
+            &buffers.grid_params,
             calm.gate_view(),
         );
+        let aniso = AnisotropyPass::new(device);
+        let density = DensityPass::new(device);
+        let blur = BlurPass::new(device, grid_size, &field);
+        let mesh = MeshPass::new(device, &field, &buffers.grid_params, voxel_normals.view());
 
-        // Light params buffer
-        let light_params = GpuLightParams {
-            sun_direction: [0.5, 0.8, 0.3],
-            sun_enabled: 1,
-            sun_color: [1.0, 0.95, 0.85],
-            sun_intensity: 2.0,
-            ambient_intensity: 1.0,
-            _pad0: [0.0; 3],
-            _padding: [0.0; 3],
-            _pad1: 0.0,
-        };
-        let light_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Light Params"),
-            contents: bytemuck::bytes_of(&light_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Environment params buffer (background mode, color, intensity)
-        let env_params = GpuEnvironmentParams::default();
-        let env_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Env Params"),
-            contents: bytemuck::bytes_of(&env_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // SH coefficients buffer (144 bytes)
-        let sh_coefficients = GpuShCoefficients::default();
-        let sh_coefficients_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC SH Coefficients"),
-            contents: bytemuck::bytes_of(&sh_coefficients),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // === SSR resources ===
-        let ssr_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SSR Texture"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let ssr_view = ssr_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let ssr_params = GpuSsrParams::default();
-        let ssr_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("SSR Params"),
-            contents: bytemuck::bytes_of(&ssr_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Load shaders (prepend container_common.wgsl to those that use ContainerGeometry)
-        let container_common_wgsl = include_str!("../shaders/container_common.wgsl");
-
-        let density_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MC Density Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/mc_density.wgsl")).into(),
-            ),
-        });
-
-        let aniso_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MC Anisotropy Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/mc_anisotropy.wgsl")).into(),
-            ),
-        });
-
-        let generate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MC Generate Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_generate.wgsl").into()),
-        });
-
-        let render_shader = water_render_shader(device, false);
-
-        let env_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MC Environment Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_environment.wgsl").into()),
-        });
-
-        let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MC Blur Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_blur.wgsl").into()),
-        });
-
-        let back_depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("MC Back Depth Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{}", container_common_wgsl, include_str!("../shaders/mc_back_depth.wgsl")).into(),
-            ),
-        });
-
-        let ssr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("SSR Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/ssr.wgsl").into()),
-        });
-
-        // === Density Pipeline ===
-        let density_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MC Density BGL"),
-            entries: &[
-                // Sorted particles (storage buffer, bound dynamically from SPH sim)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // MC grid params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Density field (write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R32Float,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                    },
-                    count: None,
-                },
-                // Container geometry (for boundary gamma correction + clipping)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // SPH cell_starts (storage buffer, from SPH spatial hash grid)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // SPH cell_counts (storage buffer, from SPH spatial hash grid)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // SPH grid params (uniform)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Anisotropic kernel records (from mc_anisotropy pass)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Anisotropic kernel params (uniform)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let density_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("MC Density Pipeline Layout"),
-            bind_group_layouts: &[&density_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let density_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("MC Density Pipeline"),
-            layout: Some(&density_pipeline_layout),
-            module: &density_shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        // === Anisotropy Pipeline (Yu & Turk per-particle ellipsoid fit) ===
-        let aniso_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MC Anisotropy BGL"),
-            entries: &[
-                // Sorted particles (read)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // SPH cell_starts
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // SPH cell_counts
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // SPH grid params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Aniso params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Output records
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Container geometry (walls mirror the neighbourhood)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let aniso_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("MC Anisotropy Pipeline Layout"),
-            bind_group_layouts: &[&aniso_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let aniso_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("MC Anisotropy Pipeline"),
-            layout: Some(&aniso_pipeline_layout),
-            module: &aniso_shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        let aniso_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MC Aniso Params"),
-            contents: bytemuck::bytes_of(&GpuAnisoParams::zeroed()),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Per-particle ellipsoid records; grown lazily in generate()
-        let aniso_capacity: u32 = 1024;
-        let aniso_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MC Aniso Records"),
-            size: aniso_capacity as u64 * ANISO_STRIDE,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        // === Generate Pipeline ===
-        let generate_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MC Generate BGL"),
-            entries: &[
-                // Density field (read)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Grid params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Edge table
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Tri table
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Counter
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Vertices
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Voxel normals (octahedral, R32Uint)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let generate_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("MC Generate Pipeline Layout"),
-            bind_group_layouts: &[&generate_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let generate_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("MC Generate Pipeline"),
-            layout: Some(&generate_pipeline_layout),
-            module: &generate_shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        // Generate bind group
-        let generate_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Generate BG"),
-            layout: &generate_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&density_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: grid_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: edge_table_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: tri_table_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: counter_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: vertex_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(voxel_normals.view()),
-                },
-            ],
-        });
-
-        // Generate bind group B (reads from density_b, used after blur)
-        let generate_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Generate BG B"),
-            layout: &generate_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&density_view_b),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: grid_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: edge_table_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: tri_table_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: counter_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: vertex_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(voxel_normals.view()),
-                },
-            ],
-        });
-
-        // === Blur Pipeline ===
-        let blur_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MC Blur BGL"),
-            entries: &[
-                // Input density field (read)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Output density field (write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R32Float,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                    },
-                    count: None,
-                },
-                // Blur params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("MC Blur Pipeline Layout"),
-            bind_group_layouts: &[&blur_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let blur_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("MC Blur Pipeline"),
-            layout: Some(&blur_pipeline_layout),
-            module: &blur_shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        // Create 3 blur param buffers (one per direction: X, Y, Z)
-        let directions: [[i32; 3]; 3] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-        let blur_params_buffers: [wgpu::Buffer; 3] = std::array::from_fn(|i| {
-            let params = GpuBlurParams {
-                dir_x: directions[i][0],
-                dir_y: directions[i][1],
-                dir_z: directions[i][2],
-                radius: 2, // default
-                grid_size,
-                _pad: [0; 3],
-            };
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(&format!("MC Blur Params {}", ["X", "Y", "Z"][i])),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            })
-        });
-
-        // Create 6 blur bind groups: [direction][a_to_b=0, b_to_a=1]
-        let blur_bind_groups: [[wgpu::BindGroup; 2]; 3] = std::array::from_fn(|dir| {
-            [
-                // a -> b
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("MC Blur BG {} A->B", ["X", "Y", "Z"][dir])),
-                    layout: &blur_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&density_view_b) },
-                        wgpu::BindGroupEntry { binding: 2, resource: blur_params_buffers[dir].as_entire_binding() },
-                    ],
-                }),
-                // b -> a
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("MC Blur BG {} B->A", ["X", "Y", "Z"][dir])),
-                    layout: &blur_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view_b) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&density_view) },
-                        wgpu::BindGroupEntry { binding: 2, resource: blur_params_buffers[dir].as_entire_binding() },
-                    ],
-                }),
-            ]
-        });
-
-        // === Render Pipeline ===
-        let render_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MC Render BGL"),
-            entries: &[
-                // Camera
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Water params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Vertices
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Environment texture
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Environment sampler
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // Back depth texture (for thickness)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Depth sampler
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // Background texture (for screen-space refraction)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Light params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // SH irradiance coefficients
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // SSR texture
-                wgpu::BindGroupLayoutEntry {
-                    binding: 10,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Container clip params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 11,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Foam density field (half-res, splatted by SprayRenderer)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 12,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Back face normals (refraction exit interface)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 13,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Background depth (what the refracted ray lands on)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 14,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Surface foam map + coarse surface grid + params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 15,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 16,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 17,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Foam flow-map coordinates (advected lace pattern)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 18,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Rigid bodies (exact refraction hits)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 19,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Front faces: nearest-surface depth + normals (pass 0a), for
-                // rays leaving the water through a camera-facing surface
-                wgpu::BindGroupLayoutEntry {
-                    binding: 21,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 22,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Background sampler for filtered refraction lookups
-                wgpu::BindGroupLayoutEntry {
-                    binding: 23,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // Pixel probe records (only the --probe shader variant uses it)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 20,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let volume_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MC Water Volume BGL"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        // R32Float, trilinear (FLOAT32_FILTERABLE is required at device creation)
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Marching-cubes triangle table: the shader rebuilds the
-                // mesh's triangles in a cell to read its normal there
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Voxel normals (octahedral, R32Uint): the normals the mesh
-                // was built from
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let volume_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("MC Water Volume Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let volume_bind_groups = create_volume_bind_groups(
-            device, &volume_bind_group_layout, &density_view, &density_view_b, &volume_sampler, &grid_params_buffer,
-            &tri_table_buffer, voxel_normals.view(),
-        );
-
-        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("MC Render Pipeline Layout"),
-            bind_group_layouts: &[&render_bind_group_layout, &volume_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let render_pipeline = water_render_pipeline(
+        // Screen-space inputs of the water pass
+        let faces = FaceBuffers::new(
             device,
-            &render_pipeline_layout,
-            &render_shader,
-            surface_format,
-            sample_count,
-        );
-
-        // === Back Face Pipeline (for thickness) ===
-        let back_face_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MC Back Face BGL"),
-            entries: &[
-                // Camera: fragment too, to orient back-face normals away from the eye
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Container clip params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let back_face_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("MC Back Face Pipeline Layout"),
-            bind_group_layouts: &[&back_face_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let back_face_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("MC Back Face Pipeline"),
-            layout: Some(&back_face_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &back_depth_shader,
-                entry_point: Some("vs_normal"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &back_depth_shader,
-                entry_point: Some("fs_back_normal"),
-                // Back-face normals for the refraction exit interface
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Cw,  // MC triangles are clockwise
-                cull_mode: Some(wgpu::Face::Front),  // Cull front faces (render back only)
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        // === Front Face Pipeline (depth + normal G-buffer for GTAO + SSR) ===
-        let front_face_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("MC Front Face Pipeline"),
-            layout: Some(&back_face_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &back_depth_shader,
-                entry_point: Some("vs_normal"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &back_depth_shader,
-                entry_point: Some("fs_normal"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Cw,
-                // For GTAO input we need nearest visible depth regardless of winding.
-                // Marching-cubes output can have local winding inconsistencies, so
-                // culling here creates missing depth regions and unstable AO.
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        let back_face_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Back Face BG"),
-            layout: &back_face_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: vertex_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: container_geom_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Render BG"),
-            layout: &render_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: water_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: vertex_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(env_texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(env_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&back_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(&back_depth_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&background.mip_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: light_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: sh_coefficients_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: wgpu::BindingResource::TextureView(&ssr_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: container_geom_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: wgpu::BindingResource::TextureView(&foam_density_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 13,
-                    resource: wgpu::BindingResource::TextureView(&back_normal_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 14,
-                    resource: wgpu::BindingResource::TextureView(&background_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 15,
-                    resource: wgpu::BindingResource::TextureView(&foam_map_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 16,
-                    resource: wgpu::BindingResource::TextureView(&foam_surface_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 17,
-                    resource: foam_map_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 18,
-                    resource: wgpu::BindingResource::TextureView(&foam_coords_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 19,
-                    resource: bodies_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 20,
-                    resource: probe_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 21,
-                    resource: wgpu::BindingResource::TextureView(&front_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 22,
-                    resource: wgpu::BindingResource::TextureView(&normal_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 23,
-                    resource: wgpu::BindingResource::Sampler(&background_sampler),
-                },
-            ],
-        });
-
-        // === SSR Compute Pipeline ===
-        let ssr_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("SSR BGL"),
-            entries: &[
-                // Camera uniform
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Front depth (water surface)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Background depth (scene without water)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Background color
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Depth sampler
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // Color sampler
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // SSR params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // SSR output
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-                // Normal G-buffer (smooth world normals from front face pass)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let ssr_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("SSR Pipeline Layout"),
-            bind_group_layouts: &[&ssr_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let ssr_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("SSR Pipeline"),
-            layout: Some(&ssr_pipeline_layout),
-            module: &ssr_shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        let color_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("SSR Color Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        let ssr_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("SSR BG"),
-            layout: &ssr_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&front_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&background_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&background.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&back_depth_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Sampler(&color_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: ssr_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&ssr_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wgpu::BindingResource::TextureView(&normal_view),
-                },
-            ],
-        });
-
-        // === Environment Pipeline ===
-        let env_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("MC Env BGL"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,  // Used in both vertex and fragment
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let env_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("MC Env Pipeline Layout"),
-            bind_group_layouts: &[&env_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let env_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("MC Env Pipeline"),
-            layout: Some(&env_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &env_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &env_shader,
-                // Writes the projected ground's depth (refraction + SSR see it)
-                entry_point: Some("fs_ground"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,  // Draw at far plane
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: sample_count,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
-
-        // Single-sampled env pipeline for background pass
-        let env_pipeline_1x = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("MC Env Pipeline 1x"),
-            layout: Some(&env_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &env_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &env_shader,
-                // Writes the projected ground's depth (refraction + SSR see it)
-                entry_point: Some("fs_ground"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),  // 1x
-            multiview: None,
-            cache: None,
-        });
-
-        let env_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Env BG"),
-            layout: &env_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(env_texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(env_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: env_params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Placeholder density bind group (will be recreated each frame with SPH grid buffers)
-        let placeholder_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Placeholder"),
-            size: 64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM,
-            mapped_at_creation: false,
-        });
-        let density_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Density BG Placeholder"),
-            layout: &density_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: placeholder_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: grid_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&density_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: container_geom_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: placeholder_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: placeholder_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: placeholder_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: aniso_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: aniso_params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        Self {
-            density_texture,
-            density_view,
-            density_texture_b,
-            _density_view_b: density_view_b,
-            msaa_texture,
-            msaa_view,
-            sample_count,
-            depth_texture,
-            depth_view,
-            background_depth_texture,
-            background_depth_view,
-            front_depth_texture,
-            front_depth_view,
-            normal_texture,
-            normal_view,
-            front_face_pipeline,
-            back_depth_texture,
-            back_depth_view,
-            back_depth_sampler,
-            back_normal_texture,
-            back_normal_view,
-            background,
-            mip_pipeline,
-            mip_bind_group_layout,
-            mip_sampler,
-            background_sampler,
-            filtered_lookup: std::cell::Cell::new(true),
-            foam_density_texture,
-            foam_density_view,
-            foam_map_view,
-            foam_surface_view,
-            foam_map_params,
-            foam_coords_view,
-            grid_params_buffer,
-            _edge_table_buffer: edge_table_buffer,
-            _tri_table_buffer: tri_table_buffer,
-            counter_buffer,
-            vertex_buffer,
-            camera_buffer,
-            water_params_buffer,
-            bodies_buffer,
-            probe_buffer,
-            probe_pixels: Vec::new(),
-            probe_pipeline: None,
-            render_pipeline_layout,
-            volume_bind_group_layout,
-            volume_sampler,
-            volume_bind_groups,
-            result_in_b: false,
-            scene_format: surface_format,
-            light_params_buffer,
-            env_params_buffer,
-            sh_coefficients_buffer,
-            indirect_buffer,
-            density_pipeline,
-            generate_pipeline,
-            aniso_pipeline,
-            aniso_params_buffer,
-            aniso_buffer,
-            aniso_capacity,
-            back_face_pipeline,
-            render_pipeline,
-            env_pipeline,
-            env_pipeline_1x,
-            blur_pipeline,
-            blur_params_buffers,
-            blur_bind_groups,
-            wall_bound,
-            voxel_normals,
-            calm,
-            _density_bind_group: density_bind_group,
-            generate_bind_group,
-            generate_bind_group_b,
-            back_face_bind_group,
-            render_bind_group,
-            env_bind_group,
-            render_bind_group_layout,
-            counter_staging_buffer,
-            counter_map_done: None,
-            counter_copy_in_flight: false,
-            current_vertex_count: 0,
-            cached_density_bg: None,
-            cached_aniso_bg: None,
-            cached_sim_buffers: None,
-            grid_min,
-            grid_max,
             width,
             height,
+            &buffers.camera,
+            mesh.vertex_buffer(),
+            &buffers.container_geom,
+        );
+        let background = Background::new(device, surface_format, width, height);
+        let backdrop = Backdrop::new(device, surface_format, sample_count, &buffers.camera, env_texture_view, env_sampler);
+        let ssr = Ssr::new(device, width, height, &buffers.camera, &faces, &background);
+        let (foam_density_texture, foam_density_view) = create_foam_density_texture(device, width, height);
+        let foam_map = FoamMapViews {
+            map_view: foam_map.foam_view().clone(),
+            surface_view: foam_map.surface_view().clone(),
+            params: foam_map.params_buffer().clone(),
+            coords_view: foam_map.coords_view().clone(),
+        };
+
+        // The water pass
+        let probe = PixelProbe::new(device);
+        let water = WaterPass::new(
+            device,
             surface_format,
-            ssr_texture,
-            ssr_view,
-            ssr_pipeline,
-            ssr_bind_group,
-            ssr_bind_group_layout,
-            ssr_params_buffer,
-            ssr_color_sampler: color_sampler,
+            width,
+            height,
+            sample_count,
+            &WaterBindings {
+                buffers: &buffers,
+                vertices: mesh.vertex_buffer(),
+                env_view: env_texture_view,
+                env_sampler,
+                faces: &faces,
+                background: &background,
+                ssr: &ssr,
+                foam_density_view: &foam_density_view,
+                foam_map: &foam_map,
+                probe: &probe,
+            },
+            &VolumeBindings {
+                field: &field,
+                grid_params: &buffers.grid_params,
+                tri_table: mesh.tri_table_buffer(),
+                voxel_normals: voxel_normals.view(),
+            },
+        );
 
-            container_geom_buffer,
+        Self {
+            field,
+            aniso,
+            density,
+            blur,
+            calm,
+            wall_bound,
+            voxel_normals,
+            mesh,
+            result_in_b: false,
+            cached_sim_buffers: None,
+            faces,
+            background,
+            backdrop,
+            ssr,
+            filtered_lookup: Cell::new(true),
+            _foam_density_texture: foam_density_texture,
+            foam_density_view,
+            foam_map,
+            buffers,
+            water,
+            probe,
+            grid_min,
+            grid_max,
             grid_size,
+            width,
+            height,
         }
-    }
-
-    /// Create density bind group with SPH grid buffers for accelerated neighbor search
-    pub fn create_density_bind_group(
-        &self,
-        device: &wgpu::Device,
-        sorted_particle_buffer: &wgpu::Buffer,
-        cell_starts_buffer: &wgpu::Buffer,
-        cell_counts_buffer: &wgpu::Buffer,
-        sph_grid_params_buffer: &wgpu::Buffer,
-    ) -> wgpu::BindGroup {
-        let layout = self.density_pipeline.get_bind_group_layout(0);
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Density BG"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: sorted_particle_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.grid_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.density_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.container_geom_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: cell_starts_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: cell_counts_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: sph_grid_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: self.aniso_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: self.aniso_params_buffer.as_entire_binding(),
-                },
-            ],
-        })
     }
 
     /// Get the front-face depth view (for GTAO input)
     pub fn front_depth_view(&self) -> &wgpu::TextureView {
-        &self.front_depth_view
+        self.faces.front_depth_view()
     }
 
     /// Target for the foam density splat pass (rendered by SprayRenderer)
@@ -2716,15 +270,15 @@ impl MarchingCubesRenderer {
     }
 
     pub fn update_camera(&self, queue: &wgpu::Queue, params: &GpuCameraParams) {
-        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(params));
+        queue.write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(params));
     }
 
     pub fn update_light_params(&self, queue: &wgpu::Queue, params: &GpuLightParams) {
-        queue.write_buffer(&self.light_params_buffer, 0, bytemuck::bytes_of(params));
+        queue.write_buffer(&self.buffers.light_params, 0, bytemuck::bytes_of(params));
     }
 
     pub fn update_sh_coefficients(&self, queue: &wgpu::Queue, coeffs: &GpuShCoefficients) {
-        queue.write_buffer(&self.sh_coefficients_buffer, 0, bytemuck::bytes_of(coeffs));
+        queue.write_buffer(&self.buffers.sh_coefficients, 0, bytemuck::bytes_of(coeffs));
     }
 
     /// Voxel edge length: the grid's largest extent over its resolution
@@ -2747,21 +301,10 @@ impl MarchingCubesRenderer {
             num_particles,
             max_vertices: MAX_VERTICES,
         };
-        queue.write_buffer(&self.grid_params_buffer, 0, bytemuck::bytes_of(&params));
+        queue.write_buffer(&self.buffers.grid_params, 0, bytemuck::bytes_of(&params));
 
         // Update blur radius for all 3 direction buffers
-        let directions: [[i32; 3]; 3] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-        for (dir, buffer) in directions.iter().zip(&self.blur_params_buffers) {
-            let blur_params = GpuBlurParams {
-                dir_x: dir[0],
-                dir_y: dir[1],
-                dir_z: dir[2],
-                radius: blur_radius as i32,
-                grid_size: self.grid_size,
-                _pad: [0; 3],
-            };
-            queue.write_buffer(buffer, 0, bytemuck::bytes_of(&blur_params));
-        }
+        self.blur.update(queue, blur_radius, self.grid_size);
     }
 
     /// Where the field ends at the container walls. `kernel_radius` is the sim h.
@@ -2785,39 +328,12 @@ impl MarchingCubesRenderer {
     /// Update anisotropic kernel parameters (Yu & Turk).
     /// `kernel_radius` is the sim h; `h_mc` the MC density kernel radius.
     pub fn update_aniso_params(&self, queue: &wgpu::Queue, enabled: bool, strength: f32, kernel_radius: f32, h_mc: f32) {
-        let params = GpuAnisoParams {
-            enabled: if enabled { 1 } else { 0 },
-            strength: strength.clamp(0.0, 1.0),
-            support_radius: ANISO_SUPPORT_SCALE * kernel_radius,
-            h_mc,
-            kr: ANISO_KR,
-            lambda: ANISO_LAMBDA,
-            max_stretch: ANISO_MAX_STRETCH,
-            max_shift: ANISO_MAX_SHIFT_SCALE * kernel_radius,
-        };
-        queue.write_buffer(&self.aniso_params_buffer, 0, bytemuck::bytes_of(&params));
-    }
-
-    /// Grow the per-particle ellipsoid record buffer if needed.
-    fn ensure_aniso_capacity(&mut self, device: &wgpu::Device, num_particles: u32) {
-        if num_particles > self.aniso_capacity {
-            let capacity = num_particles.next_power_of_two().max(1024);
-            self.aniso_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("MC Aniso Records"),
-                size: capacity as u64 * ANISO_STRIDE,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-            self.aniso_capacity = capacity;
-            // Both cached bind groups reference the old aniso buffer
-            self.cached_density_bg = None;
-            self.cached_aniso_bg = None;
-        }
+        self.aniso.update_params(queue, enabled, strength, kernel_radius, h_mc);
     }
 
     /// Update environment parameters (background mode, color, intensity)
     pub fn update_env_params(&self, queue: &wgpu::Queue, params: &GpuEnvironmentParams) {
-        queue.write_buffer(&self.env_params_buffer, 0, bytemuck::bytes_of(params));
+        self.backdrop.update_params(queue, params);
     }
 
     /// Update grid bounds to match container dimensions
@@ -2837,148 +353,62 @@ impl MarchingCubesRenderer {
         self.grid_size = new_grid_size;
 
         // Recreate density textures at new resolution
-        let density_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("MC Density Field"),
-            size: wgpu::Extent3d {
-                width: new_grid_size,
-                height: new_grid_size,
-                depth_or_array_layers: new_grid_size,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let density_view = density_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let density_texture_b = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("MC Density Field B"),
-            size: wgpu::Extent3d {
-                width: new_grid_size,
-                height: new_grid_size,
-                depth_or_array_layers: new_grid_size,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let density_view_b = density_texture_b.create_view(&wgpu::TextureViewDescriptor::default());
+        let field = FieldTextures::new(device, new_grid_size);
 
         // Field passes that own per-resolution textures and bind groups
-        self.calm = CalmSmoothing::new(device, new_grid_size, &density_view, &density_view_b);
+        self.calm = CalmSmoothing::new(device, new_grid_size, &field.view_a, &field.view_b);
         self.wall_bound = WallBound::new(
             device,
             new_grid_size,
-            &density_view,
-            &density_view_b,
-            &self.grid_params_buffer,
-            &self.container_geom_buffer,
+            &field.view_a,
+            &field.view_b,
+            &self.buffers.grid_params,
+            &self.buffers.container_geom,
         );
         self.voxel_normals = VoxelNormals::new(
             device,
             new_grid_size,
-            &density_view,
-            &density_view_b,
-            &self.grid_params_buffer,
+            &field.view_a,
+            &field.view_b,
+            &self.buffers.grid_params,
             self.calm.gate_view(),
         );
-        self.volume_bind_groups = create_volume_bind_groups(
-            device, &self.volume_bind_group_layout, &density_view, &density_view_b,
-            &self.volume_sampler, &self.grid_params_buffer, &self._tri_table_buffer,
-            self.voxel_normals.view(),
+        self.water.rebuild_volume_bind_groups(
+            device,
+            &VolumeBindings {
+                field: &field,
+                grid_params: &self.buffers.grid_params,
+                tri_table: self.mesh.tri_table_buffer(),
+                voxel_normals: self.voxel_normals.view(),
+            },
         );
 
-        // Rebuild generate bind groups (reference density texture views)
-        let gen_layout = self.generate_pipeline.get_bind_group_layout(0);
-        self.generate_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Generate BG"),
-            layout: &gen_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: self.grid_params_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self._edge_table_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self._tri_table_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.counter_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: self.vertex_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(self.voxel_normals.view()) },
-            ],
-        });
-        self.generate_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Generate BG B"),
-            layout: &gen_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view_b) },
-                wgpu::BindGroupEntry { binding: 1, resource: self.grid_params_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self._edge_table_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self._tri_table_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.counter_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: self.vertex_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(self.voxel_normals.view()) },
-            ],
-        });
+        // Bind groups that reference the density texture views
+        self.mesh.rebuild_bind_groups(device, &field, &self.buffers.grid_params, self.voxel_normals.view());
+        self.blur.rebuild_bind_groups(device, &field);
 
-        // Rebuild blur bind groups (6 total: 3 directions × 2 ping-pong)
-        let blur_layout = self.blur_pipeline.get_bind_group_layout(0);
-        self.blur_bind_groups = std::array::from_fn(|dir| {
-            [
-                // a -> b
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("MC Blur BG {} A->B", ["X", "Y", "Z"][dir])),
-                    layout: &blur_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&density_view_b) },
-                        wgpu::BindGroupEntry { binding: 2, resource: self.blur_params_buffers[dir].as_entire_binding() },
-                    ],
-                }),
-                // b -> a
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("MC Blur BG {} B->A", ["X", "Y", "Z"][dir])),
-                    layout: &blur_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&density_view_b) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&density_view) },
-                        wgpu::BindGroupEntry { binding: 2, resource: self.blur_params_buffers[dir].as_entire_binding() },
-                    ],
-                }),
-            ]
-        });
+        // Store the new textures (old ones are dropped automatically)
+        self.field = field;
 
-
-        // Store new textures and views (old ones are dropped automatically)
-        self.density_texture = density_texture;
-        self.density_view = density_view;
-        self.density_texture_b = density_texture_b;
-        self._density_view_b = density_view_b;
-
-        // Cached density bind group references the old density view
-        self.cached_density_bg = None;
-        self.cached_aniso_bg = None;
+        // The cached density bind group references the old density view
+        self.density.invalidate();
+        self.aniso.invalidate();
     }
 
     /// Update container geometry (shared struct: geometry, rotation, physics, clip)
     pub fn update_container_geometry(&self, queue: &wgpu::Queue, geom: &GpuContainerGeometry) {
-        queue.write_buffer(&self.container_geom_buffer, 0, bytemuck::bytes_of(geom));
+        queue.write_buffer(&self.buffers.container_geom, 0, bytemuck::bytes_of(geom));
     }
 
     /// MC mesh vertex storage buffer (allocated once; never recreated).
     /// Used by the caustics light-space raster pass.
     pub fn mesh_vertex_buffer(&self) -> &wgpu::Buffer {
-        &self.vertex_buffer
+        self.mesh.vertex_buffer()
     }
 
     /// GPU-driven indirect draw args for the MC mesh (vertex count filled by generate)
     pub fn mesh_indirect_buffer(&self) -> &wgpu::Buffer {
-        &self.indirect_buffer
+        self.mesh.indirect_buffer()
     }
 
     /// Update water shading parameters
@@ -3039,7 +469,7 @@ impl MarchingCubesRenderer {
             volume_trace: volume_trace as u32,
             _pad_g: [0; 2],
         };
-        queue.write_buffer(&self.water_params_buffer, 0, bytemuck::bytes_of(&params));
+        queue.write_buffer(&self.buffers.water_params, 0, bytemuck::bytes_of(&params));
     }
 
     /// Upload this frame's enabled rigid bodies (render layout, in order; the
@@ -3047,7 +477,7 @@ impl MarchingCubesRenderer {
     pub fn update_bodies(&self, queue: &wgpu::Queue, bodies: &[crate::state::GpuRigidBodyRender]) {
         let count = bodies.len().min(crate::state::MAX_RIGID_BODIES);
         if count > 0 {
-            queue.write_buffer(&self.bodies_buffer, 0, bytemuck::cast_slice(&bodies[..count]));
+            queue.write_buffer(&self.buffers.bodies, 0, bytemuck::cast_slice(&bodies[..count]));
         }
     }
 
@@ -3060,175 +490,52 @@ impl MarchingCubesRenderer {
         env_sampler: &wgpu::Sampler,
         pixels: &[[u32; 2]],
     ) {
-        self.probe_pixels = pixels.iter().copied().take(PROBE_MAX_PIXELS).collect();
-        self.probe_buffer = create_probe_buffer(device, PROBE_MAX_SLOTS);
-        let shader = water_render_shader(device, true);
-        self.probe_pipeline = Some(water_render_pipeline(
-            device,
-            &self.render_pipeline_layout,
-            &shader,
-            self.scene_format,
-            self.sample_count,
-        ));
-        self.render_bind_group = self.create_render_bind_group(device, env_view, env_sampler);
+        self.probe.enable(device, pixels);
+        self.water.enable_probe(device);
+        self.rebind_water(device, env_view, env_sampler);
     }
 
     pub fn probe_enabled(&self) -> bool {
-        self.probe_pipeline.is_some()
+        self.probe.enabled()
     }
 
     /// Empty the probe records before this frame's water pass (queue writes
     /// land ahead of the next submit)
     pub fn reset_probe(&self, queue: &wgpu::Queue) {
-        if self.probe_pipeline.is_none() {
-            return;
-        }
-        let mut header = vec![0u32; PROBE_HEADER_BYTES as usize / 4];
-        header[0] = self.probe_pixels.len() as u32;
-        header[2] = PROBE_EVENTS_PER_SLOT;
-        for (i, px) in self.probe_pixels.iter().enumerate() {
-            header[4 + 4 * i] = px[0];
-            header[4 + 4 * i + 1] = px[1];
-        }
-        queue.write_buffer(&self.probe_buffer, 0, bytemuck::cast_slice(&header));
+        self.probe.reset(queue);
     }
 
     /// Read the last frame's probe records (blocking)
     pub fn read_probe(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> ProbeDump {
-        use crate::simulation::snapshot::{read_gpu, GpuSource};
-        let size = self.probe_buffer.size();
-        let bytes = read_gpu(device, queue, vec![("probe", GpuSource::Buffer { buffer: &self.probe_buffer, size })])
-            .remove(0)
-            .1;
-        let words: &[u32] = bytemuck::cast_slice(&bytes);
-        let floats: &[f32] = bytemuck::cast_slice(&bytes);
-        let slots_used = words[1] as usize;
-        let events_per_slot = words[2] as usize;
-        let stride = 4 * (2 + PROBE_EVENT_VEC4S as usize * events_per_slot);
-        let data = &floats[PROBE_HEADER_BYTES as usize / 4..];
-        let capacity = data.len() / stride;
-        let mut fragments = Vec::new();
-        for slot in 0..slots_used.min(capacity) {
-            let d = &data[slot * stride..(slot + 1) * stride];
-            let count = (d[4] as usize).min(events_per_slot);
-            let events = (0..count)
-                .map(|e| {
-                    let v = &d[8 + 12 * e..20 + 12 * e];
-                    // [tag, a.xyz, b.xyz, c, d]
-                    [v[3], v[0], v[1], v[2], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]]
-                })
-                .collect();
-            fragments.push(ProbeFragment {
-                pixel: self.probe_pixels.get(d[0] as usize).copied().unwrap_or([0, 0]),
-                frag_xy: [d[1], d[2]],
-                depth: d[3],
-                overflow: d[5] > 0.5,
-                events,
-            });
-        }
-        ProbeDump {
-            pixels: self.probe_pixels.clone(),
-            events_per_slot: events_per_slot as u32,
-            slots_dropped: slots_used.saturating_sub(capacity) as u32,
-            fragments,
-        }
+        self.probe.read(device, queue)
     }
 
     /// Field dump (--dump-field): the density field the mesh was extracted
     /// from, as last generated — grid parameters + grid_size^3 f32 (x fastest).
     /// Voxel i sits at grid_min + i * cell_size (mc_generate's convention).
     pub fn read_field(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (GpuGridParams, Vec<u8>) {
-        let n = self.grid_size;
-        let texture = if self.result_in_b { &self.density_texture_b } else { &self.density_texture };
-        let row = n * 4;
-        let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MC Field Readback"),
-            size: padded as u64 * n as u64 * n as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let params_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MC Grid Params Readback"),
-            size: std::mem::size_of::<GpuGridParams>() as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("MC Field Readback"),
-        });
-        encoder.copy_texture_to_buffer(
-            texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded),
-                    rows_per_image: Some(n),
-                },
-            },
-            wgpu::Extent3d { width: n, height: n, depth_or_array_layers: n },
-        );
-        encoder.copy_buffer_to_buffer(&self.grid_params_buffer, 0, &params_staging, 0, params_staging.size());
-        queue.submit(Some(encoder.finish()));
-        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        params_staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-
-        let params: GpuGridParams = *bytemuck::from_bytes(&params_staging.slice(..).get_mapped_range());
-        let mut bytes = Vec::with_capacity(row as usize * n as usize * n as usize);
-        {
-            let data = staging.slice(..).get_mapped_range();
-            for r in 0..(n * n) as usize {
-                let start = r * padded as usize;
-                bytes.extend_from_slice(&data[start..start + row as usize]);
-            }
-        }
-        (params, bytes)
+        self.field.read(device, queue, self.result_in_b, self.grid_size, &self.buffers.grid_params)
     }
 
     /// Set whether SSR is enabled and update GPU params
     pub fn set_ssr_enabled(&self, queue: &wgpu::Queue, enabled: bool) {
-        let params = GpuSsrParams {
-            enabled: if enabled { 1 } else { 0 },
-            ..GpuSsrParams::default()
-        };
-        queue.write_buffer(&self.ssr_params_buffer, 0, bytemuck::bytes_of(&params));
+        self.ssr.set_enabled(queue, enabled);
     }
 
     /// Per-particle ellipsoid records from the last anisotropy pass, indexed
     /// by sorted particle index (valid after run_anisotropy this frame).
     pub fn aniso_buffer(&self) -> &wgpu::Buffer {
-        &self.aniso_buffer
+        self.aniso.records()
     }
 
     /// Invalidate cached bind groups if the sim handed us different buffer
     /// objects (sim rebuild on respawn/container change swaps them out).
-    fn sync_sim_buffer_cache(
-        &mut self,
-        sorted_particle_buffer: &wgpu::Buffer,
-        cell_starts_buffer: &wgpu::Buffer,
-        cell_counts_buffer: &wgpu::Buffer,
-        sph_grid_params_buffer: &wgpu::Buffer,
-    ) {
-        let sim_buffers_changed = match &self.cached_sim_buffers {
-            Some([a, b, c, d]) => {
-                a != sorted_particle_buffer
-                    || b != cell_starts_buffer
-                    || c != cell_counts_buffer
-                    || d != sph_grid_params_buffer
-            }
-            None => true,
-        };
-        if sim_buffers_changed {
-            self.cached_sim_buffers = Some([
-                sorted_particle_buffer.clone(),
-                cell_starts_buffer.clone(),
-                cell_counts_buffer.clone(),
-                sph_grid_params_buffer.clone(),
-            ]);
-            self.cached_density_bg = None;
-            self.cached_aniso_bg = None;
+    fn sync_sim_buffer_cache(&mut self, sim: &SimBuffers) {
+        let unchanged = self.cached_sim_buffers.as_ref().is_some_and(|cached| sim.same_as(cached));
+        if !unchanged {
+            self.cached_sim_buffers = Some(sim.handles());
+            self.density.invalidate();
+            self.aniso.invalidate();
         }
     }
 
@@ -3250,64 +557,18 @@ impl MarchingCubesRenderer {
         if num_particles == 0 {
             return;
         }
-        self.sync_sim_buffer_cache(
-            sorted_particle_buffer,
-            cell_starts_buffer,
-            cell_counts_buffer,
-            sph_grid_params_buffer,
-        );
-        // May recreate aniso_buffer (invalidates both cached bind groups)
-        self.ensure_aniso_capacity(device, num_particles);
-
-        let aniso_bind_group = match &self.cached_aniso_bg {
-            Some(bg) => bg.clone(),
-            None => {
-                let layout = self.aniso_pipeline.get_bind_group_layout(0);
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("MC Anisotropy BG"),
-                    layout: &layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: sorted_particle_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: cell_starts_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: cell_counts_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: sph_grid_params_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: self.aniso_params_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: self.aniso_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: self.container_geom_buffer.as_entire_binding(),
-                        },
-                    ],
-                });
-                self.cached_aniso_bg = Some(bg.clone());
-                bg
-            }
+        let sim = SimBuffers {
+            sorted_particles: sorted_particle_buffer,
+            cell_starts: cell_starts_buffer,
+            cell_counts: cell_counts_buffer,
+            grid_params: sph_grid_params_buffer,
         };
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("MC Anisotropy Pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.aniso_pipeline);
-        pass.set_bind_group(0, &aniso_bind_group, &[]);
-        pass.dispatch_workgroups(num_particles.div_ceil(128), 1, 1);
+        self.sync_sim_buffer_cache(&sim);
+        // Growing the record buffer leaves the density bind group stale too
+        if self.aniso.ensure_capacity(device, num_particles) {
+            self.density.invalidate();
+        }
+        self.aniso.encode(encoder, device, &sim, &self.buffers.container_geom, num_particles);
     }
 
     /// Generate mesh from particles using SPH grid-accelerated density computation
@@ -3325,12 +586,18 @@ impl MarchingCubesRenderer {
         calm_smoothing: f32,
     ) {
         // Reset counter
-        encoder.clear_buffer(&self.counter_buffer, 0, None);
+        self.mesh.reset_counter(encoder);
 
         // Pass 0: Per-particle anisotropic kernel fit (covariance + eigensolve).
-        // Runs before the density bind group is created below — it may grow
-        // aniso_buffer, which that bind group references. Also syncs the sim
+        // Runs before the density pass binds its inputs — it may grow the
+        // record buffer, which that bind group references. Also syncs the sim
         // buffer cache; repeat the sync here for the aniso-disabled path.
+        let sim = SimBuffers {
+            sorted_particles: sorted_particle_buffer,
+            cell_starts: cell_starts_buffer,
+            cell_counts: cell_counts_buffer,
+            grid_params: sph_grid_params_buffer,
+        };
         if aniso_enabled && num_particles > 0 {
             self.run_anisotropy(
                 encoder,
@@ -3342,41 +609,23 @@ impl MarchingCubesRenderer {
                 num_particles,
             );
         } else {
-            self.sync_sim_buffer_cache(
-                sorted_particle_buffer,
-                cell_starts_buffer,
-                cell_counts_buffer,
-                sph_grid_params_buffer,
-            );
+            self.sync_sim_buffer_cache(&sim);
         }
-
-        // Density bind group with SPH grid buffers (cached across frames)
-        let density_bind_group = match &self.cached_density_bg {
-            Some(bg) => bg.clone(),
-            None => {
-                let bg = self.create_density_bind_group(
-                    device,
-                    sorted_particle_buffer,
-                    cell_starts_buffer,
-                    cell_counts_buffer,
-                    sph_grid_params_buffer,
-                );
-                self.cached_density_bg = Some(bg.clone());
-                bg
-            }
-        };
 
         // Pass 1: Generate density field (splat particles into texture A)
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("MC Density Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.density_pipeline);
-            pass.set_bind_group(0, &density_bind_group, &[]);
-            let workgroups = self.grid_size.div_ceil(4);
-            pass.dispatch_workgroups(workgroups, workgroups, workgroups);
-        }
+        self.density.encode(
+            encoder,
+            device,
+            &sim,
+            &DensityInputs {
+                grid_params: &self.buffers.grid_params,
+                field: &self.field.view_a,
+                container_geom: &self.buffers.container_geom,
+                aniso_records: self.aniso.records(),
+                aniso_params: self.aniso.params_buffer(),
+            },
+            self.grid_size,
+        );
 
         // Calm-surface smoothing helper fields, from the raw field in A
         // (before the base blur ping-pongs through it)
@@ -3385,26 +634,13 @@ impl MarchingCubesRenderer {
             self.calm.encode_helpers(encoder);
         }
 
-        // Pass 1.5: Blur density field (3 separable passes: X, Y, Z)
-        // After blur: result is in texture B (odd number of passes: a->b, b->a, a->b)
-        let result_in_b = if blur_radius > 0 {
-            let workgroups = self.grid_size.div_ceil(4);
-            // Pass order: X(a->b), Y(b->a), Z(a->b)
-            // a_to_b = 0, b_to_a = 1
-            let pass_sources = [0usize, 1, 0]; // which bind group variant per pass
-            for (dir, &src) in pass_sources.iter().enumerate() {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("MC Blur Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.blur_pipeline);
-                pass.set_bind_group(0, &self.blur_bind_groups[dir][src], &[]);
-                pass.dispatch_workgroups(workgroups, workgroups, workgroups);
-            }
-            true // result ends up in texture B
-        } else {
-            false // no blur, result is in texture A
-        };
+        // Pass 1.5: Blur density field (3 separable passes: X, Y, Z).
+        // After blur the result is in texture B (odd number of passes:
+        // a->b, b->a, a->b); without it, it stays in texture A
+        let result_in_b = blur_radius > 0;
+        if result_in_b {
+            self.blur.encode(encoder, self.grid_size);
+        }
         // Pass 1.6: blend calm bulk water toward the wide half-res field
         let result_in_b = if calm {
             self.calm.encode_combine(encoder, result_in_b)
@@ -3420,58 +656,21 @@ impl MarchingCubesRenderer {
         // Pass 1.8: the final field's normals, for generate and the water shader
         self.voxel_normals.encode(encoder, result_in_b);
 
-        // Pass 2: Generate triangles (read from whichever texture has the result)
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("MC Generate Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.generate_pipeline);
-            if result_in_b {
-                pass.set_bind_group(0, &self.generate_bind_group_b, &[]);
-            } else {
-                pass.set_bind_group(0, &self.generate_bind_group, &[]);
-            }
-            let workgroups = self.grid_size.div_ceil(4);
-            pass.dispatch_workgroups(workgroups, workgroups, workgroups);
-        }
-
-        // Copy counter to indirect buffer for GPU-driven draw
-        encoder.copy_buffer_to_buffer(
-            &self.counter_buffer,
-            0,
-            &self.indirect_buffer,
-            0,
-            std::mem::size_of::<u32>() as u64,  // Just the vertex_count
-        );
-
-        // Copy counter to staging buffer for readback (for stats display) —
-        // unless the staging buffer is still mapped/pending from an earlier
-        // frame, in which case skip and let the stat stay stale one frame
-        if self.counter_map_done.is_none() {
-            encoder.copy_buffer_to_buffer(
-                &self.counter_buffer,
-                0,
-                &self.counter_staging_buffer,
-                0,
-                std::mem::size_of::<Counter>() as u64,
-            );
-            self.counter_copy_in_flight = true;
-        }
+        // Pass 2: Generate triangles (read from whichever texture has the
+        // result), then hand the count to the indirect draw and the readback
+        self.mesh.encode(encoder, result_in_b, self.grid_size);
     }
 
     /// Last read-back mesh vertex count (see `read_vertex_count`)
     pub fn vertex_count(&self) -> u32 {
-        self.current_vertex_count
+        self.mesh.vertex_count()
     }
 
     /// Read back vertex count, blocking until the GPU finishes (call after
     /// submit). Exact for the frame just submitted — automation/stats runs
     /// use this so CSV rows stay deterministic.
     pub fn read_vertex_count(&mut self, device: &wgpu::Device) {
-        self.arm_counter_map();
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        self.harvest_counter_map();
+        self.mesh.read_vertex_count(device);
     }
 
     /// Non-blocking variant for interactive frames: harvests a previously
@@ -3479,45 +678,7 @@ impl MarchingCubesRenderer {
     /// The count lags a frame or two, which only affects the GUI stat —
     /// rendering uses the GPU-side indirect buffer.
     pub fn poll_vertex_count(&mut self, device: &wgpu::Device) {
-        device.poll(wgpu::PollType::Poll).ok();
-        self.harvest_counter_map();
-        self.arm_counter_map();
-    }
-
-    /// If a counter copy was submitted and no map is outstanding, start one.
-    fn arm_counter_map(&mut self) {
-        if self.counter_map_done.is_some() || !self.counter_copy_in_flight {
-            return;
-        }
-        let flag = Arc::new(AtomicBool::new(false));
-        let done = flag.clone();
-        self.counter_staging_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                if result.is_ok() {
-                    done.store(true, Ordering::Release);
-                }
-            });
-        self.counter_map_done = Some(flag);
-        self.counter_copy_in_flight = false;
-    }
-
-    /// If the outstanding map has completed, read the count and unmap.
-    fn harvest_counter_map(&mut self) {
-        let done = self
-            .counter_map_done
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire));
-        if !done {
-            return;
-        }
-        {
-            let data = self.counter_staging_buffer.slice(..).get_mapped_range();
-            let counter: &Counter = bytemuck::from_bytes(&data);
-            self.current_vertex_count = counter.vertex_count.min(MAX_VERTICES);
-        }
-        self.counter_staging_buffer.unmap();
-        self.counter_map_done = None;
+        self.mesh.poll_vertex_count(device);
     }
 
     /// Render the generated mesh with environment background.
@@ -3532,118 +693,21 @@ impl MarchingCubesRenderer {
         spray: Option<&SprayRenderer>,
         container: Option<&ContainerRenderer>,
     ) {
-        // Pass 0a: Render water front faces to depth + normal G-buffer (for GTAO + SSR)
-        {
-            let mut front_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("MC Front Face + Normal Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.normal_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.front_depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            front_pass.set_pipeline(&self.front_face_pipeline);
-            front_pass.set_bind_group(0, &self.back_face_bind_group, &[]);
-            front_pass.draw_indirect(&self.indirect_buffer, 0);
-        }
+        let indirect_buffer = self.mesh.indirect_buffer();
 
-        // Pass 0b: Render rigid body + container into front depth (depth-only, no color targets)
-        if rigid_body.is_some() || container.is_some() {
-            let mut depth_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("MC Front Depth (RB+Container)"),
-                color_attachments: &[],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.front_depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            if let Some(rb) = rigid_body {
-                rb.render_depth_only(&mut depth_pass);
-            }
-            if let Some(ct) = container {
-                ct.render_depth_only(&mut depth_pass);
-            }
-        }
+        // Pass 0a: water front faces to depth + normal G-buffer (for GTAO + SSR)
+        // Pass 0b: rigid body + container into front depth (depth-only)
+        self.faces.encode_front(encoder, indirect_buffer, rigid_body, container);
 
-        // Pass 1: Render back faces to back_depth_texture (for thickness calculation)
-        // and their normals (refraction exit interface; w = 0 where no back face)
-        {
-            let mut back_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("MC Back Face Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.back_normal_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.back_depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            back_pass.set_pipeline(&self.back_face_pipeline);
-            back_pass.set_bind_group(0, &self.back_face_bind_group, &[]);
-            // Use indirect draw - vertex count comes from GPU buffer
-            back_pass.draw_indirect(&self.indirect_buffer, 0);
-        }
+        // Pass 1: back faces to back depth (for thickness calculation) and
+        // their normals (refraction exit interface)
+        self.faces.encode_back(encoder, indirect_buffer);
 
         // Pass 2: Render environment to background texture (for screen-space refraction)
         // Uses single-sampled depth and pipeline since background_texture is single-sampled
         {
-            let mut env_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("MC Environment Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.background.view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.background_depth_view,  // Use single-sampled depth
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            env_pass.set_pipeline(&self.env_pipeline_1x);  // Use single-sampled pipeline
-            env_pass.set_bind_group(0, &self.env_bind_group, &[]);
-            env_pass.draw(0..3, 0..1);
+            let mut env_pass = self.background.begin_pass(encoder);
+            self.backdrop.draw_1x(&mut env_pass);
 
             // Render rigid body into background texture so the water shader's
             // screen-space refraction shows it through the water surface
@@ -3664,78 +728,19 @@ impl MarchingCubesRenderer {
 
         // Pass 2b: the background's mip chain, for filtered refraction lookups
         if self.filtered_lookup.get() {
-            for (view, bind_group) in &self.background.mip_passes {
-                let mut mip_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("MC Background Mip Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                mip_pass.set_pipeline(&self.mip_pipeline);
-                mip_pass.set_bind_group(0, bind_group, &[]);
-                mip_pass.draw(0..3, 0..1);
-            }
+            self.background.encode_mips(encoder);
         }
 
         // SSR compute pass: ray-march against background depth for screen-space reflections
-        // Always dispatch — shader checks enabled flag, writes zeros when disabled
-        {
-            let mut ssr_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("SSR Pass"),
-                timestamp_writes: None,
-            });
-            ssr_pass.set_pipeline(&self.ssr_pipeline);
-            ssr_pass.set_bind_group(0, &self.ssr_bind_group, &[]);
-            let wg_x = self.width.div_ceil(8);
-            let wg_y = self.height.div_ceil(8);
-            ssr_pass.dispatch_workgroups(wg_x, wg_y, 1);
-        }
+        self.ssr.encode(encoder, self.width, self.height);
 
         // Pass 3: Render water mesh with screen-space refraction from background
-        // Uses MSAA if enabled (renders to msaa_view, resolves to color_view)
+        // Uses MSAA if enabled (renders to the MSAA target, resolves to color_view)
         {
-            let (render_view, resolve_target) = if let Some(msaa_view) = &self.msaa_view {
-                (msaa_view, Some(color_view))
-            } else {
-                (color_view, None)
-            };
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("MC Water Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: render_view,
-                    resolve_target,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+            let mut pass = self.water.begin_pass(encoder, color_view);
 
             // Draw environment background first (at far plane, will show through where no water)
-            pass.set_pipeline(&self.env_pipeline);
-            pass.set_bind_group(0, &self.env_bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            self.backdrop.draw(&mut pass);
 
             // Draw rigid body into the carved-out gap before water mesh
             if let Some(rb) = rigid_body {
@@ -3748,10 +753,7 @@ impl MarchingCubesRenderer {
             }
 
             // Draw water mesh (samples background_texture for refraction)
-            pass.set_pipeline(self.probe_pipeline.as_ref().unwrap_or(&self.render_pipeline));
-            pass.set_bind_group(0, &self.render_bind_group, &[]);
-            pass.set_bind_group(1, &self.volume_bind_groups[self.result_in_b as usize], &[]);
-            pass.draw_indirect(&self.indirect_buffer, 0);
+            self.water.draw(&mut pass, indirect_buffer, self.result_in_b);
 
             // Draw whitewater after the water mesh: camera-biased foam wins the
             // depth test at the surface, while submerged bubbles fail it and
@@ -3769,270 +771,43 @@ impl MarchingCubesRenderer {
         self.width = width;
         self.height = height;
 
-        // Recreate MSAA texture if enabled
-        if self.sample_count > 1 {
-            let (msaa_texture, msaa_view) = create_msaa_texture(device, self.surface_format, width, height, self.sample_count);
-            self.msaa_texture = Some(msaa_texture);
-            self.msaa_view = Some(msaa_view);
-        }
-
-        // Recreate depth texture (multisampled if MSAA enabled)
-        let (depth_texture, depth_view) = if self.sample_count > 1 {
-            create_msaa_depth_texture(device, width, height, self.sample_count)
-        } else {
-            create_depth_texture(device, width, height)
-        };
-        self.depth_texture = depth_texture;
-        self.depth_view = depth_view;
-
-        // Recreate front depth texture (for GTAO)
-        let (front_depth_texture, front_depth_view) = create_samplable_depth_texture(device, width, height);
-        self.front_depth_texture = front_depth_texture;
-        self.front_depth_view = front_depth_view;
-
-        // Recreate normal G-buffer (for SSR)
-        let (normal_texture, normal_view) = create_normal_texture(device, width, height);
-        self.normal_texture = normal_texture;
-        self.normal_view = normal_view;
-
-        // Recreate back depth texture (always single-sampled for sampling)
-        let (back_depth_texture, back_depth_view) = create_samplable_depth_texture(device, width, height);
-        self.back_depth_texture = back_depth_texture;
-        self.back_depth_view = back_depth_view;
-        let (back_normal_texture, back_normal_view) = create_normal_texture(device, width, height);
-        self.back_normal_texture = back_normal_texture;
-        self.back_normal_view = back_normal_view;
-
-        // Recreate background depth texture (always single-sampled, samplable for SSR)
-        let (background_depth_texture, background_depth_view) = create_samplable_depth_texture(device, width, height);
-        self.background_depth_texture = background_depth_texture;
-        self.background_depth_view = background_depth_view;
-
-        // Recreate background texture
-        self.background = create_background_texture(
-            device, self.surface_format, width, height, &self.mip_bind_group_layout, &self.mip_sampler,
-        );
-
-        // Recreate foam density field (half-res)
-        let foam_density_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Foam Density Texture"),
-            size: wgpu::Extent3d {
-                width: (width / 2).max(1),
-                height: (height / 2).max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: super::spray_renderer::FOAM_DENSITY_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        self.foam_density_view =
-            foam_density_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.foam_density_texture = foam_density_texture;
-
-        // Recreate SSR texture
-        let ssr_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SSR Texture"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        self.ssr_view = ssr_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.ssr_texture = ssr_texture;
-
-        // Rebuild SSR bind group
-        self.ssr_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("SSR BG"),
-            layout: &self.ssr_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.front_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.background_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.background.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&self.back_depth_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Sampler(&self.ssr_color_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: self.ssr_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&self.ssr_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wgpu::BindingResource::TextureView(&self.normal_view),
-                },
-            ],
-        });
+        // Every screen-sized target; SSR last (it binds the others' views)
+        self.water.resize(device, width, height);
+        self.faces.resize(device, width, height);
+        self.background.resize(device, width, height);
+        let (foam_density_texture, foam_density_view) = create_foam_density_texture(device, width, height);
+        self._foam_density_texture = foam_density_texture;
+        self.foam_density_view = foam_density_view;
+        self.ssr.resize(device, width, height, &self.buffers.camera, &self.faces, &self.background);
 
         // Recreate render bind group with new textures
-        self.render_bind_group = self.create_render_bind_group(device, env_view, env_sampler);
+        self.rebind_water(device, env_view, env_sampler);
     }
 
-    /// Water render bind group over the current size-dependent views (resize)
-    /// and environment texture (HDR switch)
-    fn create_render_bind_group(&self, device: &wgpu::Device, env_view: &wgpu::TextureView, env_sampler: &wgpu::Sampler) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Render BG"),
-            layout: &self.render_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.water_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.vertex_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(env_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(env_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&self.back_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(&self.back_depth_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&self.background.mip_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: self.light_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: self.sh_coefficients_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: wgpu::BindingResource::TextureView(&self.ssr_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: self.container_geom_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: wgpu::BindingResource::TextureView(&self.foam_density_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 13,
-                    resource: wgpu::BindingResource::TextureView(&self.back_normal_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 14,
-                    resource: wgpu::BindingResource::TextureView(&self.background_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 15,
-                    resource: wgpu::BindingResource::TextureView(&self.foam_map_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 16,
-                    resource: wgpu::BindingResource::TextureView(&self.foam_surface_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 17,
-                    resource: self.foam_map_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 18,
-                    resource: wgpu::BindingResource::TextureView(&self.foam_coords_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 19,
-                    resource: self.bodies_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 20,
-                    resource: self.probe_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 21,
-                    resource: wgpu::BindingResource::TextureView(&self.front_depth_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 22,
-                    resource: wgpu::BindingResource::TextureView(&self.normal_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 23,
-                    resource: wgpu::BindingResource::Sampler(&self.background_sampler),
-                },
-            ],
-        })
+    /// Rebuild the water pass's group 0 over the current size-dependent views
+    /// (resize), environment texture (HDR switch) and probe buffer
+    fn rebind_water(&mut self, device: &wgpu::Device, env_view: &wgpu::TextureView, env_sampler: &wgpu::Sampler) {
+        let bind_group = self.water.create_bind_group(
+            device,
+            &WaterBindings {
+                buffers: &self.buffers,
+                vertices: self.mesh.vertex_buffer(),
+                env_view,
+                env_sampler,
+                faces: &self.faces,
+                background: &self.background,
+                ssr: &self.ssr,
+                foam_density_view: &self.foam_density_view,
+                foam_map: &self.foam_map,
+                probe: &self.probe,
+            },
+        );
+        self.water.set_bind_group(bind_group);
     }
 
     /// Rebuild bind groups that reference environment texture (for HDR switching)
     pub fn rebuild_env_bind_groups(&mut self, device: &wgpu::Device, env_view: &wgpu::TextureView, env_sampler: &wgpu::Sampler) {
-        // Rebuild env_bind_group (camera + env texture)
-        let env_layout = self.env_pipeline.get_bind_group_layout(0);
-        self.env_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("MC Env BG"),
-            layout: &env_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(env_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(env_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.env_params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Rebuild render_bind_group (includes env texture)
-        self.render_bind_group = self.create_render_bind_group(device, env_view, env_sampler);
+        self.backdrop.rebuild_bind_group(device, &self.buffers.camera, env_view, env_sampler);
+        self.rebind_water(device, env_view, env_sampler);
     }
 }

@@ -78,16 +78,7 @@ fn sample_wide(p: vec3<f32>) -> f32 {
     return select(-1.0, sum / max(w_sum, 1e-6), w_sum > 1e-6);
 }
 
-// Octahedral unit vector in 16 + 16 bits (0.003 deg). mc_generate.wgsl and
-// mc_render.wgsl carry the decoder - keep in sync.
-fn oct_encode(n: vec3<f32>) -> u32 {
-    var o = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
-    if (n.z < 0.0) {
-        o = (1.0 - abs(o.yx)) * select(vec2<f32>(-1.0), vec2<f32>(1.0), o >= vec2<f32>(0.0));
-    }
-    let q = vec2<u32>(round(clamp(o, vec2<f32>(-1.0), vec2<f32>(1.0)) * 32767.0 + 32767.0));
-    return q.x | (q.y << 16u);
-}
+// oct_encode(): octahedral_common.wgsl, prepended at module creation
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {

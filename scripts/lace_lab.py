@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline replica of mc_render.wgsl `raft_mask` (the foam-map bubble raft's
+"""Offline replica of mc_render/foam.wgsl `raft_mask` (the foam-map bubble raft's
 lace pattern), for trying lace geometry variants and calibrating their mean
 coverage before writing WGSL.
 
@@ -12,7 +12,7 @@ import argparse
 import numpy as np
 from PIL import Image, ImageDraw
 
-# mc_render.wgsl constants
+# mc_render/foam.wgsl constants
 LACE_CELL = 0.045
 LACE_CELL_FINE = 0.017
 LACE_PATCH_FREQ = 8.0

@@ -60,7 +60,7 @@ struct GpuFilterParams {
     _pad: [u32; 3],
 }
 
-/// Beer-Lambert absorption coefficients — must match mc_render.wgsl
+/// Beer-Lambert absorption coefficients — must match mc_render/main.wgsl
 const ABSORPTION_COEFFS: [f32; 3] = [0.30, 0.08, 0.02];
 /// Water IOR (matches the hardcoded value in MarchingCubesRenderer)
 const WATER_IOR: f32 = 1.333;
@@ -134,6 +134,7 @@ pub struct CausticsRenderer {
 }
 
 impl CausticsRenderer {
+    #[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
     pub fn new(
         device: &wgpu::Device,
         mc_vertex_buffer: &wgpu::Buffer,
@@ -226,7 +227,13 @@ impl CausticsRenderer {
         let gbuffer_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Caustics GBuffer Shader"),
             source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{}", container_common, include_str!("../shaders/mc_caustics_gbuffer.wgsl")).into(),
+                format!(
+                    "{}\n{}\n{}",
+                    container_common,
+                    include_str!("../shaders/noise_common.wgsl"),
+                    include_str!("../shaders/mc_caustics_gbuffer.wgsl")
+                )
+                .into(),
             ),
         });
         let splat_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -602,7 +609,7 @@ impl CausticsRenderer {
             inv_two_sigma_sq: 1.0 / (2.0 * sigma * sigma),
             splat_norm,
             splat_radius,
-            // Mirrors mc_render.wgsl optical density from clarity
+            // Mirrors mc_render/main.wgsl optical density from clarity
             optical_density: (1.0 - water_clarity) * 2.5 + 0.05,
             light_res: self.res,
             time,

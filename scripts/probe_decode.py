@@ -39,7 +39,7 @@ A pixel may be shaded by several fragments: triangles meeting inside it
 under MSAA (each covers some samples, and the resolve blends them) or
 triangles hidden behind it. The nearest (smallest depth) is summarized;
 --pixel --all-fragments lists the rest. Event ids mirror the PRB_* constants in
-src/shaders/mc_render.wgsl: keep EVENTS below in sync with them.
+src/shaders/mc_render/debug_records.wgsl: keep EVENTS below in sync with them.
 """
 import argparse
 import json
@@ -51,7 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.dont_write_bytecode = True  # no scripts/__pycache__ from the import below
 from debug_decode import ENDS, EXITS, PATHS  # noqa: E402  (shared id tables)
 
-# tag -> name (fields documented in mc_render.wgsl next to PRB_*)
+# tag -> name (fields documented in mc_render/debug_records.wgsl next to PRB_*)
 EVENTS = {
     1: "FRAG", 2: "NORMAL", 3: "REFRACT_IN", 4: "SECOND",
     10: "EXIT_BEGIN", 11: "EXIT_BOX", 12: "TRACE", 13: "TRACE_REFINE", 14: "TRACE_END",
@@ -93,7 +93,7 @@ def fmt_event(e):
         back = f"back={b[1]:.7f} z-back={a[2] - b[1]:+.2e}" if b[1] >= 0 else "back=  (not read)"
         front = ""
         if len(e) > 8 and e[8] > 0:
-            # front margin in units of (1 - front): FRONT_EXIT_REL in mc_render.wgsl
+            # front margin in units of (1 - front): FRONT_EXIT_REL in mc_render/trace.wgsl
             front = f" front={e[8]:.7f} (front-z)/(1-front)={(e[8] - a[2]) / max(1 - e[8], 1e-6):+.4f}"
         return (f"{name:12s} s={c:.4f} uv=({a[0]:.5f}, {a[1]:.5f}) z={a[2]:.7f} "
                 f"bg={b[0]:.7f} z-bg={a[2] - b[0]:+.2e} {back}{front} -> {kind}")

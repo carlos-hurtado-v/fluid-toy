@@ -41,7 +41,7 @@ const FLAG_RESET: u32 = 2;
 const FLAG_RESTART_A: u32 = 4;
 const FLAG_RESTART_B: u32 = 8;
 
-/// Same layout as `FoamMapParams` in foam_map.wgsl / mc_render.wgsl
+/// Same layout as `FoamMapParams` in foam_map.wgsl / mc_render/bindings.wgsl
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct GpuFoamMapParams {

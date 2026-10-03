@@ -1,0 +1,4 @@
+# Function length: clippy::too_many_lines (enabled in Cargo.toml [lints]) counts
+# code lines, without comments and blanks. scripts/check_size.py applies the
+# same 200 to raw lines, for Rust and WGSL functions, and budgets whole files.
+too-many-lines-threshold = 200

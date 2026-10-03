@@ -14,14 +14,14 @@ struct CausticsParams {
     ior_rgb: vec3<f32>,
     // Gaussian splat sigma on the floor (container-local meters)
     sigma: f32,
-    // Beer-Lambert absorption coefficients (matches mc_render.wgsl)
+    // Beer-Lambert absorption coefficients (matches mc_render/main.wgsl)
     absorb_rgb: vec3<f32>,
     inv_two_sigma_sq: f32,
     // 1 / (2 pi sigma^2) - normalizes the splat kernel to unit integral
     splat_norm: f32,
     // Splat quad half-extent on the floor (meters, ~2.5 sigma)
     splat_radius: f32,
-    // Optical density from water clarity (matches mc_render.wgsl)
+    // Optical density from water clarity (matches mc_render/main.wgsl)
     optical_density: f32,
     // Light-space raster resolution (texels per side)
     light_res: u32,
@@ -67,35 +67,12 @@ struct FragmentOutput {
     @location(1) normal: vec4<f32>,
 }
 
-// --- Procedural micro-ripples (mirrors mc_render.wgsl exactly) ---
+// --- Procedural micro-ripples (same noise as mc_render/ripple.wgsl) ---
 // The MC mesh only carries wave detail down to grid-cell scale; the fine
 // caustic filaments come from these sub-mesh ripples, animated by sim time so
 // the floor dapple stays coherent with the surface sparkle.
 
-fn hash2(p: vec2<f32>) -> f32 {
-    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-}
-
-// Smooth value noise with analytic gradient (returns: vec3(noise, dN/dx, dN/dz))
-fn value_noise_grad(p: vec2<f32>) -> vec3<f32> {
-    let i = floor(p);
-    let f = fract(p);
-    // Quintic Hermite interpolation (C2 continuous - no grid artifacts)
-    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-    let du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
-
-    let a = hash2(i + vec2<f32>(0.0, 0.0));
-    let b = hash2(i + vec2<f32>(1.0, 0.0));
-    let c = hash2(i + vec2<f32>(0.0, 1.0));
-    let d = hash2(i + vec2<f32>(1.0, 1.0));
-
-    let val = a + (b - a) * u.x + (c - a) * u.y + (a - b - c + d) * u.x * u.y;
-    let dx = du.x * ((b - a) + (a - b - c + d) * u.y);
-    let dy = du.y * ((c - a) + (a - b - c + d) * u.x);
-    return vec3<f32>(val, dx, dy);
-}
+// hash2(), value_noise_grad(): noise_common.wgsl, prepended at module creation
 
 // Multi-octave noise normal perturbation with analytic derivatives.
 // Coarser spectrum than the surface ripple (3 octaves from 14cm wavelength,

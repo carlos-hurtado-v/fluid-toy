@@ -74,7 +74,7 @@ const BUBBLE_SPLAT_WEIGHT: f32 = 0.35;
 // foam overlaps into patches; the gaussian falloff keeps isolated splats dim.
 const SPLAT_SCALE: f32 = 4.5;
 // Calibration anchor for the field pipeline: the weights below and the
-// composite thresholds in mc_render.wgsl were tuned at this particle_size.
+// composite thresholds in mc_render/foam.wgsl were tuned at this particle_size.
 const REF_SIZE: f32 = 0.0015;
 // Peak density contribution of one fully-grown splat at its center. The
 // composite threshold (mc_render FOAM_DENSITY_LO) sits below a single grown

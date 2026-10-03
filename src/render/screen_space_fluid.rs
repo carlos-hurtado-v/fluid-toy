@@ -192,6 +192,7 @@ pub struct ScreenSpaceFluidRenderer {
 }
 
 impl ScreenSpaceFluidRenderer {
+    #[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
     pub fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
@@ -798,7 +799,17 @@ impl ScreenSpaceFluidRenderer {
         });
         let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SS Composite Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/ss_composite.wgsl").into()),
+            // The water shading shared with the MC water shader, then the composite itself
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    include_str!("../shaders/water_common.wgsl"),
+                    include_str!("../shaders/noise_common.wgsl"),
+                    include_str!("../shaders/sh_common.wgsl"),
+                    include_str!("../shaders/ss_composite.wgsl")
+                )
+                .into(),
+            ),
         });
         let env_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SS Env Shader"),
@@ -1200,11 +1211,6 @@ impl ScreenSpaceFluidRenderer {
 
     // The hardware splat depth IS this renderer's public depth output (the
     // R32Float `depth_view` field is the internal linear-depth working texture).
-    #[allow(clippy::misnamed_getters)]
-    pub fn depth_view(&self) -> &wgpu::TextureView {
-        &self.hw_depth_view
-    }
-
     pub fn front_depth_view(&self) -> &wgpu::TextureView {
         &self.hw_depth_view
     }
@@ -1370,6 +1376,7 @@ impl ScreenSpaceFluidRenderer {
     /// Main render method: runs all passes.
     /// `rigid_body`/`spray`/`container` are drawn into the background (with depth)
     /// so the water refracts and occludes against them, mirroring the MC renderer.
+    #[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
     pub fn render(
         &self,
         device: &wgpu::Device,

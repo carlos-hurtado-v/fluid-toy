@@ -55,7 +55,14 @@ impl VoxelNormals {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("MC Voxel Normals Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mc_voxel_normals.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}",
+                    include_str!("../shaders/octahedral_common.wgsl"),
+                    include_str!("../shaders/mc_voxel_normals.wgsl")
+                )
+                .into(),
+            ),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("MC Voxel Normals"),

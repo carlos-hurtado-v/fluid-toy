@@ -54,19 +54,7 @@ struct RbLightParams {
 const INV_PI: f32 = 0.31830988;
 const BODY_SPEC_STRENGTH: f32 = 0.5;
 
-// Evaluate order-2 spherical harmonics irradiance
-fn evaluate_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
-    var irradiance = sh_coeffs[0].rgb * 0.282095;
-    irradiance += sh_coeffs[1].rgb * 0.488603 * n.y;
-    irradiance += sh_coeffs[2].rgb * 0.488603 * n.z;
-    irradiance += sh_coeffs[3].rgb * 0.488603 * n.x;
-    irradiance += sh_coeffs[4].rgb * 1.092548 * n.x * n.y;
-    irradiance += sh_coeffs[5].rgb * 1.092548 * n.y * n.z;
-    irradiance += sh_coeffs[6].rgb * 0.315392 * (3.0 * n.z * n.z - 1.0);
-    irradiance += sh_coeffs[7].rgb * 1.092548 * n.x * n.z;
-    irradiance += sh_coeffs[8].rgb * 0.546274 * (n.x * n.x - n.y * n.y);
-    return max(irradiance, vec3<f32>(0.0));
-}
+// evaluate_sh_irradiance(): sh_common.wgsl, prepended at module creation
 
 // Scene-coherent body shading — identical to rigid_body.wgsl's shade_body
 fn shade_body(albedo: vec3<f32>, n: vec3<f32>, v: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {

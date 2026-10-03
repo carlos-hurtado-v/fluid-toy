@@ -85,6 +85,7 @@ fn build_bind_group(
 pub const FOAM_DENSITY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Float;
 
 impl SprayRenderer {
+    #[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
     pub fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
@@ -98,8 +99,9 @@ impl SprayRenderer {
             label: Some("Spray Render Shader"),
             source: wgpu::ShaderSource::Wgsl(
                 format!(
-                    "{}\n{}",
+                    "{}\n{}\n{}",
                     include_str!("../shaders/container_common.wgsl"),
+                    include_str!("../shaders/sh_common.wgsl"),
                     include_str!("../shaders/spray_render.wgsl")
                 )
                 .into(),

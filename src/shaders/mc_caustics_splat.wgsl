@@ -324,7 +324,7 @@ fn vs_main(
             }
         }
 
-        // Beer-Lambert along the in-water path (mirrors mc_render.wgsl).
+        // Beer-Lambert along the in-water path (mirrors mc_render/main.wgsl).
         // Up-refracted rays re-exit the surface before reaching the wall; the
         // second interface is not modeled, so the whole path is treated as
         // submerged — a slight over-absorption on centimeter scales.

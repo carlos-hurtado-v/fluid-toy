@@ -70,6 +70,7 @@ pub struct RigidBodyRenderer {
 }
 
 impl RigidBodyRenderer {
+    #[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -198,7 +199,13 @@ impl RigidBodyRenderer {
         let procedural_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Rigid Body Procedural Shader"),
             source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{}", container_common, include_str!("../shaders/rigid_body.wgsl")).into(),
+                format!(
+                    "{}\n{}\n{}",
+                    container_common,
+                    include_str!("../shaders/sh_common.wgsl"),
+                    include_str!("../shaders/rigid_body.wgsl")
+                )
+                .into(),
             ),
         });
 
@@ -331,6 +338,7 @@ impl RigidBodyRenderer {
     }
 
     /// Create all GPU resources for the mesh pipeline
+    #[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
     fn create_mesh_resources(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -452,8 +460,9 @@ impl RigidBodyRenderer {
             label: Some("Rigid Body Mesh Shader"),
             source: wgpu::ShaderSource::Wgsl(
                 format!(
-                    "{}\n{}",
+                    "{}\n{}\n{}",
                     include_str!("../shaders/container_common.wgsl"),
+                    include_str!("../shaders/sh_common.wgsl"),
                     include_str!("../shaders/rigid_body_mesh.wgsl")
                 )
                 .into(),

@@ -103,6 +103,7 @@ pub struct SpraySystem {
 
 impl SpraySystem {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
     pub fn new(
         device: &wgpu::Device,
         sorted_particle_buffer: &wgpu::Buffer,

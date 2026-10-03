@@ -1,5 +1,7 @@
 //! GPU context - shared wgpu resources
 
+pub mod bind;
+
 use std::sync::Arc;
 use winit::window::Window;
 

@@ -20,3 +20,9 @@ serde_json = "1"
 egui = "0.33"
 egui-wgpu = "0.33"
 egui-winit = "0.33"
+
+[lints.clippy]
+# Long functions are how the big files grew: a new pass, phase or panel gets
+# its own function or module. Threshold in clippy.toml; functions that were
+# already over it carry #[allow(clippy::too_many_lines)].
+too_many_lines = "warn"

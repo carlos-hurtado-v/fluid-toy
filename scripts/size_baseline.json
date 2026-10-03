@@ -1,0 +1,23 @@
+{
+  "_comment": "Files and functions over the budgets in scripts/check_size.py, frozen at these sizes: they may shrink, never grow. Regenerate with `python scripts/check_size.py --update`.",
+  "frozen": {
+    "src/gui/mod.rs": 1099,
+    "src/gui/mod.rs::render_control_panel": 1047,
+    "src/render/caustics.rs::new": 365,
+    "src/render/container_renderer.rs::new": 307,
+    "src/render/gtao.rs::new": 430,
+    "src/render/post_process.rs::new": 503,
+    "src/render/rigid_body_renderer.rs::create_mesh_resources": 275,
+    "src/render/rigid_body_renderer.rs::new": 265,
+    "src/render/screen_space_fluid.rs": 1734,
+    "src/render/screen_space_fluid.rs::new": 946,
+    "src/render/screen_space_fluid.rs::render": 354,
+    "src/render/spray_renderer.rs::new": 364,
+    "src/shaders/mc_render/main.wgsl::fs_main": 360,
+    "src/shaders/sph_integrate_3d.wgsl::main": 341,
+    "src/shaders/ss_composite.wgsl::fs_main": 274,
+    "src/simulation/sph_3d_grid.rs": 1678,
+    "src/simulation/sph_3d_grid.rs::new": 1199,
+    "src/simulation/spray.rs::new": 239
+  }
+}

@@ -102,6 +102,7 @@ pub struct SphSimulation3DGrid {
 }
 
 impl SphSimulation3DGrid {
+    #[allow(clippy::too_many_lines)] // frozen in scripts/size_baseline.json: may shrink, not grow
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
